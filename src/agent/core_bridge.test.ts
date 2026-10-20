@@ -238,7 +238,22 @@ it("reads the real scheduler tradeMetrics timestamp and keeps missing or future 
     const unknown = await bridge.profile(c.id);
     assert.equal(unknown.last_trade_at, null);
     assert.equal(unknown.metric_periods?.roi.period, "unavailable");
+    assert.equal(unknown.source_roi_pct, null);
     assert.equal(unknown.score_explanation?.cap_applied, null);
+    row.roi_ratio = "0.83289342";
+    row.raw = JSON.stringify({
+      metrics: {
+        monthRoi: 0.00832893,
+        allTimeRoi: 0.15950055,
+        maxDrawdown: null,
+        maxDrawdownSource: "hyperdash.drawdownAllTime",
+      },
+    });
+    const monthly = await bridge.profile(c.id);
+    assert.equal(monthly.source_roi_pct, 0.832893);
+    assert.equal(monthly.metric_periods?.roi.period, "source_month");
+    assert.match(monthly.metric_periods!.roi.basis, /metrics.monthRoi/);
+    assert.equal(monthly.metric_periods?.drawdown.period, "unavailable");
   } finally {
     await bridge.close();
   }

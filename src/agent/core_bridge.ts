@@ -384,11 +384,23 @@ export class CoreBridge {
       b != null &&
       Number.isFinite(Number(a)) &&
       Number(a) === Number(b);
-    const roiPeriod = sameMetric(row.roi_ratio, raw.metrics?.allTimeRoi)
-      ? "source_all_time"
-      : sameMetric(row.roi_ratio, raw.metrics?.monthRoi)
+    // The fixed-pool score snapshot stores ROI in percentage points despite
+    // Core's legacy `roi_ratio` label. Use the explicitly windowed raw metric
+    // instead of applying a second 100x conversion to that ambiguous alias.
+    const monthRoi = raw.metrics?.monthRoi;
+    const allTimeRoi = raw.metrics?.allTimeRoi;
+    const roiPeriod =
+      typeof monthRoi === "number" && Number.isFinite(monthRoi)
         ? "source_month"
-        : "unavailable";
+        : typeof allTimeRoi === "number" && Number.isFinite(allTimeRoi)
+          ? "source_all_time"
+          : "unavailable";
+    const roiPercent =
+      roiPeriod === "source_month"
+        ? D(monthRoi).times(100).toNumber()
+        : roiPeriod === "source_all_time"
+          ? D(allTimeRoi).times(100).toNumber()
+          : null;
     const drawdownSource =
       raw.metrics?.riskHistorySource ?? raw.metrics?.maxDrawdownSource;
     const drawdownPeriod =
@@ -532,7 +544,7 @@ export class CoreBridge {
           basis:
             roiPeriod === "unavailable"
               ? "Source did not verify the ROI period"
-              : "Source metrics matched the reported period; exact historical bounds unavailable",
+              : `${roiPeriod === "source_month" ? "metrics.monthRoi" : "metrics.allTimeRoi"}; source ratio converted to percent once; exact historical bounds unavailable`,
         },
         drawdown: {
           period: drawdownPeriod,
@@ -561,8 +573,7 @@ export class CoreBridge {
           : "mixed",
       median_hold_hours:
         row.median_hold_seconds == null ? null : row.median_hold_seconds / 3600,
-      source_roi_pct:
-        row.roi_ratio == null ? null : D(row.roi_ratio).times(100).toNumber(),
+      source_roi_pct: roiPercent,
       source_drawdown_pct:
         row.drawdown_ratio == null
           ? null
