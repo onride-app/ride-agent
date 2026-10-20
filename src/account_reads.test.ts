@@ -31,6 +31,8 @@ function fixtureFetch(failEmbedded = false): typeof fetch {
             enabledConfigs: 1,
             totalOpenPositions: 1,
           },
+          openInventory: { totalCount: 1 },
+          closingInventory: { totalCount: 0 },
           positions0: { positions: [], hasNextPage: false },
           positions1: {
             positions: [
@@ -115,6 +117,77 @@ it("reports unavailable wallet reads as partial coverage instead of an empty acc
   assert.equal(value.data.coverage_complete, false);
   assert.equal((value.data.account as any).authenticated, true);
   assert.equal((value.data.perps as any).configs.length, 1);
+});
+
+it("counts stopped Prediction inventory across all pages and presents one valuation pair", async () => {
+  const base = fixtureFetch();
+  const fetcher = (async (url, init) => {
+    const response = await base(url, init);
+    if (!JSON.parse(String(init?.body)).query.includes("RideAppCopies"))
+      return response;
+    const body = (await response.json()) as any;
+    body.data.myCopyTradeConfigs[0].isEnabled = false;
+    body.data.copyTradeSummary.totalOpenPositions = 0;
+    body.data.openInventory.totalCount = 3;
+    body.data.closingInventory.totalCount = 2;
+    body.data.positions1.hasNextPage = true;
+    Object.assign(body.data.positions1.positions[0], {
+      currentPnl: "-2",
+      currentPnlPercent: "-40",
+      displayCurrentValue: "6",
+      displayCurrentPnl: "1",
+      displayCurrentPnlPercent: "999",
+    });
+    return Response.json(body);
+  }) as typeof fetch;
+  const value = await readAccountCopies(
+    "https://core.test/graphql",
+    "fixture-session",
+    { limit: 1, offset: 10 },
+    fetcher,
+  );
+  const prediction = value.data.prediction as any;
+  assert.equal(prediction.summary.totalOpenPositions, 5);
+  assert.equal(prediction.summary.openPositionCount, 3);
+  assert.equal(prediction.summary.closingPositionCount, 2);
+  assert.equal(prediction.summary.includes_disabled_configs, true);
+  assert.equal(prediction.positions.length, 1);
+  const p = prediction.positions[0];
+  assert.equal(p.currentPnl, "1");
+  assert.equal(p.displayCurrentPnl, p.currentPnl);
+  assert.equal(p.currentPnlPercent, "20.000000");
+  assert.equal(p.displayCurrentPnlPercent, p.currentPnlPercent);
+  assert.equal(p.valuation.source, "copy_wallet_display_metrics");
+  assert.equal(p.valuation.source_observed_at, null);
+  assert.equal(value.status, "stale");
+});
+
+it("leaves missing counts and wallet cost basis unavailable instead of reusing stale metrics", async () => {
+  const base = fixtureFetch();
+  const fetcher = (async (url, init) => {
+    const response = await base(url, init);
+    if (!JSON.parse(String(init?.body)).query.includes("RideAppCopies"))
+      return response;
+    const body = (await response.json()) as any;
+    delete body.data.openInventory;
+    Object.assign(body.data.positions1.positions[0], {
+      currentPnl: "-2",
+      currentPnlPercent: "-40",
+      displayCurrentPnl: "1",
+    });
+    return Response.json(body);
+  }) as typeof fetch;
+  const value = await readAccountCopies(
+    "https://core.test/graphql",
+    "fixture-session",
+    {},
+    fetcher,
+  );
+  const prediction = value.data.prediction as any;
+  assert.equal(prediction.summary.totalOpenPositions, null);
+  assert.equal(prediction.positions[0].currentPnlPercent, null);
+  assert.equal(value.data.coverage_complete, false);
+  assert.equal(value.status, "stale");
 });
 
 it("never accepts a caller-supplied account identity or turns an account failure into logged-out state", async () => {

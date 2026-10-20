@@ -268,6 +268,8 @@ export class AgentService {
                 amount_usdc: old.amount_usdc,
                 leverage_cap: old.leverage_cap,
                 leverage_mode: old.leverage_mode,
+                leverage_cap_source: "inherited",
+                leverage_cap_inherited_from_plan_id: saved.id,
                 stop_loss_pct: old.stop_loss_pct,
               });
               for (const key of [
@@ -727,6 +729,13 @@ export class AgentService {
             ...plan.allocations.find((a) => a.trader.id === x.trader_id)!,
             amount_usdc: cash(x.amount_usdc),
             leverage_cap: leverage,
+            leverage_cap_source: capEdited
+              ? "user"
+              : prior
+                ? "inherited"
+                : "default",
+            leverage_cap_inherited_from_plan_id:
+              !capEdited && prior ? previous.id : undefined,
             leverage_mode: leverageMode === "cap" ? undefined : leverageMode,
             stop_loss_pct: x.stop_loss_pct ?? prior?.stop_loss_pct ?? 30,
             copy_mode: settings.copy_mode ?? pref.copy_mode,
@@ -1172,8 +1181,22 @@ export class AgentService {
           "Removing this hedge requires additional verified margin.",
         );
     }
+    const projected = portfolioView(p).data.portfolio as Record<string, any>;
+    const { state: projectedState, ...projectedFields } = projected;
     const preview = {
-      portfolio: portfolioView(p).data,
+      state_semantics: "projected_after_confirmation",
+      portfolio: {
+        portfolio: {
+          ...projectedFields,
+          projected_state: projectedState,
+          sleeves: projected.sleeves.map(
+            ({ state, ...sleeve }: Record<string, any>) => ({
+              ...sleeve,
+              projected_state: state,
+            }),
+          ),
+        },
+      },
       proposed_positions: proposedTargets,
       action: name,
       parameters: args,
@@ -1761,6 +1784,10 @@ export class AgentService {
           ).href,
           execution_tasks: tasks,
           portfolio_state: portfolio?.state ?? null,
+          actual_portfolio_state: portfolio?.state ?? null,
+          preview_state_semantics: "projected_after_confirmation",
+          execution_state:
+            p.status === "requires_confirmation" ? "not_submitted" : p.status,
         },
       },
       p.status === "requires_confirmation"
@@ -1866,8 +1893,13 @@ export function portfolioView(p: Portfolio): Result {
           trader: s.trader,
           amount_usdc: s.amount_usdc,
           leverage_cap: s.leverage_cap,
+          leverage_cap_source: s.leverage_cap_source,
+          leverage_cap_inherited_from_plan_id:
+            s.leverage_cap_inherited_from_plan_id,
           ...(s.leverage_mode ? { leverage_mode: s.leverage_mode } : {}),
           stop_loss_pct: s.stop_loss_pct,
+          loss_policy: s.loss_policy,
+          emergency_exit_pct: s.emergency_exit_pct,
           state: s.state,
           net_profit_usdc:
             stats.sleeves.find((x) => x.copy_id === s.copy_id)?.net_usdc ??

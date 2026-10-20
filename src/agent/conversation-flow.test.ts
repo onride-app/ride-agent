@@ -23,6 +23,64 @@ function env(count = 24) {
     (await api.tool(user, name, args)).data as any;
   return { repo, adapter, api, call };
 }
+it("keeps score caps, unknown historical bounds and last trade evidence in native recommendation and browse rows", async () => {
+  const { adapter, call } = env(2);
+  adapter.pool = adapter.pool.map((c) => ({
+    ...c,
+    score: 84.99,
+    score_explanation: {
+      tier: "B 观察",
+      raw_quality_score: 91,
+      display_cap: 84.99,
+      cap_applied: true,
+      note: "Tier cap",
+    },
+    metric_periods: {
+      roi: {
+        period: "source_all_time",
+        start_at: null,
+        end_at: null,
+        basis: "source history",
+      },
+      drawdown: {
+        period: "unavailable",
+        start_at: null,
+        end_at: null,
+        basis: "unknown source period",
+      },
+    },
+  }));
+  const recommended = await call("recommend_traders", {
+    preferences: {
+      budget_usdc: "20",
+      loss_trigger_pct: 10,
+      market: "perps",
+      basket_size: 2,
+      portfolio_kind: "basket",
+    },
+  });
+  const browsed = await call("browse_traders", {});
+  for (const rows of [recommended.candidate_table, browsed.candidate_table]) {
+    assert.deepEqual(
+      rows.map((r: any) => r.trader_id),
+      adapter.pool.map((c) => c.id),
+    );
+    assert.ok(
+      rows.every(
+        (r: any) => r.score_explanation.cap_applied && r.last_trade_at != null,
+      ),
+    );
+    assert.ok(
+      rows.every(
+        (r: any) =>
+          r.metric_periods.roi.start_at === null &&
+          r.metric_periods.drawdown.period === "unavailable",
+      ),
+    );
+  }
+  assert.equal(browsed.candidates_meta.period_comparable, false);
+  assert.match(browsed.candidates_meta.score_tie_note, /tier caps/);
+});
 it("requests only the chosen market when refreshing recommendation candidates", async () => {
   const { adapter, call } = env(2);
   adapter.pool = adapter.pool.map((c) => ({

@@ -108,9 +108,31 @@ it("preserves frozen 3x plans on refresh and changes a running cap only through 
   ).data.plan as any;
   assert.ok(
     refreshed.allocations.every(
-      (a: any) => a.leverage_cap === 3 && a.leverage_mode == null,
+      (a: any) =>
+        a.leverage_cap === 3 &&
+        a.leverage_mode == null &&
+        a.leverage_cap_source === "inherited" &&
+        a.leverage_cap_inherited_from_plan_id === original.id,
     ),
   );
+  const cleared = await api.tool("alice", "recalculate_plan", {
+    plan_id: refreshed.id,
+    allocations: refreshed.allocations.map((a: any) => ({
+      trader_id: a.trader.id,
+      amount_usdc: a.amount_usdc,
+      leverage_cap: null,
+    })),
+  });
+  assert.ok(
+    (cleared.data.plan as any).allocations.every(
+      (a: any) =>
+        a.leverage_cap === null &&
+        a.leverage_mode === "follow_source" &&
+        a.leverage_cap_source === "user" &&
+        a.leverage_cap_inherited_from_plan_id == null,
+    ),
+  );
+  assert.ok(original.allocations.every((a) => a.leverage_cap === 3));
   let copy = "";
   await repo.transact("alice", async (s) => {
     copy = s.portfolios[0].sleeves[0].copy_id;

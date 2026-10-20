@@ -78,6 +78,9 @@ export function traderRow(c: Candidate) {
     metric_window: c.metric_window ?? null,
     metric_provenance: c.metric_provenance ?? null,
     metric_unavailable_reason: c.metric_unavailable_reason ?? null,
+    metric_periods: c.metric_periods ?? null,
+    score_explanation: c.score_explanation ?? null,
+    last_trade_at: c.last_trade_at,
     eligibility: c.eligibility,
     scored_at: c.scored_at,
   };
@@ -162,6 +165,8 @@ export function browse(
         "Entire current verified source pool, not just this page. The production Perps source profiles at most the top 30 by Copy Score; this is not all market traders.",
       historical_metric_note:
         "Source history is not follower profit. Compare periods and score versions before drawing conclusions; unknown periods are unavailable, never assumed equal.",
+      score_tie_note:
+        "Equal display scores can result from tier caps. Use each row's score_explanation; missing tier evidence remains unavailable. Public trader ID is the deterministic tie-breaker, not a return forecast.",
       period_comparable:
         page.length > 0 &&
         page.every((c) => c.metric_window != null) &&
@@ -201,8 +206,17 @@ export function conversationView(
         amount_usdc: a.amount_usdc,
         leverage_mode: a.leverage_mode ?? "cap",
         leverage_cap: a.leverage_cap,
+        leverage_cap_source:
+          a.leverage_cap_source ??
+          (a.leverage_cap != null &&
+          a.trader.market === "perps" &&
+          !a.leverage_mode
+            ? "inherited"
+            : "default"),
+        leverage_cap_inherited_from_plan_id:
+          a.leverage_cap_inherited_from_plan_id ?? null,
         maximum_leverage_cap: maximumUserLeverage(a.trader),
-        reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.`,
+        reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.${a.leverage_cap_source === "inherited" || (a.trader.market === "perps" && a.leverage_cap != null && !a.leverage_mode) ? ` Inherited leverage setting: ${a.leverage_cap == null ? "no extra cap" : `${a.leverage_cap}x`}; explicitly clear leverage_cap to follow source without an extra cap.` : ""}`,
       })) ?? [],
     candidate_table: candidates.slice(0, 5).map(traderRow),
     selection_origin: selectedByUser ? "user" : "system_recommendation",

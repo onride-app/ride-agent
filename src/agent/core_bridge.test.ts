@@ -209,16 +209,36 @@ it("reads the real scheduler tradeMetrics timestamp and keeps missing or future 
       [now() + 60000, null],
     ] as const) {
       row.raw = JSON.stringify({
-        copyScoreV2_5: { components: c.components },
+        copyScoreV2_5: {
+          components: c.components,
+          displayTier: "B 观察",
+          rawQualityScore: 91.5,
+        },
+        metrics: {
+          allTimeRoi: 0.1,
+          maxDrawdown: 0.02,
+          maxDrawdownSource: "hyperdash.drawdownAllTime",
+        },
         dailyRescore: { computedAt: now() },
         tradeMetrics: { status: "available", newestFillTime: timestamp },
       });
-      assert.equal((await bridge.profile(c.id)).last_trade_at, expected);
+      row.score = 84.99;
+      const profile = await bridge.profile(c.id);
+      assert.equal(profile.last_trade_at, expected);
+      assert.equal(profile.score_explanation?.display_cap, 84.99);
+      assert.equal(profile.score_explanation?.raw_quality_score, 91.5);
+      assert.equal(profile.score_explanation?.cap_applied, true);
+      assert.equal(profile.metric_periods?.roi.period, "source_all_time");
+      assert.equal(profile.metric_periods?.drawdown.period, "source_all_time");
+      assert.equal(profile.metric_periods?.roi.start_at, null);
     }
     row.raw = JSON.stringify({
       tradeMetrics: { status: "unavailable", newestFillTime: at },
     });
-    assert.equal((await bridge.profile(c.id)).last_trade_at, null);
+    const unknown = await bridge.profile(c.id);
+    assert.equal(unknown.last_trade_at, null);
+    assert.equal(unknown.metric_periods?.roi.period, "unavailable");
+    assert.equal(unknown.score_explanation?.cap_applied, null);
   } finally {
     await bridge.close();
   }

@@ -307,6 +307,18 @@ function sleeveCards(
             ? null
             : `${s.leverage_cap}x`,
       ),
+      ...(s.leverage_cap_source === "inherited" ||
+      (s.trader?.market === "perps" &&
+        s.leverage_cap != null &&
+        !s.leverage_mode)
+        ? [
+            el(
+              "p",
+              `继承旧设置：${s.leverage_cap == null ? "无额外上限" : `${s.leverage_cap}x`}。清空杠杆上限并重新计算，可改为跟随源杠杆；交易所限制仍适用。`,
+              "muted",
+            ),
+          ]
+        : []),
       row(
         s.loss_policy === "pause_then_exit"
           ? "Pause new exposure"
@@ -326,6 +338,8 @@ function sleeveCards(
         row("State", s.state),
         row("Net contribution", usdc(s.net_profit_usdc)),
       );
+    if (s.projected_state)
+      c.append(row("预计状态（确认后）", s.projected_state));
     if (callTool) {
       const b = el("button", "Trader details", "secondary");
       b.addEventListener("click", () =>
@@ -842,6 +856,7 @@ function render(
         "Source ROI",
         t.source_roi_pct == null ? "Unavailable" : `${t.source_roi_pct}%`,
       ),
+      ...historyRows(t),
       row(
         "Source drawdown",
         t.source_drawdown_pct == null
@@ -896,6 +911,10 @@ function render(
       renderNestedPortfolio(root, q.preview.portfolio.portfolio);
     const params = card("Frozen parameters");
     params.append(
+      row(
+        "真实组合状态",
+        q.actual_portfolio_state ?? q.portfolio_state ?? "尚未建立组合",
+      ),
       row("Loss trigger amount", usdc(q.preview?.loss_trigger_amount_usdc)),
       row("Existing entry deviation", "≤ 0.2%"),
       row(
@@ -1015,6 +1034,7 @@ function renderCandidates(root, data, callTool) {
           `${t.market} / ${t.asset_category ?? "unavailable"}`,
         ),
         row("Copy Score", t.score),
+        ...historyRows(t),
         row("Trading assets", t.assets?.join(", ") || "Unavailable"),
         row("Qualification", t.eligibility),
       );
@@ -1295,6 +1315,19 @@ function planEditor(plan, data, callTool, start) {
       a.leverage_cap ?? "",
     );
     leverage.placeholder = "No extra cap · follow source";
+    if (
+      a.leverage_cap_source === "inherited" ||
+      (a.trader.market === "perps" &&
+        a.leverage_cap != null &&
+        !a.leverage_mode)
+    )
+      r.append(
+        el(
+          "p",
+          `继承旧设置：${a.leverage_cap == null ? "无额外上限" : `${a.leverage_cap}x`}。清空此项并重新计算可取消额外上限；交易所限制仍适用。`,
+          "muted",
+        ),
+      );
     leverage.min = "1";
     leverage.max = String(
       maximumLimits.get(a.trader.id) ??
@@ -2009,7 +2042,60 @@ function renderNotifications(root, d, callTool) {
   root.append(c);
 }
 function renderNestedPortfolio(root, p) {
-  root.append(sleeveCards(p.sleeves ?? []));
+  root.append(
+    el(
+      "p",
+      "以下为确认后的预计状态；实际提交、成交与运行状态以处理结果为准。",
+      "muted",
+    ),
+    row("预计组合状态（确认后）", p.projected_state ?? p.state),
+    sleeveCards(
+      (p.sleeves ?? []).map(({ state, ...s }) => ({
+        ...s,
+        projected_state: s.projected_state ?? state,
+      })),
+    ),
+  );
+}
+
+function historyRows(t) {
+  const periods = t.metric_periods;
+  const period = (key) =>
+    t.metric_window
+      ? `${new Date(t.metric_window.start_at).toISOString()} – ${new Date(t.metric_window.end_at).toISOString()}`
+      : periods?.[key]?.period === "source_all_time"
+        ? "源账户全部可用历史（起止日期未知）"
+        : periods?.[key]?.period === "source_month"
+          ? "源账户月度窗口（起止日期未知）"
+          : "统计周期未知";
+  const score = t.score_explanation;
+  return [
+    row("ROI 统计周期", period("roi")),
+    row("回撤统计周期", period("drawdown")),
+    row(
+      "最近交易",
+      t.last_trade_at == null
+        ? "Unavailable"
+        : new Date(t.last_trade_at).toISOString(),
+    ),
+    row("评分版本", t.score_version),
+    ...(score
+      ? [
+          row(
+            "评级 / 原始质量分",
+            `${score.tier ?? "Unavailable"} / ${score.raw_quality_score ?? "Unavailable"}`,
+          ),
+          row("评级分数上限", score.display_cap ?? "Unavailable"),
+          el(
+            "p",
+            score.cap_applied
+              ? "展示分已触及评级上限；同分不代表原始质量或收益相同。同分时按公开交易员 ID 排序。"
+              : score.note,
+            "muted",
+          ),
+        ]
+      : []),
+  ];
 }
 
 /*INLINE_CONFIRM*/const config = /*CONFIG*/{};
@@ -2033,8 +2119,12 @@ document.getElementById("approve").textContent = config.demo
 document.getElementById("reject").textContent = config.demo
   ? "取消模拟"
   : "取消方案";
+const missingStoredSession = (e) =>
+  /no tokens found in storage/i.test(e?.message ?? String(e));
 const showError = (e) => {
-  status.textContent = e?.message ?? String(e);
+  status.textContent = missingStoredSession(e)
+    ? "网页确认需要独立的 Ride 登录，请登录后继续查看方案。"
+    : (e?.message ?? String(e));
   status.className = "warning error";
 };
 async function init() {
@@ -2072,7 +2162,9 @@ async function call(operation, body = {}) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    const error = new Error(payload.error?.message ?? "Ride Agent request failed.");
+    const error = new Error(
+      payload.error?.message ?? "Ride Agent request failed.",
+    );
     error.code = payload.error?.code;
     throw error;
   }
@@ -2165,10 +2257,12 @@ async function finish(session) {
 function showLogin() {
   loginView.hidden = false;
   actions.hidden = true;
+  loginView.querySelector("p").textContent =
+    "MCP 登录与网页确认使用独立的认证会话。请在此验证同一个 Ride 账户；有效的网页登录会自动复用。";
   if (embedded) {
     loginView.querySelector("h1").textContent = "连接 Ride 后在此确认";
     loginView.querySelector("p").textContent =
-      "首次连接会打开 Ride 登录窗口；连接有效时，后续卡片直接显示方案。";
+      "MCP 登录与网页确认使用独立的认证会话。首次连接会打开 Ride 登录窗口；网页登录有效时，后续卡片直接显示方案。";
     signIn.textContent = "连接 Ride";
     document.getElementById("access-code").parentElement.hidden = true;
   }
@@ -2366,7 +2460,10 @@ async function start() {
     showLogin();
   } catch (e) {
     showLogin();
-    showError(e);
+    if (missingStoredSession(e)) {
+      status.textContent = "";
+      status.className = "";
+    } else showError(e);
   }
 }
 start();

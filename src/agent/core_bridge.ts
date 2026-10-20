@@ -363,6 +363,44 @@ export class CoreBridge {
       raw = JSON.parse(row.raw ?? "{}");
     } catch {}
     const components: Record<string, number | null> = {};
+    const scoring = raw.copyScoreV2_5 ?? {};
+    const tier =
+      typeof scoring.displayTier === "string" ? scoring.displayTier : null;
+    const rawQuality =
+      typeof scoring.rawQualityScore === "number" &&
+      Number.isFinite(scoring.rawQualityScore)
+        ? scoring.rawQualityScore
+        : null;
+    const displayCap =
+      row.score_version === "strict_perp_v2_5_daily_live_v1"
+        ? tier === "B 观察"
+          ? 84.99
+          : tier === "C 谨慎"
+            ? 69.99
+            : null
+        : null;
+    const sameMetric = (a: unknown, b: unknown) =>
+      a != null &&
+      b != null &&
+      Number.isFinite(Number(a)) &&
+      Number(a) === Number(b);
+    const roiPeriod = sameMetric(row.roi_ratio, raw.metrics?.allTimeRoi)
+      ? "source_all_time"
+      : sameMetric(row.roi_ratio, raw.metrics?.monthRoi)
+        ? "source_month"
+        : "unavailable";
+    const drawdownSource =
+      raw.metrics?.riskHistorySource ?? raw.metrics?.maxDrawdownSource;
+    const drawdownPeriod =
+      typeof drawdownSource === "string" &&
+      sameMetric(row.drawdown_ratio, raw.metrics?.maxDrawdown)
+        ? drawdownSource.includes("AllTime") ||
+          drawdownSource.includes("allTime")
+          ? "source_all_time"
+          : drawdownSource.includes("perpMonth")
+            ? "source_month"
+            : "unavailable"
+        : "unavailable";
     for (const name of [
       "stability",
       "pathSmoothness",
@@ -473,6 +511,39 @@ export class CoreBridge {
           process.env.RIDE_AGENT_RWA_ENABLED === "true"),
       score: Number(row.score),
       score_version: row.score_version,
+      score_explanation: {
+        tier,
+        raw_quality_score: rawQuality,
+        display_cap: displayCap,
+        cap_applied:
+          displayCap == null || rawQuality == null
+            ? null
+            : rawQuality > displayCap && Number(row.score) === displayCap,
+        note:
+          row.score_version === "strict_perp_v2_5_daily_live_v1"
+            ? "B observation scores are capped at 84.99 and C caution scores at 69.99 in this score version. Equal display scores do not imply equal raw quality or returns; public trader ID breaks score ties. Missing tier or raw quality cannot establish why a score tied."
+            : "Score tier limits are unavailable for this score version. Equal display scores do not imply equal quality or returns; public trader ID breaks score ties.",
+      },
+      metric_periods: {
+        roi: {
+          period: roiPeriod,
+          start_at: null,
+          end_at: null,
+          basis:
+            roiPeriod === "unavailable"
+              ? "Source did not verify the ROI period"
+              : "Source metrics matched the reported period; exact historical bounds unavailable",
+        },
+        drawdown: {
+          period: drawdownPeriod,
+          start_at: null,
+          end_at: null,
+          basis:
+            drawdownPeriod === "unavailable"
+              ? "Source did not verify the drawdown period"
+              : `${drawdownSource}; exact historical bounds unavailable`,
+        },
+      },
       components,
       scored_at: row.computed_at,
       expires_at: row.expires_at,

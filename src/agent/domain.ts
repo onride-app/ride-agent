@@ -32,6 +32,27 @@ export type Venue = "perps" | "prediction";
 // Match the existing App's editable Perps Auto-Ride setting.
 export const PERPS_COPY_MAX_LEVERAGE = 40;
 export interface Candidate {
+  metric_periods?: {
+    roi: {
+      period: string;
+      start_at: number | null;
+      end_at: number | null;
+      basis: string;
+    };
+    drawdown: {
+      period: string;
+      start_at: number | null;
+      end_at: number | null;
+      basis: string;
+    };
+  };
+  score_explanation?: {
+    tier: string | null;
+    raw_quality_score: number | null;
+    display_cap: number | null;
+    cap_applied: boolean | null;
+    note: string;
+  };
   metric_window?: { start_at: number; end_at: number; basis: string };
   metric_provenance?: {
     source: string;
@@ -78,6 +99,8 @@ export interface Allocation {
   trader: Candidate;
   amount_usdc: string;
   leverage_cap: number | null;
+  leverage_cap_source?: "inherited" | "user" | "default";
+  leverage_cap_inherited_from_plan_id?: string;
   // Missing on frozen/approved capped plans; never infer a policy upgrade.
   leverage_mode?: "follow_source" | "custom_cap";
   stop_loss_pct: number;
@@ -472,6 +495,7 @@ export function recommend(p: Preferences, candidates: Candidate[]): Plan {
       copy_id: uid("copy"),
       trader: c,
       amount_usdc: amounts[i],
+      leverage_cap_source: "default",
       leverage_cap:
         defaultLeverageMode(p, c) === "follow_source"
           ? null

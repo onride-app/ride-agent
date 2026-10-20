@@ -73,6 +73,22 @@ it("previews with zero funds and refreshes an expired plan into a new immutable 
     })
   ).data.proposal as any;
   assert.equal(proposal.status, "requires_confirmation");
+  assert.equal(proposal.execution_state, "not_submitted");
+  assert.equal(proposal.actual_portfolio_state, null);
+  assert.equal(
+    proposal.preview.state_semantics,
+    "projected_after_confirmation",
+  );
+  const projected = proposal.preview.portfolio.portfolio;
+  assert.equal(projected.state, undefined);
+  assert.equal(projected.projected_state, "activating");
+  assert.ok(
+    projected.sleeves.every(
+      (s: any) => s.state == null && s.projected_state === "active",
+    ),
+  );
+  assert.equal(projected.reserved_usdc, "0.000000");
+  assert.equal(adapter.submitCount, 0);
   adapter.pool[0].eligibility = "REJECT";
   await assert.rejects(
     api.confirm("alice", proposal.id, proposal.preview_hash),

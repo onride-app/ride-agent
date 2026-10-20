@@ -19,8 +19,12 @@ document.getElementById("approve").textContent = config.demo
 document.getElementById("reject").textContent = config.demo
   ? "取消模拟"
   : "取消方案";
+const missingStoredSession = (e) =>
+  /no tokens found in storage/i.test(e?.message ?? String(e));
 const showError = (e) => {
-  status.textContent = e?.message ?? String(e);
+  status.textContent = missingStoredSession(e)
+    ? "网页确认需要独立的 Ride 登录，请登录后继续查看方案。"
+    : (e?.message ?? String(e));
   status.className = "warning error";
 };
 async function init() {
@@ -58,7 +62,9 @@ async function call(operation, body = {}) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    const error = new Error(payload.error?.message ?? "Ride Agent request failed.");
+    const error = new Error(
+      payload.error?.message ?? "Ride Agent request failed.",
+    );
     error.code = payload.error?.code;
     throw error;
   }
@@ -151,10 +157,12 @@ async function finish(session) {
 function showLogin() {
   loginView.hidden = false;
   actions.hidden = true;
+  loginView.querySelector("p").textContent =
+    "MCP 登录与网页确认使用独立的认证会话。请在此验证同一个 Ride 账户；有效的网页登录会自动复用。";
   if (embedded) {
     loginView.querySelector("h1").textContent = "连接 Ride 后在此确认";
     loginView.querySelector("p").textContent =
-      "首次连接会打开 Ride 登录窗口；连接有效时，后续卡片直接显示方案。";
+      "MCP 登录与网页确认使用独立的认证会话。首次连接会打开 Ride 登录窗口；网页登录有效时，后续卡片直接显示方案。";
     signIn.textContent = "连接 Ride";
     document.getElementById("access-code").parentElement.hidden = true;
   }
@@ -352,7 +360,10 @@ async function start() {
     showLogin();
   } catch (e) {
     showLogin();
-    showError(e);
+    if (missingStoredSession(e)) {
+      status.textContent = "";
+      status.className = "";
+    } else showError(e);
   }
 }
 start();

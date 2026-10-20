@@ -23,7 +23,30 @@ const proposal = {
     budget_usdc: "20",
     traders: ["fixture-A", "fixture-B"],
   },
-  preview: { loss_trigger_amount_usdc: "4.000000" },
+  actual_portfolio_state: null,
+  execution_state: "not_submitted",
+  preview: {
+    state_semantics: "projected_after_confirmation",
+    loss_trigger_amount_usdc: "2.000000",
+    fees: { estimate_usdc: null },
+    portfolio: {
+      portfolio: {
+        projected_state: "activating",
+        reserved_usdc: "0.000000",
+        sleeves: ["A", "B"].map((name) => ({
+          copy_id: `fixture-${name}`,
+          trader: { handle: `Fixture trader ${name}`, market: "perps" },
+          amount_usdc: "10.000000",
+          leverage_cap: 3,
+          leverage_cap_source: "inherited",
+          projected_state: "active",
+          stop_loss_pct: 30,
+          loss_policy: "pause_then_exit",
+          emergency_exit_pct: 70,
+        })),
+      },
+    },
+  },
   preview_hash: "a".repeat(64),
   expires_at: Date.now() + 60 * 60_000,
   confirmation_url: `${base}/agent/confirm/${proposalId}`,
@@ -89,9 +112,11 @@ app.get("/fixture/privy.js", (_req, res) =>
 export class LocalStorage {}
 export default class Privy {
   async initialize() {}
-  user = { get: async () => ({ user: { id: 'local-fixture-user', linkedAccounts: [
+  user = { get: async () => {
+    if (new URL(location.href).searchParams.get('fixture') === 'missing-session') throw Error('No tokens found in storage');
+    return ({ user: { id: 'local-fixture-user', linkedAccounts: [
     { type:'wallet', chainType:'ethereum', walletClientType:'privy', address:'0x'+'1'.repeat(40), id:'local-fixture-wallet' }
-  ] } }) };
+  ] } }); } };
   async getAccessToken() { return 'local-fixture-privy'; }
   auth = { oauth: { generateURL: async () => { throw Error('Unexpected Google redirect in local acceptance'); } } };
 }`),

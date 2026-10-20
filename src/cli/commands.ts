@@ -163,8 +163,7 @@ export async function runCli(
     return;
   }
   if (command === "setup") {
-    const server =
-      flags.server ?? process.env.RIDE_MCP_URL;
+    const server = flags.server ?? process.env.RIDE_MCP_URL;
     console.log(
       JSON.stringify(
         await (installDependencies.onboard ?? onboard)(
@@ -399,7 +398,7 @@ function print(value: Result, pretty: boolean): void {
         market: s.trader.market,
         score: s.trader.score,
         USDC: s.amount_usdc,
-        leverage: `≤${s.leverage_cap}x`,
+        leverage: `${s.leverage_cap == null ? "Follow source · no extra cap" : `≤${s.leverage_cap}x`}${s.leverage_cap_source === "inherited" || (s.trader.market === "perps" && s.leverage_cap != null && !s.leverage_mode) ? " · 继承旧设置" : ""}`,
         style: s.trader.style,
       })),
     );

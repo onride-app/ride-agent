@@ -26,7 +26,7 @@ export const accountCopiesInput = z
   .strict();
 
 const predictionFields = `id configId traderAddress marketTitle side status shares entryPrice
-  currentPnl currentPnlPercent displayCurrentValue displayCurrentPnl claimable openedAt closedAt`;
+  currentPnl currentPnlPercent displayCurrentValue displayCurrentPnl displayCurrentPnlPercent claimable openedAt closedAt`;
 const perpsFields = `id configId traderAddress coin side size entryPx markPx positionValue marginUsed
   unrealizedPnl realizedPnl tradingFees fundingPnl netPnl status openedAt closedAt`;
 const perpsQuery = `query RideAppPerps {
@@ -87,6 +87,8 @@ export async function readAccountCopies(
     me { id username }
     copyTradeSummary { totalConfigs enabledConfigs totalOpenPositions totalRealizedPnl totalAllocation totalAvailableFund }
     myCopyTradeConfigs { id traderAddress allocatedFund availableFund isEnabled currentPositions }
+    openInventory: copyTradePositions(status: OPEN, limit: 1, offset: 0) { totalCount }
+    closingInventory: copyTradePositions(status: CLOSING, limit: 1, offset: 0) { totalCount }
     ${statuses.map((s, i) => connection(`positions${i}`, s)).join("\n")}
   }`;
   const reads = await Promise.allSettled([
@@ -131,7 +133,47 @@ export async function readAccountCopies(
           )),
   );
   const pages = statuses.map((_, i) => prediction.value[`positions${i}`]);
-  const predictionPositions = unique(pages.flatMap((p) => p?.positions ?? []));
+  const fetchedAt = new Date().toISOString();
+  const predictionPositions = unique(
+    pages.flatMap((p) => p?.positions ?? []),
+  ).map((p) => {
+    // Wallet display metrics supersede the older market-price estimate as a pair.
+    const wallet = p.displayCurrentPnl != null;
+    const pnl = wallet ? p.displayCurrentPnl : (p.currentPnl ?? null);
+    let percent = wallet ? null : (p.currentPnlPercent ?? null);
+    if (wallet && p.displayCurrentValue != null) {
+      try {
+        const cost = D(p.displayCurrentValue).minus(pnl);
+        if (cost.isFinite() && cost.gt(0))
+          percent = D(pnl).div(cost).times(100).toFixed(6);
+      } catch {
+        /* An unknown cost basis leaves percentage unavailable. */
+      }
+    }
+    return {
+      ...p,
+      currentPnl: pnl,
+      displayCurrentPnl: pnl,
+      displayCurrentValue: wallet ? (p.displayCurrentValue ?? null) : null,
+      currentPnlPercent: percent,
+      displayCurrentPnlPercent: percent,
+      valuation: {
+        source: wallet
+          ? "copy_wallet_display_metrics"
+          : pnl != null
+            ? "market_price_estimate"
+            : "unavailable",
+        fetched_at: fetchedAt,
+        source_observed_at: null,
+        note: "PnL fields use one valuation; fetch time is not the source price timestamp.",
+      },
+    };
+  });
+  const openCount = prediction.value.openInventory?.totalCount;
+  const closingCount = prediction.value.closingInventory?.totalCount;
+  const summaryComplete = [openCount, closingCount].every(
+    (n) => Number.isSafeInteger(n) && n >= 0,
+  );
   const complete =
     perps.every((r) => r.status === "fulfilled") &&
     pages.every((p) => p && !p.hasNextPage);
@@ -143,10 +185,19 @@ export async function readAccountCopies(
     },
     query_scope: "ride_app_copies",
     management: "ride_app",
-    coverage_complete: complete,
+    coverage_complete: complete && summaryComplete,
     prediction: {
       configs: prediction.value.myCopyTradeConfigs,
-      summary: prediction.value.copyTradeSummary,
+      summary: {
+        ...prediction.value.copyTradeSummary,
+        totalOpenPositions: summaryComplete ? openCount + closingCount : null,
+        openPositionCount: openCount ?? null,
+        closingPositionCount: closingCount ?? null,
+        position_count_source: "account_position_status_counts",
+        includes_disabled_configs: true,
+        scope: "all_account_positions_open_or_closing",
+        fetched_at: fetchedAt,
+      },
       positions: predictionPositions,
       has_more: pages.some((p) => p?.hasNextPage),
     },
@@ -158,11 +209,11 @@ export async function readAccountCopies(
   }) as Record<string, unknown>;
   return result(
     data,
-    complete ? "ok" : "stale",
-    complete
+    complete && summaryComplete ? "ok" : "stale",
+    complete && summaryComplete
       ? []
       : [
-          "Some App account reads or position pages are unavailable. Missing positions must not be treated as zero.",
+          "Some App account reads, position counts or pages are unavailable. Missing positions must not be treated as zero.",
         ],
   );
 }
