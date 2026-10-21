@@ -4,6 +4,7 @@ import express from "express";
 import { VERSION } from "../version.js";
 import { firebaseAccount } from "./firebase.js";
 import pg from "pg";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   createHash,
   createSign,
@@ -43,6 +44,13 @@ export class CoreBridge {
   private taxonomyCache: { at: number; values: Map<string, string> } | null =
     null;
   private candidatesCache: { at: number; rows: any[] } | null = null;
+  private discoveryCache: { until: number; rows: Candidate[] } | null = null;
+  private discoveryFlight: Promise<Candidate[]> | null = null;
+  private discoveryFailure: { until: number; error: AgentError } | null = null;
+  private candleReads = new Map<
+    string,
+    { until: number; read: Promise<any[]> }
+  >();
   private tokens: { value: string; expiry: number } | null = null;
   constructor(
     private coreUrl: string,
@@ -142,13 +150,17 @@ export class CoreBridge {
       signal: AbortSignal.timeout(12000),
       redirect: "error",
     });
-    if (!response.ok)
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       throw new AgentError(
-        "VENUE_UNAVAILABLE",
-        "Hyperliquid read failed.",
-        true,
+        response.status === 429 ? "VENUE_RATE_LIMITED" : "VENUE_UNAVAILABLE",
+        response.status === 429
+          ? "Hyperliquid reads are temporarily rate limited."
+          : "Hyperliquid read failed.",
+        response.status === 429 || response.status >= 500,
         503,
       );
+    }
     return response.json();
   }
   private traderId(address: string) {
@@ -350,6 +362,41 @@ export class CoreBridge {
         !state.assetPositions.some((x: any) => x.position?.coin?.includes(":")),
     };
   }
+  private async profileCandles(asset: string): Promise<any[]> {
+    const end = Math.floor(now() / 86400_000) * 86400_000;
+    const key = `${asset}:${end}`;
+    for (const [key, entry] of this.candleReads)
+      if (entry.until <= now()) this.candleReads.delete(key);
+    let entry = this.candleReads.get(key);
+    if (!entry) {
+      // These are closed daily candles, shared across traders. Never cache a
+      // live source/account read used by execution.
+      if (this.candleReads.size >= 128)
+        this.candleReads.delete(this.candleReads.keys().next().value!);
+      entry = {
+        until: now() + 5 * 60_000,
+        read: this.info(
+          {
+            type: "candleSnapshot",
+            req: {
+              coin: asset,
+              interval: "1d",
+              startTime: end - 16 * 86400_000,
+              endTime: end - 1,
+            },
+          },
+          true,
+        ).catch((error) => {
+          // A failed optional ATR read must not fan out across every trader.
+          entry!.until =
+            now() + (error?.code === "VENUE_RATE_LIMITED" ? 60_000 : 2000);
+          throw error;
+        }),
+      };
+      this.candleReads.set(key, entry);
+    }
+    return structuredClone(await entry.read);
+  }
   async profile(id: string): Promise<Candidate> {
     if (
       process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
@@ -463,19 +510,7 @@ export class CoreBridge {
     try {
       const returns: number[] = [];
       for (const asset of assets.slice(0, 3)) {
-        const end = Math.floor(now() / 86400_000) * 86400_000;
-        const candles = await this.info(
-          {
-            type: "candleSnapshot",
-            req: {
-              coin: asset,
-              interval: "1d",
-              startTime: end - 16 * 86400_000,
-              endTime: end - 1,
-            },
-          },
-          true,
-        );
+        const candles = await this.profileCandles(asset);
         if (candles.length < 15) continue;
         const sorted = candles.sort((a: any, b: any) => a.t - b.t);
         const tr = sorted.slice(-14).map((c: any, i: number) => {
@@ -601,24 +636,125 @@ export class CoreBridge {
       return process.env.RIDE_AGENT_PREDICTION_ENABLED === "true"
         ? this.prediction.candidates()
         : [];
-    const sorted = [...(await this.rows())]
-      .filter((r) => r.eligibility === "PASS" && r.expires_at > now())
-      .sort((a, b) => Number(b.score) - Number(a.score))
-      .slice(0, 30);
-    const out: Candidate[] = [];
-    for (let offset = 0; offset < sorted.length; offset += 3) {
-      const batch = await Promise.allSettled(
-        sorted
-          .slice(offset, offset + 3)
-          .map((r) => this.profile(this.traderId(r.address))),
-      );
-      for (const r of batch) if (r.status === "fulfilled") out.push(r.value);
-    }
+    const out = await this.perpsCandidates();
     if (
       market !== "perps" &&
       process.env.RIDE_AGENT_PREDICTION_ENABLED === "true"
     )
       out.push(...(await this.prediction.candidates()));
+    return out;
+  }
+  private async perpsCandidates(): Promise<Candidate[]> {
+    if (this.discoveryCache && this.discoveryCache.until > now())
+      return structuredClone(this.discoveryCache.rows);
+    if (this.discoveryFlight)
+      return structuredClone(await this.discoveryFlight);
+    if (this.discoveryFailure && this.discoveryFailure.until > now())
+      throw this.discoveryFailure.error;
+    const read = this.readPerpsCandidates();
+    this.discoveryFlight = read;
+    try {
+      const rows = await read;
+      this.discoveryFailure = null;
+      return structuredClone(rows);
+    } catch (error) {
+      const normalized =
+        error instanceof AgentError
+          ? error
+          : new AgentError(
+              "CANDIDATE_SOURCE_UNAVAILABLE",
+              "The complete candidate snapshot could not be verified. Retry shortly.",
+              true,
+              503,
+            );
+      this.discoveryFailure = {
+        until:
+          now() + (normalized.code === "VENUE_RATE_LIMITED" ? 60_000 : 2000),
+        error: normalized,
+      };
+      throw normalized;
+    } finally {
+      this.discoveryFlight = null;
+    }
+  }
+  private async readPerpsCandidates(): Promise<Candidate[]> {
+    const started = now();
+    const sorted = [...(await this.rows())]
+      .filter((r) => r.eligibility === "PASS" && r.expires_at > now())
+      .sort(
+        (a, b) =>
+          Number(b.score) - Number(a.score) ||
+          this.traderId(a.address).localeCompare(this.traderId(b.address)),
+      )
+      .slice(0, 30);
+    const out: Candidate[] = [];
+    for (let offset = 0; offset < sorted.length; offset += 3) {
+      const batch = await Promise.allSettled(
+        sorted.slice(offset, offset + 3).map(async (r) => {
+          const id = this.traderId(r.address);
+          try {
+            return await this.profile(id);
+          } catch (error) {
+            // Retry transient transport/5xx failures once. A 429 needs a
+            // cooldown, not a second burst of the same expensive reads.
+            if (
+              error instanceof AgentError &&
+              (!error.retryable || error.code === "VENUE_RATE_LIMITED")
+            )
+              throw error;
+            await delay(250);
+            return this.profile(id);
+          }
+        }),
+      );
+      const failures = batch.flatMap((r, i) =>
+        r.status === "rejected"
+          ? [{ id: this.traderId(sorted[offset + i].address), error: r.reason }]
+          : [],
+      );
+      if (failures.length) {
+        const rateLimited = failures.some(
+          (f) => f.error?.code === "VENUE_RATE_LIMITED",
+        );
+        console.warn(
+          JSON.stringify({
+            event: "candidate_snapshot_unavailable",
+            expected: sorted.length,
+            verified:
+              out.length + batch.filter((r) => r.status === "fulfilled").length,
+            failures: failures.map((f) => ({
+              trader_id: f.id,
+              code:
+                f.error instanceof AgentError ? f.error.code : "READ_FAILED",
+            })),
+          }),
+        );
+        throw new AgentError(
+          rateLimited ? "VENUE_RATE_LIMITED" : "CANDIDATE_SOURCE_INCOMPLETE",
+          "The complete candidate snapshot could not be verified. Retry shortly; the previous snapshot was not replaced.",
+          true,
+          503,
+        );
+      }
+      for (const r of batch) if (r.status === "fulfilled") out.push(r.value);
+    }
+    const until = Math.min(started + 60_000, ...out.map((c) => c.expires_at));
+    if (until <= now())
+      throw new AgentError(
+        "CANDIDATE_SOURCE_INCOMPLETE",
+        "The candidate snapshot expired during the read. Retry with fresh source data.",
+        true,
+        503,
+      );
+    this.discoveryCache = { until, rows: out };
+    console.info(
+      JSON.stringify({
+        event: "candidate_snapshot_refreshed",
+        count: out.length,
+        expires_at: until,
+        elapsed_ms: now() - started,
+      }),
+    );
     return out;
   }
   private async paged(

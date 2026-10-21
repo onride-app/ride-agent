@@ -151,12 +151,51 @@ export class AgentService {
           s.selected_trader_ids = [...new Set(args.trader_ids as string[])];
         const selectedIds = s.selected_trader_ids;
         let pool: Candidate[];
-        let sourceReadFailed = false;
         try {
           pool = await this.adapter.candidates(savedPref.market);
-        } catch {
-          sourceReadFailed = true;
-          pool = [];
+        } catch (error) {
+          const code =
+            error instanceof AgentError
+              ? error.code
+              : "CANDIDATE_SOURCE_UNAVAILABLE";
+          return {
+            ...result(
+              {
+                ...conversationView(null, collection, [], !!selectedIds),
+                plan: null,
+                plan_unchanged: true,
+                saved_plan_id: s.plans.at(-1)?.id ?? null,
+                account: { authenticated: true, user_id: user },
+                selected_trader_ids: selectedIds ?? [],
+                missing_selected_trader_ids: null,
+                candidates: [],
+                candidates_meta: { total: null, returned: 0, has_more: false },
+                candidate_source: {
+                  status: "unavailable",
+                  previous_snapshot_retained: !!s.discovery,
+                  previous_snapshot_at: s.discovery?.created_at ?? null,
+                },
+                recommendation_diagnostics: {
+                  diagnostic_id: uid("diagnostic"),
+                  stage: "candidate_source_fetch",
+                  blocker: code,
+                  count_semantics:
+                    "Source verification failed; candidate counts and feasible trader counts are unavailable, not zero.",
+                  source_candidates: null,
+                  requested_basket_size: savedPref.basket_size ?? null,
+                  feasible_basket_sizes: null,
+                  funding_required: false,
+                },
+              },
+              "stale",
+            ),
+            error: {
+              code,
+              message:
+                "The complete candidate source is temporarily unavailable. Retry shortly; your saved plan, selection and previous candidate snapshot were preserved. Funding is not required.",
+              retryable: true,
+            },
+          };
         }
         const planningPool = selectedIds
           ? pool.filter((c) => selectedIds.includes(c.id))
@@ -292,7 +331,6 @@ export class AgentService {
             "market_source_data_unavailable",
             "stale_source_scores",
           ].includes(diagnostics.blocker ?? "");
-          if (sourceReadFailed) diagnostics.stage = "candidate_source_fetch";
           const diagnosticCode =
             error instanceof AgentError
               ? error.code
