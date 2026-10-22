@@ -34,6 +34,8 @@ Setup preserves unrelated settings, upgrades unmodified managed installations an
 
 Registry installation is the default. To use the pinned GitHub release source, run `npx -y github:onride-app/ride-agent#v0.5.2 setup --client CLIENT --trade --distribution github`. Other clients supporting remote Streamable HTTP MCP with OAuth can connect to `https://mcp.onride.me/mcp`; their registration and consent interface is managed by that client. The installer currently configures Codex, Claude Code and Cursor.
 
+For ChatGPT, connect Ride through ChatGPT's app/connector settings using the hosted MCP URL. npm setup and standalone CLI login do not authorize a ChatGPT connection. If a tool returns `AUTH_REQUIRED`, reconnect Ride in those settings and finish its OAuth flow, then retry in a new chat. Keep the user's previously supplied preferences; authentication does not require repeating their budget or risk answers. A chat message cannot itself open the host's login interface or create a valid OAuth authorization URL.
+
 For the Skill alone:
 
 ```sh
