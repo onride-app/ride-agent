@@ -90,7 +90,12 @@ async function main(): Promise<void> {
       !login?.accessToken ||
       !login.user?.id
     )
-      throw new AgentError("AUTH_REQUIRED", "Ride Agent sign-in failed.", false, 401);
+      throw new AgentError(
+        "AUTH_REQUIRED",
+        "Ride Agent sign-in failed.",
+        false,
+        401,
+      );
     return {
       rideAuthToken: login.accessToken as string,
       identity: {
@@ -109,9 +114,12 @@ async function main(): Promise<void> {
   });
   const app = createRideHttpApp(host),
     resource = new URL("/mcp", base),
+    oauth = {
+      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
+    },
     auth = requireBearerAuth({
       verifier: provider,
-      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
+      resourceMetadataUrl: oauth.resourceMetadataUrl,
     }),
     readOnly = process.env.RIDE_PUBLIC_SUBMISSION_MODE === "true";
   app.use(
@@ -195,25 +203,30 @@ async function main(): Promise<void> {
             { proposal_id: id },
           ),
       },
+      oauth,
     );
-    registerAppAccountRead(server, async (args, extra) => {
-      if (!extra.authInfo?.scopes?.includes("ride:read"))
-        throw new AgentError(
-          "SCOPE_REQUIRED",
-          "Missing ride:read permission.",
-          false,
-          403,
-        );
-      const token = extra.authInfo?.extra?.rideAuthToken;
-      if (typeof token !== "string")
-        throw new AgentError(
-          "AUTH_REQUIRED",
-          "A Ride OAuth session is required.",
-          false,
-          401,
-        );
-      return accountRead("get_my_copies", args, token);
-    });
+    registerAppAccountRead(
+      server,
+      async (args, extra) => {
+        if (!extra.authInfo?.scopes?.includes("ride:read"))
+          throw new AgentError(
+            "SCOPE_REQUIRED",
+            "Missing ride:read permission.",
+            false,
+            403,
+          );
+        const token = extra.authInfo?.extra?.rideAuthToken;
+        if (typeof token !== "string")
+          throw new AgentError(
+            "AUTH_REQUIRED",
+            "A Ride OAuth session is required.",
+            false,
+            401,
+          );
+        return accountRead("get_my_copies", args, token);
+      },
+      oauth,
+    );
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });

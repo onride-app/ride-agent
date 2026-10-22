@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { accountCopiesInput } from "../account_reads.js";
 import { claudeCardDomain } from "./card_hosts.js";
@@ -18,9 +19,47 @@ import {
 } from "./contracts.js";
 
 export const RESOURCE_URI = "ui://ride/agent-v7-confirmation.html";
+export type McpOAuthContext = { resourceMetadataUrl: string };
+
+function securityMeta(scope: string, oauth?: McpOAuthContext) {
+  // The SDK preserves extension fields under _meta in tools/list.
+  return oauth
+    ? { securitySchemes: [{ type: "oauth2", scopes: [scope] }] }
+    : {};
+}
+
+function toolResult(
+  value: Result,
+  scope: string,
+  oauth?: McpOAuthContext,
+): CallToolResult {
+  const response: CallToolResult = {
+    content: [{ type: "text", text: JSON.stringify(value) }],
+    structuredContent: value,
+    isError: !!value.error,
+  };
+  if (
+    oauth &&
+    ["AUTH_REQUIRED", "SCOPE_REQUIRED"].includes(value.error?.code ?? "")
+  ) {
+    const insufficientScope = value.error?.code === "SCOPE_REQUIRED";
+    // Use fixed descriptions, never upstream error text or bearer tokens.
+    response._meta = {
+      "mcp/www_authenticate": [
+        `Bearer resource_metadata=${JSON.stringify(oauth.resourceMetadataUrl)}, ` +
+          `error="${insufficientScope ? "insufficient_scope" : "invalid_token"}", ` +
+          `error_description="${insufficientScope ? "Reconnect Ride to grant the required permission." : "Your Ride session has expired. Reconnect Ride to continue."}", ` +
+          `scope=${JSON.stringify(scope)}`,
+      ],
+    };
+  }
+  return response;
+}
+
 export function registerAppAccountRead(
   server: McpServer,
   invoke: (args: unknown, extra: any) => Promise<Result>,
+  oauth?: McpOAuthContext,
 ): void {
   server.registerTool(
     "get_my_copies",
@@ -36,22 +75,15 @@ export function registerAppAccountRead(
         idempotentHint: true,
         openWorldHint: true,
       },
+      _meta: securityMeta("ride:read", oauth),
     },
     async (args, extra) => {
       try {
         const value = publicResult(await invoke(args, extra));
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(value) }],
-          structuredContent: value,
-          isError: !!value.error,
-        };
+        return toolResult(value, "ride:read", oauth);
       } catch (e) {
         const value = failure(e);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(value) }],
-          structuredContent: value,
-          isError: true,
-        };
+        return toolResult(value, "ride:read", oauth);
       }
     },
   );
@@ -64,6 +96,7 @@ export function registerAgentTools(
     base: string;
     readProposal: (id: string, extra: any) => Promise<Result>;
   },
+  oauth?: McpOAuthContext,
 ): void {
   const confirmationOrigin = confirmation
     ? new URL(confirmation.base).origin
@@ -151,6 +184,7 @@ export function registerAgentTools(
           openWorldHint: false,
         },
         _meta: {
+          ...securityMeta("ride:read", oauth),
           ui: { resourceUri: RESOURCE_URI },
           "openai/outputTemplate": RESOURCE_URI,
         },
@@ -200,18 +234,10 @@ export function registerAgentTools(
             );
             value.data.confirmation_card = true;
           }
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(value) }],
-            structuredContent: value,
-            isError: !!value.error,
-          };
+          return toolResult(value, "ride:read", oauth);
         } catch (e) {
           const value = failure(e);
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(value) }],
-            structuredContent: value,
-            isError: true,
-          };
+          return toolResult(value, "ride:read", oauth);
         }
       },
     );
@@ -235,30 +261,34 @@ export function registerAgentTools(
           idempotentHint: !stateTools.has(name) && !mutationTools.has(name),
           openWorldHint: true,
         },
-        ...(mutationTools.has(name) || name === "prepare_deposit"
-          ? {
-              _meta: {
+        _meta: {
+          ...securityMeta(
+            mutationTools.has(name) ? "ride:trade" : "ride:read",
+            oauth,
+          ),
+          ...(mutationTools.has(name) || name === "prepare_deposit"
+            ? {
                 ui: { resourceUri: RESOURCE_URI },
                 "openai/outputTemplate": RESOURCE_URI,
-              },
-            }
-          : {}),
+              }
+            : {}),
+        },
       },
       async (args: unknown, extra: any) => {
         try {
           const value = publicResult(await invoke(name, args, extra));
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(value) }],
-            structuredContent: value,
-            isError: !!value.error,
-          };
+          return toolResult(
+            value,
+            mutationTools.has(name) ? "ride:trade" : "ride:read",
+            oauth,
+          );
         } catch (e) {
           const value = failure(e);
-          return {
-            content: [{ type: "text" as const, text: JSON.stringify(value) }],
-            structuredContent: value,
-            isError: true,
-          };
+          return toolResult(
+            value,
+            mutationTools.has(name) ? "ride:trade" : "ride:read",
+            oauth,
+          );
         }
       },
     );
