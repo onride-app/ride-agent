@@ -69,7 +69,7 @@ export async function onboard(
   } catch (e) {
     const reason = e instanceof Error ? e.message : "Authentication failed";
     throw new Error(
-      `Ride Agent Skill and MCP are installed, but login is incomplete. Rerun the same setup command to retry. ${reason}`,
+      `Rider Skill and MCP are installed, but login is incomplete. Rerun the same setup command to retry. ${reason}`,
     );
   }
   return {

@@ -67,7 +67,7 @@ async function call(operation, body = {}) {
     }),
   });
   const out = await response.json();
-  if (!response.ok) throw Error(out.error?.message ?? "Ride Agent request failed.");
+  if (!response.ok) throw Error(out.error?.message ?? "Rider request failed.");
   return out;
 }
 function button(parent, text, action) {
@@ -294,7 +294,7 @@ try {
     );
     history.replaceState({}, "", location.pathname);
     await finish(session);
-  } else if (query.has("error")) showError(Error("Ride Agent login declined."));
+  } else if (query.has("error")) showError(Error("Rider login declined."));
   else await finish();
 } catch (e) {
   showError(e);

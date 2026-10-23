@@ -967,7 +967,7 @@ export class AgentRunner {
           await this.tick(user);
         } catch {
           console.error(
-            "Ride Agent monitoring cycle failed; retained for retry.",
+            "Rider monitoring cycle failed; retained for retry.",
           );
         }
       }

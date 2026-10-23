@@ -1611,7 +1611,7 @@ export class CoreBridge {
           body: JSON.stringify({
             message: {
               token,
-              notification: { title: "Ride Agent", body: event.message },
+              notification: { title: "Rider", body: event.message },
               data: {
                 type: "ride_agent",
                 event_id: event.id,

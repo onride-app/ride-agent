@@ -1,4 +1,4 @@
-name: Publish Ride Agent
+name: Publish Rider
 on:
   workflow_dispatch:
 permissions:

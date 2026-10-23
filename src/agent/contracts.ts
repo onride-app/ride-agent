@@ -278,7 +278,7 @@ export function failure(error: unknown): Result {
           )
         : new AgentError(
             "INTERNAL_ERROR",
-            "Ride Agent could not complete this request.",
+            "Rider could not complete this request.",
             true,
             500,
           );

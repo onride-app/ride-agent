@@ -46,7 +46,7 @@ try {
       ["--help"],
       { encoding: "utf8" },
     );
-    assert(help.includes("Ride Agent"));
+    assert(help.includes("Rider"));
   }
   const root = join(temp, "node_modules", packed.name);
   const metadata = JSON.parse(
@@ -143,7 +143,7 @@ try {
     );
     assert.deepEqual(mcp.getServerVersion(), {
       name: "ride",
-      title: "Ride Agent",
+      title: "Rider",
       version: metadata.version,
     });
     const { tools } = await mcp.listTools();

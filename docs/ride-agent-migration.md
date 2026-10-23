@@ -40,7 +40,7 @@ npx -y --prefer-online @onride/agent@latest setup --skip-login
 
 Add `--client codex`, `--client claude-code` or `--client cursor` to choose a client explicitly. Run once per client if several are installed. Omit `--server` to preserve the installed URL; an environment override `RIDE_MCP_URL` is an explicit server selection and must match the existing registration. Reconnect MCP or open a new chat afterwards.
 
-The CLI command, MCP registration key and Skill directory remain `ride`. MCP implementations advertise the independent display title `Ride Agent`. Tool names, `ride:read`/`ride:trade` scopes and the `~/.ride` session path remain unchanged. Codex keeps its native OAuth store and HTTP entry; Claude Code/Cursor retain their stdio session. Migration does not request login or broader scopes when `--skip-login` is used.
+The CLI command, MCP registration key and Skill directory remain `ride`. MCP implementations advertise the independent display title `Rider`. Tool names, `ride:read`/`ride:trade` scopes and the `~/.ride` session path remain unchanged. Codex keeps its native OAuth store and HTTP entry; Claude Code/Cursor retain their stdio session. Migration does not request login or broader scopes when `--skip-login` is used.
 
 The installer recognizes released fixed-version npm/GitHub launchers and the old npm `latest` launcher, including the actual published 0.5.0 Skill tree. It replaces only managed registrations and known unmodified Skills. Custom servers and unrelated client settings survive. Custom arguments, environment entries, wrappers, unrecognized versions or edited Skills require manual review; conflicts leave the original files untouched and report their paths.
 
@@ -116,7 +116,7 @@ Keep the old package downloadable. Do not unpublish it or move its latest tag as
 | Regression tests with isolated PostgreSQL | 211 passed, 0 failed, 0 skipped, including current main's confirmation-card compatibility fixes |
 | Functional OAuth/MCP/CLI/Pg and simulated execution | 45 passed, 0 failed; no real funds moved |
 | Packed files / installed CLI / all-client fresh and repeat setup | Passed; see the verification JSON for the final file count and tarball size |
-| Built MCP identity | `name=ride`, `title=Ride Agent`, release 0.5.2 |
+| Built MCP identity | `name=ride`, `title=Rider`, release 0.5.3 |
 | Published 0.5.0 upgrades | Fixed npm, old npm latest and GitHub launchers on all 3 clients passed |
 | Custom server, unrelated settings and session preservation | Passed |
 | Custom configuration refusal / failed commit rollback and retry | Passed |

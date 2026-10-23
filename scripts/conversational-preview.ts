@@ -217,7 +217,7 @@ app.get("/preview", (_req, res) =>
   res.type("html")
     .send(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ride V18 functional preview</title>
 <style>body{margin:0;background:#fcfbf8;font:14px system-ui}header{padding:10px;background:#f5f3ec;display:flex;flex-wrap:wrap;gap:8px;align-items:center}iframe{width:100%;height:calc(100vh - 70px);border:0}button{padding:6px}small{max-width:100%}</style>
-<header><small>Local acceptance · simulated venue, real cards and backend</small><button id="fund">Simulate funding</button><button id="confirm">Simulate Ride human confirmation</button><button id="portfolio">Load portfolio</button><button id="settings">Notification settings</button></header><iframe id="app" src="/cards" title="Ride Agent cards"></iframe>
+<header><small>Local acceptance · simulated venue, real cards and backend</small><button id="fund">Simulate funding</button><button id="confirm">Simulate Ride human confirmation</button><button id="portfolio">Load portfolio</button><button id="settings">Notification settings</button></header><iframe id="app" src="/cards" title="Rider cards"></iframe>
 <script>
 const frame=document.querySelector('iframe');let lastProposal=null;window.calls=[];
 const send=value=>frame.contentWindow.postMessage({jsonrpc:'2.0',method:'ui/notifications/tool-result',params:{structuredContent:value}},'*');

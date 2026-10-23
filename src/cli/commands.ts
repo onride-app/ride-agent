@@ -26,7 +26,7 @@ import { selectClient } from "./clients.js";
 import { VERSION } from "../version.js";
 import { fetchGuide, GUIDE_INSTRUCTIONS, registerGuide } from "../guide.js";
 
-export const HELP = `Ride Agent — AI Copy-Trading Agent\n  Run with no arguments to install Skill + MCP and start browser login.\n  setup [--client codex|claude-code|cursor|auto] [--trade] [--skip-login] [--server URL] [--distribution npm|github]\n  login --server https://YOUR-RIDE-HOST/mcp [--trade]\n  preferences --json '{"budget_usdc":"500","risk_tolerance":"medium"}'\n  recommend | traders [--sort score|drawdown|roi] [--limit 10] [--cursor CURSOR] | trader TRADER_ID | portfolio [PORTFOLIO_ID] | review [PORTFOLIO_ID]\n  copy start PLAN_ID | copy update COPY_ID --json '{"leverage_cap":5}'\n  copy stop COPY_ID [--mode wind_down|close_now]\n  updates [--cursor CURSOR] [--limit 20] | position close POSITION_ID\n  plan recalculate PLAN_ID [--json ALLOCATIONS_JSON]\n  performance [PORTFOLIO_ID] [--period daily|weekly|inception]\n  diagnose COPY_ID --start-at MILLISECONDS --end-at MILLISECONDS\n  copies [--status open] [--limit 100] [--offset 0]\n  notifications [--json SETTINGS_JSON]\n  proposal PROPOSAL_ID | confirm PROPOSAL_ID\n  guide [--server URL] (current workflow; no login)\n  mcp [--server URL]\n  deposit options | deposit address --json ROUTE | deposit prepare DEPOSIT_ID --json AMOUNT | deposit status DEPOSIT_ID\n  portfolio update PORTFOLIO_ID --json CHANGES | daily [--timezone Asia/Shanghai]\nSetup installs Skill + MCP and starts browser login (default server: https://mcp.onride.me/mcp).\nJSON output is default. --pretty renders a human-readable view. Confirmation opens Ride.\n`;
+export const HELP = `Rider — AI Copy-Trading Agent\n  Run with no arguments to install Skill + MCP and start browser login.\n  setup [--client codex|claude-code|cursor|auto] [--trade] [--skip-login] [--server URL] [--distribution npm|github]\n  login --server https://YOUR-RIDE-HOST/mcp [--trade]\n  preferences --json '{"budget_usdc":"500","risk_tolerance":"medium"}'\n  recommend | traders [--sort score|drawdown|roi] [--limit 10] [--cursor CURSOR] | trader TRADER_ID | portfolio [PORTFOLIO_ID] | review [PORTFOLIO_ID]\n  copy start PLAN_ID | copy update COPY_ID --json '{"leverage_cap":5}'\n  copy stop COPY_ID [--mode wind_down|close_now]\n  updates [--cursor CURSOR] [--limit 20] | position close POSITION_ID\n  plan recalculate PLAN_ID [--json ALLOCATIONS_JSON]\n  performance [PORTFOLIO_ID] [--period daily|weekly|inception]\n  diagnose COPY_ID --start-at MILLISECONDS --end-at MILLISECONDS\n  copies [--status open] [--limit 100] [--offset 0]\n  notifications [--json SETTINGS_JSON]\n  proposal PROPOSAL_ID | confirm PROPOSAL_ID\n  guide [--server URL] (current workflow; no login)\n  mcp [--server URL]\n  deposit options | deposit address --json ROUTE | deposit prepare DEPOSIT_ID --json AMOUNT | deposit status DEPOSIT_ID\n  portfolio update PORTFOLIO_ID --json CHANGES | daily [--timezone Asia/Shanghai]\nSetup installs Skill + MCP and starts browser login (default server: https://mcp.onride.me/mcp).\nJSON output is default. --pretty renders a human-readable view. Confirmation opens Ride.\n`;
 export function parseCommand(argv: string[]): {
   command: string;
   name?: ToolName;
@@ -201,7 +201,7 @@ export async function runCli(
   }
   if (command === "mcp") {
     const server = new McpServer(
-      { name: "ride", title: "Ride Agent", version: VERSION },
+      { name: "ride", title: "Rider", version: VERSION },
       { instructions: GUIDE_INSTRUCTIONS },
     );
     registerGuide(server, async () => {
@@ -303,7 +303,7 @@ export async function runCli(
           throw new Error("Proposal has no confirmation URL");
         const confirmation = new URL(proposal.confirmation_url);
         if (confirmation.origin !== new URL(session.server).origin)
-          throw new Error("Confirmation origin does not match Ride Agent");
+          throw new Error("Confirmation origin does not match Rider");
         await openBrowser(confirmation.href);
       }
       print(value, !!flags.pretty);
@@ -332,7 +332,7 @@ function print(value: Result, pretty: boolean): void {
     console.log(JSON.stringify(value));
     return;
   }
-  console.log(`Ride Agent · ${value.status} · ${value.as_of}`);
+  console.log(`Rider · ${value.status} · ${value.as_of}`);
   const data = value.data as any;
   if (Array.isArray(data.candidates)) {
     console.log(

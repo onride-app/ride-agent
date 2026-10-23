@@ -385,7 +385,7 @@ export async function createRedisOAuthStateStore(options: {
 }): Promise<RideOAuthStateStore> {
   const client = createClient({ url: options.url });
   client.on("error", (error) => {
-    console.error("Ride Agent OAuth Redis error:", error);
+    console.error("Rider OAuth Redis error:", error);
   });
   await client.connect();
   return new RedisOAuthStateStore(client as RedisClientType, options.keyPrefix ?? "ride:mcp:oauth");
@@ -855,7 +855,7 @@ function renderAuthorizePage(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorize Ride Agent</title>
+  <title>Authorize Rider</title>
   <style>
     :root {
       color-scheme: light;
@@ -997,7 +997,7 @@ function renderAuthorizePage(
 </head>
 <body>
   <main>
-    <h1>Authorize Ride Agent</h1>
+    <h1>Authorize Rider</h1>
     <p>${escapeHtml(clientName)} wants access to your Ride account for Auto-Ride tools.</p>
     <div class="scope">Scopes: ${escapeHtml(scope)}</div>
 
@@ -1076,7 +1076,7 @@ function renderAuthorizePage(
       if (privy) return privy;
       if (privyInitialization) return privyInitialization;
       if (!config.privyAppId) {
-        throw new Error('Ride Agent is missing Privy configuration.');
+        throw new Error('Rider is missing Privy configuration.');
       }
       const options = {
         appId: config.privyAppId,
@@ -1179,7 +1179,7 @@ function renderAuthorizePage(
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error(payload.message || 'Ride Agent authorization failed.');
+        throw new Error(payload.message || 'Rider authorization failed.');
       }
       sessionStorage.removeItem(ACCESS_CODE_KEY);
       window.location.assign(payload.redirectUrl);
@@ -1191,7 +1191,7 @@ function renderAuthorizePage(
       if (!user?.id) throw new Error('Privy login did not return a user.');
       const walletResult = await ensureEmbeddedEthereumWallet(client, user);
       user = walletResult.user;
-      setStatus('Getting Ride Agent authorization...');
+      setStatus('Getting Rider authorization...');
       const privyAccessToken = await client.getAccessToken();
       if (!privyAccessToken) throw new Error('Could not get Privy access token.');
       await approveWithPrivy(user, privyAccessToken, walletResult.wallet, authProvider);
@@ -1250,7 +1250,7 @@ function renderPrivyOAuthCallbackPage(): string {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Completing Ride Agent Login</title>
+  <title>Completing Rider Login</title>
   <style>
     :root {
       color-scheme: light;
@@ -1291,14 +1291,14 @@ function renderPrivyOAuthCallbackPage(): string {
 </head>
 <body>
   <main>
-    <h1>Completing Ride Agent Login</h1>
-    <p id="status">Returning to Ride Agent authorization...</p>
+    <h1>Completing Rider Login</h1>
+    <p id="status">Returning to Rider authorization...</p>
   </main>
   <script>
     const statusEl = document.getElementById('status');
     const originalAuthorizeUrl = sessionStorage.getItem('ride:mcp:oauth_authorize_url');
     if (!originalAuthorizeUrl) {
-      statusEl.textContent = 'Missing original Ride Agent authorization request. Please restart authorization from your AI client.';
+      statusEl.textContent = 'Missing original Rider authorization request. Please restart authorization from your AI client.';
       statusEl.classList.add('error');
     } else {
       const currentUrl = new URL(window.location.href);

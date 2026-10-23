@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ride Agent · Fund trading account</title><style>/*INLINE_CSS*/:root {
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rider · Fund trading account</title><style>/*INLINE_CSS*/:root {
   font-family:
     Inter,
     -apple-system,
@@ -258,7 +258,7 @@ summary {
   border-radius: 16px;
   background: #fcfbf8;
 }
-</style></head><body><main><header><div class="brand">Ride Agent / trading account funding</div><span class="tag">Human confirmation</span></header><div class="card" id="login"><h1>Sign in to fund your trading account</h1><label>Access code, if required<input id="access-code" autocomplete="off"></label><button id="sign-in">Continue with Google</button></div><p id="status" aria-live="polite"></p><div id="content"></div></main><script type="module">const config=/*CONFIG*/{};
+</style></head><body><main><header><div class="brand">Rider / trading account funding</div><span class="tag">Human confirmation</span></header><div class="card" id="login"><h1>Sign in to fund your trading account</h1><label>Access code, if required<input id="access-code" autocomplete="off"></label><button id="sign-in">Continue with Google</button></div><p id="status" aria-live="polite"></p><div id="content"></div></main><script type="module">const config=/*CONFIG*/{};
 /*INLINE_FUND*/let client, csrf, user, funding;
 const status = document.getElementById("status"),
   content = document.getElementById("content");
@@ -328,7 +328,7 @@ async function call(operation, body = {}) {
     }),
   });
   const out = await response.json();
-  if (!response.ok) throw Error(out.error?.message ?? "Ride Agent request failed.");
+  if (!response.ok) throw Error(out.error?.message ?? "Rider request failed.");
   return out;
 }
 function button(parent, text, action) {
@@ -555,7 +555,7 @@ try {
     );
     history.replaceState({}, "", location.pathname);
     await finish(session);
-  } else if (query.has("error")) showError(Error("Ride Agent login declined."));
+  } else if (query.has("error")) showError(Error("Rider login declined."));
   else await finish();
 } catch (e) {
   showError(e);
