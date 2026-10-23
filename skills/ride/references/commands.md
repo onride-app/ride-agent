@@ -44,4 +44,4 @@ Default output is JSON. Add `--pretty` for human-readable cards/tables. The CLI 
 | get_preferences | `ride preferences`                                              |
 | prepare_deposit | `ride deposit prepare DEPOSIT_ID --json '{"amount_usdc":"10"}'` |
 
-Partial preference answers are saved; remaining questions are returned without a recommendation. Funding preparation returns a reviewed human confirmation page. Wallet credit, transaction confirmation, account activation and verified trading balance are separate states. Do not resubmit uncertain funding.
+Partial preference answers are saved; remaining questions are returned without a recommendation. Funding preparation displays a human confirmation card inside the conversation, with a Ride page fallback for unsupported clients. Connecting the account or signing can open a wallet window; approval and result tracking remain in the card. Refresh expired quotes and obtain a new approval. Wallet credit, transaction confirmation, account activation and verified trading balance are separate states. Do not resubmit uncertain funding.

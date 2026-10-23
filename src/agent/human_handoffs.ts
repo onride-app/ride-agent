@@ -4,7 +4,8 @@ import { createClient } from "redis";
 export type HumanHandoff = {
   session: string;
   challenge: string;
-  proposal_id: string;
+  proposal_id?: string;
+  deposit_id?: string;
   expires_at: number;
 };
 export interface HumanHandoffs {

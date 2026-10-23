@@ -10,6 +10,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { RESOURCE_URI } from "./agent/mcp.js";
 import {
   fetchGuide,
   packagedGuide,
@@ -69,6 +70,17 @@ it("an unchanged running stdio MCP reads a newly deployed workflow without setup
       await client.connect(transport);
       assert.equal(client.getInstructions(), GUIDE_INSTRUCTIONS);
       assert.equal((await client.listTools()).tools.length, 25);
+      const resource = (await client.readResource({ uri: RESOURCE_URI }))
+        .contents[0];
+      assert.deepEqual((resource._meta?.ui as any).csp.frameDomains, [
+        new URL(url).origin,
+      ]);
+      assert(
+        "text" in resource &&
+          resource.text.includes(
+            `"confirmation_origin":"${new URL(url).origin}"`,
+          ),
+      );
       const first = await client.callTool({
         name: "get_ride_guide",
         arguments: {},

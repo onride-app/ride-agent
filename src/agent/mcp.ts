@@ -18,7 +18,7 @@ import {
   type ToolName,
 } from "./contracts.js";
 
-export const RESOURCE_URI = "ui://ride/agent-v7-confirmation.html";
+export const RESOURCE_URI = "ui://ride/agent-v8-confirmation.html";
 export type McpOAuthContext = { resourceMetadataUrl: string };
 
 function securityMeta(scope: string, oauth?: McpOAuthContext) {
@@ -94,7 +94,7 @@ export function registerAgentTools(
   readOnly = false,
   confirmation?: {
     base: string;
-    readProposal: (id: string, extra: any) => Promise<Result>;
+    readProposal?: (id: string, extra: any) => Promise<Result>;
   },
   oauth?: McpOAuthContext,
 ): void {
@@ -110,6 +110,7 @@ export function registerAgentTools(
   });
   for (const resourceUri of [
     RESOURCE_URI,
+    "ui://ride/agent-v7-confirmation.html",
     "ui://ride/agent-v6-confirmation.html",
     "ui://ride/agent-v5-confirmation.html",
     "ui://ride/agent-v4-confirmation.html",
@@ -160,7 +161,7 @@ export function registerAgentTools(
         ],
       }),
     );
-  if (confirmation && !readOnly)
+  if (confirmation?.readProposal && !readOnly)
     server.registerTool(
       "show_confirmation_card",
       {
@@ -230,7 +231,7 @@ export function registerAgentTools(
                 400,
               );
             value = publicResult(
-              await confirmation.readProposal(proposal_id, extra),
+              await confirmation.readProposal!(proposal_id, extra),
             );
             value.data.confirmation_card = true;
           }
@@ -327,7 +328,7 @@ function description(name: ToolName): string {
     get_preferences:
       "Read saved/partial answers. Start in chat with budget and risk preference only; ask only returned missing questions. Preserve earlier answers. Numeric risk presets are suggestions requiring final confirmation, not user consent.",
     prepare_deposit:
-      "Prepare an exact-amount deposit activation for an owned funding request. Returns a human Rider confirmation URL; no funds move until the user confirms and signs there.",
+      "Prepare an exact-amount deposit activation for an owned funding request. Display the returned inline Rider funding confirmation card. The user reviews and confirms in the trusted card; Ride handles any required wallet signing. The URL is a fallback for clients without inline UI. Expired quotes must be refreshed and approved again. Never claim success until check_deposit_status verifies trading credit.",
     get_deposit_options:
       "Read currently supported funding routes. No funds are transferred.",
     get_deposit_address:
