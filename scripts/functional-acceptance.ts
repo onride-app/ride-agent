@@ -1888,6 +1888,11 @@ try {
     await ok(widgetClient, "set_preferences", { risk_tolerance: "medium" });
     const d = (await ok(widgetClient, "recommend_traders")).data;
     assert.equal(d.recommended_portfolio.length, 4);
+    assert.deepEqual(
+      d.recommended_trader_comparison.map((c: any) => c.trader_id),
+      d.recommended_portfolio.map((c: any) => c.trader_id),
+    );
+    assert.equal(d.recommended_comparison_meta.plan_id, d.plan.id);
     assert.equal(d.candidate_table.length, 5);
     assert.equal(d.preferences.market, "both");
     assert.equal(d.preferences.asset_category, "any");

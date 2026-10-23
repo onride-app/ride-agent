@@ -218,6 +218,14 @@ export function conversationView(
         maximum_leverage_cap: maximumUserLeverage(a.trader),
         reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.${a.leverage_cap_source === "inherited" || (a.trader.market === "perps" && a.leverage_cap != null && !a.leverage_mode) ? ` Inherited leverage setting: ${a.leverage_cap == null ? "no extra cap" : `${a.leverage_cap}x`}; explicitly clear leverage_cap to follow source without an extra cap.` : ""}`,
       })) ?? [],
+    // Compare the same immutable selection in the same order. The candidate
+    // ranking can contain other traders and must not stand in for this table.
+    recommended_trader_comparison:
+      plan?.allocations.map((a) => traderRow(a.trader)) ?? [],
+    recommended_comparison_meta: {
+      plan_id: plan?.id ?? null,
+      source: "plan_allocations",
+    },
     candidate_table: candidates.slice(0, 5).map(traderRow),
     selection_origin: selectedByUser ? "user" : "system_recommendation",
     planning_constraints: {
@@ -283,6 +291,6 @@ export function conversationView(
         }
       : null,
     instruction:
-      "Show two compact chat tables: recommended portfolio (trader, amount, reason) and top 5 candidates (ID, score, assets, style, history). A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
+      "When a plan exists, show two compact chat tables: recommended_portfolio (trader, amount, reason) and recommended_trader_comparison (the same selected trader IDs in the same order, with score, assets, style and source history/periods). Never replace the recommended performance comparison with candidate_table or the top five ranking. Use this same plan selection for any following portfolio analysis or final review. On older responses without recommended_trader_comparison, use the metrics already in recommended_portfolio. Candidate discovery is separate: label candidate_table as the eligible candidate ranking and show it when the user asks for candidates, or when no plan is feasible; do not call it the recommended portfolio's performance comparison. The first browse request starts without a cursor unless a candidate page was actually displayed. A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
   };
 }
