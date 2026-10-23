@@ -268,7 +268,10 @@ summary {
   pollTimer,
   popup,
   popupChallenge,
-  signatureWait;
+  signatureWait,
+  walletBridge,
+  walletConnection;
+let walletState = "idle";
 const embedded = config.embedded === true;
 let pollRemaining = 6;
 let busy = false,
@@ -379,15 +382,44 @@ async function initialize() {
   const { default: Privy, LocalStorage } = await import(config.privy_sdk);
   const iframe = document.createElement("iframe");
   iframe.hidden = true;
+  iframe.loading = "eager";
   iframe.title = "Privy secure wallet";
+  const bridge = {
+    loaded: false,
+    waiters: new Set(),
+    waitForLoad() {
+      if (bridge.loaded) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const done = () => {
+          clearTimeout(timer);
+          bridge.waiters.delete(done);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          bridge.waiters.delete(done);
+          reject(
+            Error(
+              "Secure wallet could not load. Check your connection, then reconnect the signing wallet. No funding was submitted.",
+            ),
+          );
+        }, 45000);
+        bridge.waiters.add(done);
+      });
+    },
+  };
+  iframe.addEventListener("load", () => {
+    bridge.loaded = true;
+    for (const done of [...bridge.waiters]) done();
+  });
   const next = new Privy({
     appId: config.privy_app_id,
     ...(config.privy_client_id ? { clientId: config.privy_client_id } : {}),
     storage: new LocalStorage(),
     embeddedWalletMessagePoster: {
-      postMessage: (message, origin, transfer) =>
-        iframe.contentWindow?.postMessage(message, origin, transfer),
+      postMessage: (message, _origin, transfer) =>
+        iframe.contentWindow?.postMessage(message, walletUrl.origin, transfer),
       reload: () => {
+        bridge.loaded = false;
         iframe.src = next.embeddedWallet.getURL();
       },
     },
@@ -412,11 +444,42 @@ async function initialize() {
   try {
     await next.initialize();
     client = next;
+    walletBridge = bridge;
     return client;
   } catch (e) {
     window.removeEventListener("message", onWalletMessage);
     iframe.remove();
     throw e;
+  }
+}
+async function connectWallet(reconnect = false) {
+  if (walletConnection) return walletConnection;
+  if (walletState === "ready" && !reconnect) return;
+  walletState = "connecting";
+  updateConfirmation();
+  walletConnection = (async () => {
+    try {
+      const c = await init();
+      if (reconnect) c.embeddedWallet.reload();
+      // The SDK's signing timeout includes waitForReady(). Load the frame and
+      // verify its message bridge before starting that short signing window.
+      await walletBridge.waitForLoad();
+      if (!(await c.embeddedWallet.ping(10000)))
+        throw Error(
+          "Secure wallet did not respond. Check your connection, then reconnect the signing wallet. No funding was submitted.",
+        );
+      walletState = "ready";
+    } catch (e) {
+      walletState = "failed";
+      throw e;
+    } finally {
+      updateConfirmation();
+    }
+  })();
+  try {
+    return await walletConnection;
+  } finally {
+    walletConnection = undefined;
   }
 }
 async function call(operation, body = {}) {
@@ -465,7 +528,7 @@ function button(parent, text, action) {
 }
 async function sign(challenge, activation = false) {
   if (embedded) return requestSignature(activation);
-  await init();
+  await connectWallet();
   user ??= (await client.user.get()).user;
   if (
     !challenge ||
@@ -502,11 +565,39 @@ async function sign(challenge, activation = false) {
       throw Error("Permit does not match the displayed funding amount.");
   } else if (challenge.message?.hyperliquidChain !== "Mainnet")
     throw Error("Unexpected account activation network.");
+  const selected = activation ? funding.activation : funding;
+  if (selected.expires_at <= Date.now())
+    throw Object.assign(
+      Error(
+        "Funding quote expired while connecting the wallet. Refresh it and review the amount again.",
+      ),
+      { code: "FUNDING_QUOTE_EXPIRED" },
+    );
   const provider = await client.embeddedWallet.getProvider(wallet);
-  return provider.request({
-    method: "eth_signTypedData_v4",
-    params: [wallet.address, JSON.stringify(challenge)],
-  });
+  try {
+    return await provider.request({
+      method: "eth_signTypedData_v4",
+      params: [wallet.address, JSON.stringify(challenge)],
+    });
+  } catch (e) {
+    if (/timeout|timed out/i.test(e?.message ?? "")) {
+      walletState = "failed";
+      e.message =
+        "Wallet signing timed out before a funding submission. Reconnect the signing wallet, then review the quote before confirming again.";
+      updateConfirmation();
+    }
+    throw e;
+  }
+}
+function needsWalletConnection() {
+  return (
+    !embedded &&
+    !submissionUnknown &&
+    ((funding.status === "requires_confirmation" &&
+      funding.requires_signature) ||
+      (funding.activation?.status === "requires_confirmation" &&
+        funding.activation.requires_signature))
+  );
 }
 function display(value) {
   clearTimeout(expiryTimer);
@@ -531,6 +622,18 @@ function display(value) {
       "This moves only the displayed amount from your Ride funding wallet to your Hyperliquid trading account. Copy trading needs a separate confirmation.",
     ),
   );
+  if (needsWalletConnection()) {
+    const connection = node("p");
+    connection.id = "wallet-connection";
+    c.append(connection);
+    const connect = button(actions, "Reconnect signing wallet", async () => {
+      await connectWallet(true);
+      status.className = "warning";
+      status.textContent =
+        "Signing wallet connected. Review the amount and funding status before confirming.";
+    });
+    connect.dataset.action = "connect-wallet";
+  }
   if (funding.status === "requires_confirmation") {
     const label = node("label", "Funding amount · USDC"),
       amount = node("input");
@@ -625,6 +728,8 @@ function display(value) {
   }
   content.append(c);
   updateConfirmation();
+  if (needsWalletConnection() && walletState === "idle")
+    void connectWallet().catch(showError);
   announce(
     submissionUnknown
       ? "uncertain"
@@ -635,6 +740,17 @@ function display(value) {
   );
 }
 function updateConfirmation() {
+  const connection = content.querySelector('[id="wallet-connection"]');
+  const connect = content.querySelector('[data-action="connect-wallet"]');
+  if (connection)
+    connection.textContent = {
+      idle: "Signing wallet has not connected yet.",
+      connecting: "Connecting signing wallet… No transfer is being submitted.",
+      ready: "Signing wallet connected.",
+      failed:
+        "Signing wallet connection failed. Reconnect before confirming funding.",
+    }[walletState];
+  if (connect) connect.disabled = busy || walletState === "connecting";
   const confirm = content.querySelector('[data-action="confirm-funding"]');
   const renew = content.querySelector('[data-action="refresh-quote"]');
   if (!confirm) return;
@@ -645,6 +761,7 @@ function updateConfirmation() {
     busy ||
     submissionUnknown ||
     expired ||
+    (!embedded && funding.requires_signature && walletState !== "ready") ||
     micros(amount.value) !== micros(funding.amount_usdc);
   renew.disabled = busy || submissionUnknown;
   if (submissionUnknown) {
