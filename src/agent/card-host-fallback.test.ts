@@ -17,7 +17,10 @@ function fixture(funding = false, wrongUrl = false) {
     isConnected: true,
     contentWindow: {},
     style: {},
-    setAttribute() {},
+    attributes: {} as Record<string, string>,
+    setAttribute(name: string, value: string) {
+      this.attributes[name] = value;
+    },
     append(...children: any[]) {
       nodes.push(...children);
     },
@@ -132,6 +135,14 @@ it("funding cards validate their own URL/frame/deposit and send only public fund
     f.frame.src,
     `https://ride.test/agent/fund-card/deposit_${"a".repeat(32)}`,
   );
+  assert.doesNotMatch(f.frame.attributes.sandbox, /allow-popups/);
+  assert.match(
+    f.frame.attributes.sandbox,
+    /allow-storage-access-by-user-activation/,
+  );
+  f.expire();
+  assert.match(f.state.textContent, /刷新 Rider 连接/);
+  assert.doesNotMatch(f.state.textContent, /页面中打开/);
   f.message({ origin: "https://evil.test" });
   f.message({ source: {} });
   f.message({

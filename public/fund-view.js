@@ -5,11 +5,9 @@ let client,
   funding,
   expiryTimer,
   pollTimer,
-  popup,
-  popupChallenge,
-  signatureWait,
   walletBridge,
-  walletConnection;
+  walletConnection,
+  walletStorage;
 let walletState = "idle";
 const embedded = config.embedded === true;
 let pollRemaining = 6;
@@ -43,69 +41,6 @@ function announce(state) {
       },
       "*",
     );
-}
-const nonce = () =>
-  [...crypto.getRandomValues(new Uint8Array(32))]
-    .map((n) => n.toString(16).padStart(2, "0"))
-    .join("");
-function openWalletPopup(mode, activation = false) {
-  popupChallenge = nonce();
-  const url = new URL(`/agent/fund/${config.deposit_id}`, location.origin);
-  url.searchParams.set(mode, "1");
-  url.hash = new URLSearchParams({
-    challenge: popupChallenge,
-    ...(mode === "card_sign"
-      ? {
-          preview_hash: activation
-            ? funding.activation.preview_hash
-            : funding.preview_hash,
-          activation: String(activation),
-        }
-      : {}),
-  }).toString();
-  popup = window.open(
-    url.href,
-    `ride-funding-wallet-${popupChallenge}`,
-    "popup,width=540,height=720",
-  );
-  if (!popup)
-    throw Error(
-      "Allow the Ride wallet connection window, then return to this card to confirm.",
-    );
-}
-function requestSignature(activation) {
-  // This opens synchronously from the inline approval click. The popup can
-  // authenticate/sign only; it never calls funding_confirm or moves funds.
-  openWalletPopup("card_sign", activation);
-  return new Promise((resolve, reject) => {
-    const closedTimer = setInterval(() => {
-      if (!popup?.closed) return;
-      clearInterval(closedTimer);
-      clearTimeout(signatureWait?.timer);
-      signatureWait = undefined;
-      reject(
-        Error(
-          "Wallet signing was cancelled. Review the amount before confirming again.",
-        ),
-      );
-    }, 500);
-    const timer = setTimeout(() => {
-      clearInterval(closedTimer);
-      signatureWait = undefined;
-      reject(
-        Error(
-          "Wallet signing timed out. No funding submission was requested by this card.",
-        ),
-      );
-    }, 120000);
-    signatureWait = {
-      resolve,
-      reject,
-      timer,
-      closedTimer,
-      hash: activation ? funding.activation.preview_hash : funding.preview_hash,
-    };
-  });
 }
 async function init() {
   if (client) return client;
@@ -153,7 +88,7 @@ async function initialize() {
   const next = new Privy({
     appId: config.privy_app_id,
     ...(config.privy_client_id ? { clientId: config.privy_client_id } : {}),
-    storage: new LocalStorage(),
+    storage: walletStorage ?? new LocalStorage(),
     embeddedWalletMessagePoster: {
       postMessage: (message, _origin, transfer) =>
         iframe.contentWindow?.postMessage(message, walletUrl.origin, transfer),
@@ -183,6 +118,10 @@ async function initialize() {
   try {
     await next.initialize();
     client = next;
+    bridge.dispose = () => {
+      window.removeEventListener("message", onWalletMessage);
+      iframe.remove();
+    };
     walletBridge = bridge;
     return client;
   } catch (e) {
@@ -266,7 +205,6 @@ function button(parent, text, action) {
   return b;
 }
 async function sign(challenge, activation = false) {
-  if (embedded) return requestSignature(activation);
   await connectWallet();
   user ??= (await client.user.get()).user;
   if (
@@ -330,7 +268,6 @@ async function sign(challenge, activation = false) {
 }
 function needsWalletConnection() {
   return (
-    !embedded &&
     !submissionUnknown &&
     ((funding.status === "requires_confirmation" &&
       funding.requires_signature) ||
@@ -366,7 +303,8 @@ function display(value) {
     connection.id = "wallet-connection";
     c.append(connection);
     const connect = button(actions, "Reconnect signing wallet", async () => {
-      await connectWallet(true);
+      if (embedded) await connectInline();
+      else await connectWallet(true);
       status.className = "warning";
       status.textContent =
         "Signing wallet connected. Review the amount and funding status before confirming.";
@@ -467,7 +405,7 @@ function display(value) {
   }
   content.append(c);
   updateConfirmation();
-  if (needsWalletConnection() && walletState === "idle")
+  if (!embedded && needsWalletConnection() && walletState === "idle")
     void connectWallet().catch(showError);
   announce(
     submissionUnknown
@@ -500,7 +438,7 @@ function updateConfirmation() {
     busy ||
     submissionUnknown ||
     expired ||
-    (!embedded && funding.requires_signature && walletState !== "ready") ||
+    (funding.requires_signature && walletState !== "ready") ||
     micros(amount.value) !== micros(funding.amount_usdc);
   renew.disabled = busy || submissionUnknown;
   if (submissionUnknown) {
@@ -648,70 +586,74 @@ function showLogin() {
   if (embedded) {
     login.querySelector("h1").textContent =
       "Connect Ride to confirm funding here";
-    document.getElementById("sign-in").textContent = "Connect Ride";
+    document.getElementById("sign-in").textContent =
+      "Connect Ride in this card";
     document.getElementById("access-code").parentElement.hidden = true;
     announce("sign_in_required");
   }
 }
-window.addEventListener("message", async (event) => {
-  if (
-    !embedded ||
-    event.origin !== location.origin ||
-    !popup ||
-    event.source !== popup
-  )
-    return;
-  const msg = event.data;
-  if (msg?.deposit_id !== config.deposit_id || msg.challenge !== popupChallenge)
-    return;
-  if (
-    msg.type === "ride:funding-signature" &&
-    signatureWait &&
-    msg.preview_hash === signatureWait.hash &&
-    /^0x[a-fA-F0-9]{130}$/.test(msg.signature ?? "")
-  ) {
-    clearTimeout(signatureWait.timer);
-    clearInterval(signatureWait.closedTimer);
-    signatureWait.resolve(msg.signature);
-    signatureWait = undefined;
-    popup.close();
-    popup = undefined;
-    popupChallenge = undefined;
-  } else if (msg.type === "ride:funding-signature-error" && signatureWait) {
-    clearTimeout(signatureWait.timer);
-    clearInterval(signatureWait.closedTimer);
-    const error = Object.assign(
-      Error(
-        msg.code === "FUNDING_QUOTE_EXPIRED"
-          ? "Funding quote expired. Refresh it and approve again."
-          : "Wallet signing did not complete. Review the amount before confirming again.",
-      ),
-      { code: msg.code },
-    );
-    if (msg.code === "FUNDING_QUOTE_EXPIRED") funding.expires_at = 0;
-    signatureWait.reject(error);
-    signatureWait = undefined;
-    popup.close();
-    popup = undefined;
-    popupChallenge = undefined;
-  } else if (msg.type === "ride:funding-session" && !signatureWait) {
+async function connectInline() {
+  // Request only Ride's own browser session, directly from this human click.
+  // No session material or signature is sent to the outer MCP App/model.
+  if (document.requestStorageAccess) {
     try {
-      csrf = (
-        await call("embed-session", {
-          ticket: msg.ticket,
-          challenge: popupChallenge,
-        })
-      ).csrf;
-      popup.close();
-      popup = undefined;
-      popupChallenge = undefined;
-      await ready();
-    } catch (e) {
-      showLogin();
-      showError(e);
+      const handle = await document.requestStorageAccess({
+        cookies: true,
+        localStorage: true,
+      });
+      if (handle?.localStorage) {
+        if (initialization) await initialization;
+        if (walletConnection) await walletConnection.catch(() => {});
+        walletBridge?.dispose();
+        client = user = walletBridge = undefined;
+        walletState = "idle";
+        const storage = handle.localStorage;
+        walletStorage = {
+          async get(key) {
+            const value = storage.getItem(key);
+            return value === null ? undefined : JSON.parse(value);
+          },
+          put(key, value) {
+            if (value === undefined) storage.removeItem(key);
+            else storage.setItem(key, JSON.stringify(value));
+          },
+          del: (key) => storage.removeItem(key),
+          getKeys: () => Object.keys(storage),
+        };
+      }
+    } catch {
+      // A partitioned session may already exist. Try it without opening a page.
     }
   }
-});
+  const c = await init();
+  try {
+    user = (await c.user.get()).user;
+  } catch {
+    user = undefined;
+  }
+  if (!user)
+    throw Error(
+      "This client cannot restore your Ride signing session inside the card. No page was opened and no funds were submitted.",
+    );
+  const accounts = user.linked_accounts ?? user.linkedAccounts ?? [];
+  const wallet = accounts.find(
+    (w) =>
+      w.type === "wallet" &&
+      (w.chain_type ?? w.chainType) === "ethereum" &&
+      (w.wallet_client_type ?? w.walletClientType) === "privy",
+  );
+  csrf = (
+    await call("embedded-login", {
+      privyId: user.id,
+      privyAccessToken: await c.getAccessToken(),
+      walletAddress: wallet?.address,
+      privyWalletId: wallet?.id,
+      authProvider: "GOOGLE",
+    })
+  ).csrf;
+  await ready();
+  if (needsWalletConnection()) await connectWallet(walletState === "failed");
+}
 async function finish(session) {
   if (!session) {
     try {
@@ -758,7 +700,7 @@ async function finish(session) {
 document.getElementById("sign-in").onclick = async () => {
   try {
     if (embedded) {
-      openWalletPopup("card_login");
+      await connectInline();
       return;
     }
     const c = await init();

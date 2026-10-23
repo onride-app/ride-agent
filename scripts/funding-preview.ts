@@ -145,13 +145,14 @@ export default class Privy {
   embeddedWallet = { getURL: () => "https://wallet.test.invalid/fixture", onMessage() {}, ping: async () => true, reload: () => { const frame = document.querySelector('iframe[title="Privy secure wallet"]'); if (frame) frame.srcdoc = '<!doctype html><title>Fictional wallet transport</title>'; }, getProvider: async () => ({ request: async () => (await (await fetch("/fixture/signature", {method:"POST"})).json()).signature }) };
 }`),
 );
-app.get("/fixture/widget", async (_req, res) => {
+app.get("/fixture/widget", async (req, res) => {
   const funding = publicFunding;
+  const data = req.query.demo === "1" ? { funding_demo: true } : { funding };
   const html = (await readFile("public/agent.html", "utf8"))
     .replace("/*HOST_CONFIG*/{}", JSON.stringify({ confirmation_origin: base }))
     .replace(
       "<script",
-      `<script>window.openai={toolOutput:${JSON.stringify({ version: "3", status: "requires_confirmation", data: { funding } })},callTool:async()=>{},setWidgetState:(value)=>parent.postMessage({fixture_state:value},"*")};</script><script`,
+      `<script>window.openai={toolOutput:${JSON.stringify({ version: "3", status: "requires_confirmation", data })},callTool:async()=>{},setWidgetState:(value)=>parent.postMessage({fixture_state:value},"*")};</script><script`,
     );
   res.removeHeader("X-Frame-Options");
   res.set(

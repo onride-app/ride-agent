@@ -87,11 +87,16 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
     frame.referrerPolicy = "no-referrer";
     frame.setAttribute(
       "sandbox",
-      "allow-scripts allow-same-origin allow-popups allow-forms allow-popups-to-escape-sandbox",
+      funding
+        ? "allow-scripts allow-same-origin allow-storage-access-by-user-activation"
+        : "allow-scripts allow-same-origin allow-popups allow-forms allow-popups-to-escape-sandbox",
     );
+    if (funding) frame.setAttribute("allow", "storage-access");
     frame.src = new URL(
       funding
-        ? `/agent/fund-card/${id}`
+        ? demo
+          ? "/agent/fund-demo"
+          : `/agent/fund-card/${id}`
         : demo
           ? "/agent/card-demo"
           : `/agent/card/${id}`,
@@ -107,8 +112,9 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
         return;
       }
       frame.hidden = true;
-      state.textContent =
-        "当前客户端未能加载内嵌确认。请在 Ride 页面中打开；有效登录会自动复用。";
+      state.textContent = funding
+        ? "当前客户端未能加载对话内入金卡片。请刷新 Rider 连接后重试；尚未提交入金。"
+        : "当前客户端未能加载内嵌确认。请在 Ride 页面中打开；有效登录会自动复用。";
     }, 8000);
     const onMessage = (event) => {
       if (!frame.isConnected) {
@@ -188,7 +194,7 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
         "muted",
       ),
     );
-    if (proposal.confirmation_url) {
+    if (proposal.confirmation_url && !funding) {
       const fallback = el("button", "在 Ride 页面中打开", "secondary");
       const fallbackUrl = demo
         ? new URL("/agent/card-demo", base).href

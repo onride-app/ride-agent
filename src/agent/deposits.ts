@@ -459,8 +459,8 @@ export class DepositReads {
             ? "Trading balance is verified, but this account mode is not enabled for Agent execution. Review account compatibility; do not repeat funding or switch account mode automatically."
             : trading.activation_required &&
                 D(trading.trading_balance_usdc ?? "0").gt(0)
-              ? "Open the Ride funding confirmation page to activate this funded trading account."
-              : "Use prepare_deposit with the exact amount to open Ride's funding confirmation page. Wallet receipt alone is not trading credit. Do not repeat an unresolved submission.",
+              ? "Use the inline Ride funding card to review and confirm trading-account activation."
+              : "Use prepare_deposit with the exact amount to show the inline Ride funding confirmation card. Wallet receipt alone is not trading credit. Do not repeat an unresolved submission.",
       };
     }
     const response = await this.bridge(`status/${deposit.address}`);
@@ -514,7 +514,7 @@ export async function depositView(deposit: Deposit) {
         : "Prediction bridge",
     instructions:
       deposit.provider === "wallet"
-        ? "Send only native USDC on Arbitrum to this owned funding wallet. Then open the Ride funding confirmation page to move the chosen amount to the trading account, activate it if needed, and verify trading balance."
+        ? "Send only native USDC on Arbitrum to this owned funding wallet. Then use the inline Ride funding card to confirm the chosen amount, activate the trading account if needed, and verify trading balance."
         : "Use only the selected supported asset and network. Check provider status before refreshing available collateral.",
   };
 }

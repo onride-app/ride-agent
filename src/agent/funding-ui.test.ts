@@ -221,55 +221,6 @@ it("restores the human cookie before loading a wallet SDK and requires a fresh e
   assert.match(f.ids.status.textContent, /submitted.*pending/);
 });
 
-it("inline approval signs only through the bound Ride popup and never exposes the challenge/signature to the AI host", async () => {
-  const f = await fixture({ embedded: true, signature: true });
-  const approving = f.action("confirm-funding").onclick!();
-  assert.equal(f.opened.length, 1);
-  assert(!f.calls.includes("funding_confirm"));
-  await f.signature({ origin: "https://evil.test" });
-  await f.signature({ source: {} });
-  assert(!f.calls.includes("funding_confirm"));
-  await f.signature();
-  await approving;
-  assert.equal(
-    f.calls.filter((x: string) => x === "funding_confirm").length,
-    1,
-  );
-  assert.equal(
-    f.bodies.find((x: any) => x.operation === "funding_confirm").signature,
-    "0x" + "a".repeat(130),
-  );
-  assert(
-    f.messages.some(
-      (x: any) => x.type === "ride:funding-state" && x.status === "submitted",
-    ),
-  );
-  assert(!JSON.stringify(f.messages).includes("signing_challenge"));
-  assert(!JSON.stringify(f.messages).includes("0x" + "a".repeat(130)));
-});
-
-it("expiry while the inline wallet prompt is open requires renewal and never submits the stale signature", async () => {
-  const f = await fixture({ embedded: true, signature: true });
-  const approving = f.action("confirm-funding").onclick!();
-  f.getFunding().expires_at = 0;
-  await f.signature();
-  await approving;
-  assert(!f.calls.includes("funding_confirm"));
-  assert.equal(f.action("confirm-funding").disabled, true);
-  assert.equal(f.action("refresh-quote").disabled, false);
-});
-
-it("closing the wallet prompt releases the inline UI without submitting or waiting for its signing timeout", async () => {
-  const f = await fixture({ embedded: true, signature: true });
-  const approving = f.action("confirm-funding").onclick!();
-  f.closeWallet();
-  await approving;
-  assert(!f.calls.includes("funding_confirm"));
-  assert.equal(f.action("confirm-funding").disabled, false);
-  assert.equal(f.action("refresh-quote").disabled, false);
-  assert.match(f.ids.status.textContent, /cancelled/);
-});
-
 it("server expiry stops stale confirmation and offers renewal without submitting a fresh quote", async () => {
   const f = await fixture({ serverExpired: true });
   await f.action("confirm-funding").onclick!();

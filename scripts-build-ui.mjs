@@ -6,7 +6,7 @@ const css = await readFile("public/agent.css", "utf8"),
     "export ",
     "",
   );
-for (const name of ["agent", "confirm", "fund"]) {
+for (const name of ["agent", "confirm", "fund", "fund-demo"]) {
   const path = `public/${name}.html`;
   let html = await readFile(path, "utf8");
   html = html

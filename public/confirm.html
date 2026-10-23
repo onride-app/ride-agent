@@ -373,6 +373,16 @@ function render(
     confirmationCard(root, value.data.funding, false, "funding");
     return;
   }
+  if (value.data?.funding_demo && confirmationCard) {
+    root.append(el("h1", "对话内入金确认测试"));
+    confirmationCard(
+      root,
+      { amount_usdc: "0", network: "Arbitrum" },
+      true,
+      "funding",
+    );
+    return;
+  }
   if (value.data?.preference_saved)
     root.append(el("p", "Preferences saved", "status"));
   else if (
