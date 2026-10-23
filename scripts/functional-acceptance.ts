@@ -1649,7 +1649,8 @@ try {
           network: "Arbitrum",
         })
       ).data.deposit;
-      let submits = 0;
+      let submits = 0,
+        quotes = 0;
       venue.fundingOperation = async (operation, owner, input) => {
         assert.equal(owner, users.funding);
         if (operation === "submit") {
@@ -1660,6 +1661,7 @@ try {
             receipt_status: "0x1",
           };
         }
+        quotes++;
         return {
           amount_usdc: input.amount_usdc,
           wallet: { master: deposit.address },
@@ -1671,7 +1673,37 @@ try {
       };
       venue.depositStatus = async (deposit) => ({
         deposit_id: deposit.id,
+        wallet_balance_usdc: "0",
+        trading_balance_usdc: "36.279657",
+        trading_account_mode: "unified",
+        available_to_copy: true,
+      });
+      const insufficient = await user.client.callTool({
+        name: "prepare_deposit",
+        arguments: {
+          deposit_id: deposit.id,
+          amount_usdc: "10",
+        },
+      });
+      assert.equal(
+        (insufficient.structuredContent as any).error.code,
+        "FUNDING_WALLET_INSUFFICIENT",
+      );
+      assert.equal(quotes, 0);
+      assert.equal(submits, 0);
+      const funded = await ok(user.client, "check_deposit_status", {
+        deposit_id: deposit.id,
+      });
+      assert.equal(funded.data.deposit_status.available_to_copy, true);
+      assert.equal(
+        funded.data.deposit_status.trading_balance_usdc,
+        "36.279657",
+      );
+      venue.depositStatus = async (deposit) => ({
+        deposit_id: deposit.id,
+        wallet_balance_usdc: "10",
         trading_balance_usdc: "0",
+        trading_account_mode: "standard",
         available_to_copy: false,
       });
       const prepared = await ok(user.client, "prepare_deposit", {
@@ -1722,6 +1754,7 @@ try {
         human_signature_required: true,
         submitted_once: true,
         verified_credit_state: true,
+        existing_venue_funds_do_not_prepare_another_transfer: true,
       };
     },
   );
