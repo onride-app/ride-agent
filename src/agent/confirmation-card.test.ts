@@ -67,6 +67,9 @@ it("read-only card tool renders a no-execution demo or owned proposal and never 
     const card = tools.find((t) => t.name === "show_confirmation_card")!;
     assert.equal(card.annotations?.readOnlyHint, true);
     assert.equal((card._meta?.ui as any).resourceUri, RESOURCE_URI);
+    assert.deepEqual((card._meta?.["openai/ui"] as any).entrypoints, [
+      { type: "thread" },
+    ]);
     assert(
       tools.every(
         (t) => !["confirm", "authorize", "revoke", "reject"].includes(t.name),
@@ -77,6 +80,7 @@ it("read-only card tool renders a no-execution demo or owned proposal and never 
       arguments: { mode: "demo" },
     });
     assert.equal((demo.structuredContent as any).data.confirmation_demo, true);
+    assert.equal((demo.structuredContent as any).data.funding_demo, true);
     assert.equal(
       (demo.structuredContent as any).data.proposal.confirmation_url,
       "https://ride.test/agent/card-demo",
@@ -117,6 +121,7 @@ it("read-only card tool renders a no-execution demo or owned proposal and never 
         item.text.includes('"confirmation_origin":"https://ride.test"'),
     );
     for (const uri of [
+      "ui://ride/agent-v8-confirmation.html",
       "ui://ride/agent-v7-confirmation.html",
       "ui://ride/agent-v6-confirmation.html",
       "ui://ride/agent-v5-confirmation.html",

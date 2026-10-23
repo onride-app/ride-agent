@@ -207,10 +207,12 @@ export function mountHumanConfirmation(
       "/agent/card/:proposalId",
       "/agent/card-demo",
       "/agent/fund-card/:depositId",
+      "/agent/fund-demo",
     ],
     async (req, res) => {
-      const demo = req.path === "/agent/card-demo";
-      const funding = req.path.startsWith("/agent/fund-card/");
+      const fundingDemo = req.path === "/agent/fund-demo";
+      const demo = req.path === "/agent/card-demo" || fundingDemo;
+      const funding = req.path.startsWith("/agent/fund-card/") || fundingDemo;
       if (
         !demo &&
         !(
@@ -225,7 +227,11 @@ export function mountHumanConfirmation(
       const template = await readFile(
         fileURLToPath(
           new URL(
-            funding ? "../../public/fund.html" : "../../public/confirm.html",
+            fundingDemo
+              ? "../../public/fund-demo.html"
+              : funding
+                ? "../../public/fund.html"
+                : "../../public/confirm.html",
             import.meta.url,
           ),
         ),
@@ -361,6 +367,75 @@ export function mountHumanConfirmation(
       res.set("Cache-Control", "no-store").json({ csrf });
     } catch (e) {
       res.status(e instanceof AgentError ? e.httpStatus : 400).json(failure(e));
+    }
+  });
+  app.post("/agent/human/embedded-login", async (req, res) => {
+    try {
+      requireOrigin(req);
+      if (req.get("x-ride-embedded") !== "1")
+        throw new AgentError("AUTH_REQUIRED", "Use the Ride card.", false, 401);
+      const { deposit_id, ...input } = z
+        .object({
+          deposit_id: depositId,
+          privyId: z.string().min(1),
+          privyAccessToken: z.string().min(1),
+          walletAddress: z.string().optional(),
+          privyWalletId: z.string().optional(),
+          authProvider: z.literal("GOOGLE"),
+        })
+        .strict()
+        .parse(req.body);
+      const exchanged = await options.exchange(input);
+      // Authentication alone must not mint a session for someone else's deposit.
+      // This read never refreshes a quote, signs, activates or submits funding.
+      const response = await fetch(
+        new URL("/agent/human/funding", options.backend),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${exchanged.rideAuthToken}`,
+          },
+          body: JSON.stringify({ deposit_id }),
+          signal: AbortSignal.timeout(15000),
+          redirect: "error",
+        },
+      );
+      const value = output.parse(await response.json());
+      if (
+        !response.ok ||
+        value.error ||
+        (value.data.funding as any)?.deposit_id !== deposit_id
+      )
+        throw new AgentError(
+          "NOT_FOUND",
+          "Funding request not found for this account.",
+          false,
+          404,
+        );
+      const csrf = randomBytes(32).toString("base64url"),
+        expires_at = Date.now() + 15 * 60_000;
+      res.cookie(
+        embedCookie,
+        seal({
+          token: exchanged.rideAuthToken,
+          csrf,
+          expires_at,
+          embedded: true,
+          deposit_id,
+        }),
+        {
+          httpOnly: true,
+          secure: true,
+          sameSite: "none",
+          partitioned: true,
+          path: "/agent",
+          maxAge: 15 * 60_000,
+        },
+      );
+      res.set("Cache-Control", "no-store").json({ csrf, expires_at });
+    } catch (e) {
+      res.status(e instanceof AgentError ? e.httpStatus : 503).json(failure(e));
     }
   });
   const allowed = new Set([

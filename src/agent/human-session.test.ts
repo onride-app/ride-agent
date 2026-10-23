@@ -20,6 +20,17 @@ async function fixture() {
     }
     if (["confirm", "reject", "authorize"].includes(req.params.operation))
       writes++;
+    if (req.params.operation === "funding") {
+      const owned = req.body.deposit_id === "deposit_" + "a".repeat(32);
+      res.status(owned ? 200 : 404).json({
+        version: "3",
+        status: owned ? "requires_confirmation" : "failed",
+        data: owned ? { funding: { deposit_id: req.body.deposit_id } } : {},
+        warnings: [],
+        as_of: new Date().toISOString(),
+      });
+      return;
+    }
     res.json({
       version: "3",
       status: "ok",
@@ -112,6 +123,74 @@ it("restores an existing human cookie on multiple proposals without login, exten
     }
     assert.equal(restored[0], restored[1]);
     assert.deepEqual(f.counts(), { exchanges: 1, writes: 0 });
+  } finally {
+    f.close();
+  }
+});
+it("inline login verifies deposit ownership before issuing a scoped partitioned session; origin, scope and CSRF remain enforced", async () => {
+  const f = await fixture();
+  try {
+    const deposit_id = "deposit_" + "a".repeat(32);
+    const body = {
+      deposit_id,
+      privyId: "fixture",
+      privyAccessToken: "fixture-privy",
+      authProvider: "GOOGLE",
+    };
+    const login = (patch = {}, headers = {}) =>
+      f.post(
+        "embedded-login",
+        { ...body, ...patch },
+        { "X-Ride-Embedded": "1", ...headers },
+      );
+    const foreign = await login({}, { Origin: "https://foreign.test" });
+    assert.equal(foreign.status, 403);
+    assert.equal(f.counts().exchanges, 0);
+    const other = await login({ deposit_id: "deposit_" + "b".repeat(32) });
+    assert.equal(other.status, 404);
+    assert.equal(other.headers.get("set-cookie"), null);
+    const response = await login();
+    assert.equal(response.status, 200);
+    const cookieHeader = response.headers.get("set-cookie")!;
+    assert.match(cookieHeader, /HttpOnly/);
+    assert.match(cookieHeader, /Secure/);
+    assert.match(cookieHeader, /Partitioned/);
+    const session = await response.json();
+    assert(!JSON.stringify(session).includes("fixture-core"));
+    const headers = {
+      Cookie: cookieHeader.split(";")[0],
+      "X-Ride-Embedded": "1",
+      "X-Ride-CSRF": session.csrf,
+    };
+    assert.equal(
+      (await f.post("funding", { deposit_id }, headers)).status,
+      200,
+    );
+    assert.equal(
+      (
+        await f.post(
+          "funding",
+          { deposit_id: "deposit_" + "b".repeat(32) },
+          headers,
+        )
+      ).status,
+      404,
+    );
+    assert.equal(
+      (await f.post("confirm", { proposal_id: proposal }, headers)).status,
+      404,
+    );
+    assert.equal(
+      (
+        await f.post(
+          "funding_confirm",
+          { deposit_id },
+          { ...headers, "X-Ride-CSRF": "wrong" },
+        )
+      ).status,
+      403,
+    );
+    assert.equal(f.counts().writes, 0);
   } finally {
     f.close();
   }

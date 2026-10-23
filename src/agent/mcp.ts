@@ -18,7 +18,7 @@ import {
   type ToolName,
 } from "./contracts.js";
 
-export const RESOURCE_URI = "ui://ride/agent-v8-confirmation.html";
+export const RESOURCE_URI = "ui://ride/agent-v9-confirmation.html";
 export type McpOAuthContext = { resourceMetadataUrl: string };
 
 function securityMeta(scope: string, oauth?: McpOAuthContext) {
@@ -110,6 +110,7 @@ export function registerAgentTools(
   });
   for (const resourceUri of [
     RESOURCE_URI,
+    "ui://ride/agent-v8-confirmation.html",
     "ui://ride/agent-v7-confirmation.html",
     "ui://ride/agent-v6-confirmation.html",
     "ui://ride/agent-v5-confirmation.html",
@@ -142,6 +143,7 @@ export function registerAgentTools(
               }).replaceAll("<", "\\u003c"),
             ),
             _meta: {
+              "openai/ui": { availableDisplayModes: ["inline", "fullscreen"] },
               ui: {
                 prefersBorder: true,
                 ...(confirmationOrigin
@@ -170,7 +172,7 @@ export function registerAgentTools(
           "Show an owned frozen proposal in a human confirmation card. mode:demo renders a 0-USDC interface test without account changes or any execution. This tool never confirms, signs or submits a proposal.",
         inputSchema: z
           .object({
-            mode: z.enum(["demo", "proposal"]),
+            mode: z.enum(["demo", "proposal"]).default("demo"),
             proposal_id: z
               .string()
               .regex(/^proposal_[a-zA-Z0-9_-]{8,100}$/)
@@ -188,6 +190,7 @@ export function registerAgentTools(
           ...securityMeta("ride:read", oauth),
           ui: { resourceUri: RESOURCE_URI },
           "openai/outputTemplate": RESOURCE_URI,
+          "openai/ui": { entrypoints: [{ type: "thread" }] },
         },
       },
       async ({ mode, proposal_id }, extra) => {
@@ -206,6 +209,7 @@ export function registerAgentTools(
               status: "ok",
               data: {
                 confirmation_demo: true,
+                funding_demo: true,
                 proposal: {
                   id: "proposal_card_demo_00000000",
                   action: "demo",
@@ -328,7 +332,7 @@ function description(name: ToolName): string {
     get_preferences:
       "Read saved/partial answers. Start in chat with budget and risk preference only; ask only returned missing questions. Preserve earlier answers. Numeric risk presets are suggestions requiring final confirmation, not user consent.",
     prepare_deposit:
-      "Prepare an exact-amount deposit activation for an owned funding request. Display the returned inline Rider funding confirmation card. The user reviews and confirms in the trusted card; Ride handles any required wallet signing. The URL is a fallback for clients without inline UI. Expired quotes must be refreshed and approved again. Never claim success until check_deposit_status verifies trading credit.",
+      "Prepare an exact-amount deposit activation for an owned funding request. Display the returned inline Rider funding confirmation card. The user connects the existing Ride session, reviews, confirms and signs inside the trusted card without opening a page. If inline rendering or session access is blocked, report that blocker and leave funding unsubmitted. The URL is for explicitly requested standalone use. Expired quotes must be refreshed and approved again. Never claim success until check_deposit_status verifies trading credit.",
     get_deposit_options:
       "Read currently supported funding routes. No funds are transferred.",
     get_deposit_address:

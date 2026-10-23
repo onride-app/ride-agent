@@ -22,7 +22,7 @@ try {
       `Unwanted package file: ${f.path}`,
     );
     assert(
-      /^(dist\/|public\/(agent|confirm|fund)\.html|skills\/|docs\/|README\.md|LICENSE|package\.json|\.env\.example)/.test(
+      /^(dist\/|public\/(agent|confirm|fund|fund-demo)\.html|skills\/|docs\/|README\.md|LICENSE|package\.json|\.env\.example)/.test(
         f.path,
       ),
       `Unexpected file: ${f.path}`,

@@ -6,8 +6,8 @@ financial proposal or calls the executor. `mode: proposal` reads an owned frozen
 proposal; the backend continues to validate its owner. Recommendation and
 preference tools keep their conversation-first outputs.
 
-MCP Apps use the versioned `ui://ride/agent-v8-confirmation.html` resource. The
-previous v7, v6, v5, v4 and v3 URIs remain registered. Only the configured Ride origin is added to
+MCP Apps use the versioned `ui://ride/agent-v9-confirmation.html` resource. The
+previous v8, v7, v6, v5, v4 and v3 URIs remain registered. Only the configured Ride origin is added to
 the resource's frame policy. The card embeds `/agent/card/:proposalId`; its
 content and human approval requests run at the Ride origin, separate from the
 model and the MCP App sandbox. Existing confirmation, OAuth and funding pages
@@ -33,17 +33,18 @@ the page tries the existing Privy session before offering Google sign-in. It
 never initiates Google automatically. Funding pages also reuse a valid human
 cookie while retaining the separate wallet-signing requirements.
 
-The first embedded connection opens the normal Ride sign-in window. An existing
+The first embedded proposal connection opens the normal Ride sign-in window. An existing
 browser session is reused. That window issues a 60-second, single-use handoff
 bound to a random challenge and proposal ID. It sends the ticket only to its
 same-origin opener. The trusted child frame checks the popup source and origin,
 then exchanges it for a separate HttpOnly, Secure, SameSite=None, Partitioned
 cookie. Redis GETDEL consumes tickets atomically across gateway replicas. The
 embedded cookie retains the original human-session expiry. Proposal sessions
-are limited to proposal reads, confirm and reject. A funding handoff is bound
+are limited to proposal reads, confirm and reject. Legacy funding handoffs remain bound
 to one deposit ID and only its human funding operations; it cannot confirm
-proposals, grant authority, or operate on another deposit. Blocked popups or unavailable partitioned storage fall back to the
-normal Ride page; no authentication or approval checks are bypassed.
+proposals, grant authority, or operate on another deposit. Proposal cards retain
+the normal Ride page fallback. Current funding cards use the inline-only flow
+below; no authentication or approval checks are bypassed.
 
 Only sanitized status/height notifications leave the trusted frame. Tokens,
 CSRF values, handoff tickets and signing challenges never enter tool results,
@@ -74,16 +75,32 @@ while connecting still require renewal and another explicit approval.
 An unknown submission response locks approval and renewal and permits status
 reads only. Backend persistence remains authoritative for exactly-once submission.
 
-`prepare_deposit` renders `/agent/fund-card/:depositId` in the conversation using
-the same narrowly allowed Ride origin as proposal cards. Its ordinary
-`/agent/fund/:depositId` fallback remains unframeable. Inline confirmation stays
-inside the human frame, never a model-callable tool. When a wallet signature is
-needed, the explicit approval click opens a same-origin wallet window. That
-window rereads the owned frozen quote, validates its hash, expiry, amount and
-signing wallet, then returns only the signature to its exact opener. It never
-calls the funding submission endpoint. The frame checks origin, popup source,
-random challenge, deposit and hash before submitting. Closing or cancelling the
-wallet prompt leaves the transfer unsubmitted and allows another explicit review.
+`prepare_deposit` renders `/agent/fund-card/:depositId` in the conversation.
+The trusted Ride frame performs session restoration, wallet readiness checks,
+exact-amount approval, signing and submission. Its sandbox does not allow popups,
+and the outer funding card has no webpage fallback button. The normal
+`/agent/fund/:depositId` route remains for older clients and explicit standalone use.
+
+The Connect action asks the browser for access to Ride's existing local storage.
+When a storage handle is available, it is passed directly to Privy's storage
+adapter inside the trusted Ride frame. No credential is passed to the outer UI
+or model. The browser may ask for storage permission. An existing partitioned
+session can also be reused. If neither session is available, the card reports the
+inline blocker without opening a page, signing or submitting funds. This requires
+host support and a prior Ride signing session in the same browser profile; it is
+not a new login mechanism or a guarantee of compatibility in every host.
+
+`embedded-login` exchanges the independently authenticated Privy session and reads
+the owned deposit before issuing a 15-minute HttpOnly, Secure, SameSite=None,
+Partitioned cookie bound to that deposit. Origin, CSRF, ownership and operation
+restrictions remain enforced. Connection never renews a quote, activates an account,
+signs or submits funding. The actual confirm button requires a ready wallet.
+
+`show_confirmation_card` exposes a conversation-panel entrypoint and a default
+0-USDC funding demo at `/agent/fund-demo`. The demo uses no account, SDK, backend,
+signing or submission endpoints. It proves rendering and local interaction only;
+real wallet-session restoration and signing require separate host acceptance.
+Resource v9 declares inline/fullscreen display modes; v8-v3 remain registered.
 
 Sanitized deposit ID/status notifications update the outer card and the AI's
 widget context using the [MCP Apps UI bridge](https://developers.openai.com/plugins/build/chatgpt-ui).
@@ -93,11 +110,11 @@ identities, signing challenges and signatures stay out of host/model context.
 
 `npx tsx scripts/funding-preview.ts` serves a loopback-only fixture with fictional
 wallet/signature/balance data and no real transfers. It covers expired quote
-renewal, login handoff, inline approval, wallet signature return, verified credit
+renewal, login handoff, inline approval and signing, verified credit
 and lost submission responses. Unit/HTTP tests also reject foreign origins,
 cross-deposit handoffs, stale signatures and duplicate approvals. Local acceptance
 does not establish deployment, real Google/Privy signing or host-specific nested
-frame compatibility. Unsupported hosts keep the normal Ride page fallback.
+frame compatibility. Unsupported inline hosts remain unsubmitted and report the blocker.
 
 ## Acceptance
 

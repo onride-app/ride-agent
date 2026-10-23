@@ -50,7 +50,11 @@ class Element {
   }
 }
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function fixture(signatureTimeout = false) {
+async function fixture(
+  signatureTimeout = false,
+  embedded = false,
+  options: { noUser?: boolean; storage?: boolean; deferred?: boolean } = {},
+) {
   const ids = Object.fromEntries(
     ["content", "status", "login", "sign-in", "access-code"].map((id) => [
       id,
@@ -60,6 +64,12 @@ async function fixture(signatureTimeout = false) {
   const body = new Element("body"),
     listeners: Array<(e: any) => unknown> = [],
     timers = new Map<number, { callback: () => void; ms: number }>();
+  const messages: any[] = [];
+  let storageRequests = 0;
+  let configuredStorage: any;
+  let resolveSignature: ((s: string) => void) | undefined;
+  const storage = { getItem: () => null, setItem() {}, removeItem() {} };
+  let opened = 0;
   let timerId = 0,
     pings = 0,
     providers = 0,
@@ -100,9 +110,17 @@ async function fixture(signatureTimeout = false) {
   class Privy {
     constructor(options: any) {
       poster = options.embeddedWalletMessagePoster;
+      configuredStorage = options.storage;
     }
     initialize = async () => {};
-    user = { get: async () => ({ user: { linked_accounts: [wallet] } }) };
+    getAccessToken = async () => "fixture-privy";
+    user = {
+      get: async () => ({
+        user: options.noUser
+          ? null
+          : { id: "fixture", linked_accounts: [wallet] },
+      }),
+    };
     embeddedWallet = {
       getURL: () => "https://wallet.test/embedded-wallets",
       ping: async (_timeout: number) => {
@@ -137,6 +155,10 @@ async function fixture(signatureTimeout = false) {
             signatures++;
             if (signatureTimeout)
               throw Error("Operation reached timeout: user-signer:sign");
+            if (options.deferred)
+              return new Promise<string>((resolve) => {
+                resolveSignature = resolve;
+              });
             return "0x" + "b".repeat(130);
           },
         };
@@ -150,15 +172,28 @@ async function fixture(signatureTimeout = false) {
   const api = await vm.runInNewContext(
     `(async()=>{${source}\nreturn {init, sign, getFunding:()=>funding};})()`,
     {
-      config: { deposit_id: funding.deposit_id, embedded: false },
+      config: { deposit_id: funding.deposit_id, embedded },
       testLoadSdk: async () => ({ default: Privy, LocalStorage: class {} }),
       document: {
         body,
+        ...(options.storage
+          ? {
+              requestStorageAccess: async () => {
+                storageRequests++;
+                return { localStorage: storage };
+              },
+            }
+          : {}),
         createElement: (tag: string) => new Element(tag),
         getElementById: (id: string) =>
           ids[id] ?? ids.content.querySelector(`[id="${id}"]`),
       },
       window: {
+        parent: { postMessage: (value: any) => messages.push(value) },
+        open() {
+          opened++;
+          throw Error("Funding must stay inline");
+        },
         addEventListener: (_: string, handler: any) => listeners.push(handler),
         removeEventListener() {},
       },
@@ -186,6 +221,8 @@ async function fixture(signatureTimeout = false) {
       clearInterval() {},
       fetch: async (path: string) => {
         const operation = path.split("/").at(-1);
+        if (operation === "embedded-login")
+          return { ok: true, json: async () => ({ csrf: "fixture" }) };
         if (operation === "session")
           return { ok: true, json: async () => ({ csrf: "fixture" }) };
         if (operation === "funding_confirm") {
@@ -221,14 +258,19 @@ async function fixture(signatureTimeout = false) {
     frame,
     action,
     counts: () => ({ pings, providers, signatures, submits, reloads }),
+    messages,
+    opened: () => opened,
+    storageRequests: () => storageRequests,
+    configuredStorage: () => configuredStorage,
+    finishSignature: () => resolveSignature?.("0x" + "b".repeat(130)),
     async load() {
-      frame.listeners.load();
+      body.querySelectorAll("iframe").at(-1)!.listeners.load();
       await tick();
     },
     async reply(overrides: any = {}) {
       const event = {
         origin: "https://wallet.test",
-        source: frame.contentWindow,
+        source: body.querySelectorAll("iframe").at(-1)!.contentWindow,
         data: JSON.stringify({
           id: "ping-" + pings,
           event: "privy:iframe:ready",
@@ -326,4 +368,66 @@ it("a signer timeout requires a fresh wallet connection and never retries signin
   assert.equal(f.action("confirm-funding").disabled, false);
   assert.equal(f.counts().signatures, 1);
   assert.equal(f.counts().submits, 0);
+});
+
+it("inline funding connects and signs within the trusted card with zero windows and no credential/signature in host messages", async () => {
+  const f = await fixture(false, true);
+  assert.equal(f.action("confirm-funding").disabled, true);
+  const connecting = f.action("connect-wallet").onclick!();
+  await tick();
+  await f.load();
+  await f.reply();
+  await connecting;
+  assert.equal(f.action("confirm-funding").disabled, false);
+  assert.equal(f.counts().signatures, 0);
+  await f.action("confirm-funding").onclick!();
+  assert.equal(f.counts().signatures, 1);
+  assert.equal(f.counts().submits, 1);
+  assert.equal(f.opened(), 0);
+  assert(f.messages.some((m: any) => m.status === "submitted"));
+  assert(!JSON.stringify(f.messages).includes("fixture-privy"));
+  assert(!JSON.stringify(f.messages).includes("signing_challenge"));
+  assert(!JSON.stringify(f.messages).includes("0x" + "b".repeat(130)));
+});
+
+it("an unavailable inline signing session stays in the card and never opens a window, signs or submits", async () => {
+  const f = await fixture(false, true, { noUser: true });
+  await f.action("connect-wallet").onclick!();
+  assert.match(f.ids.status.textContent, /cannot restore.*inside the card/);
+  assert.equal(f.action("confirm-funding").disabled, true);
+  assert.equal(f.opened(), 0);
+  assert.equal(f.counts().signatures, 0);
+  assert.equal(f.counts().submits, 0);
+});
+it("explicit inline connection gives Privy the browser-provided Ride storage handle without sending it to the host", async () => {
+  const f = await fixture(false, true, { storage: true });
+  assert.equal(f.storageRequests(), 0);
+  const connecting = f.action("connect-wallet").onclick!();
+  await tick();
+  await f.load();
+  await f.reply();
+  await connecting;
+  assert.equal(f.storageRequests(), 1);
+  assert.equal(typeof f.configuredStorage().get, "function");
+  assert.equal(f.counts().signatures, 0);
+  assert.equal(f.counts().submits, 0);
+  assert.equal(f.opened(), 0);
+});
+it("a quote expiring during inline signing never submits the returned signature", async () => {
+  const f = await fixture(false, true, { deferred: true });
+  const connecting = f.action("connect-wallet").onclick!();
+  await tick();
+  await f.load();
+  await f.reply();
+  await connecting;
+  const confirming = f.action("confirm-funding").onclick!();
+  await tick();
+  assert.equal(f.counts().signatures, 1);
+  f.getFunding().expires_at = 0;
+  f.finishSignature();
+  await confirming;
+  assert.equal(f.counts().submits, 0);
+  assert.equal(f.action("confirm-funding").disabled, true);
+  assert.equal(f.action("refresh-quote").disabled, false);
+  assert.equal(f.opened(), 0);
 });
