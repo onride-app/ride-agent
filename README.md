@@ -66,7 +66,7 @@ The public, unauthenticated `ride guide --server URL` command reads the same wor
 
 ## Use
 
-The new conversation flow starts with budget and risk preference only, then shows a recommended portfolio and five candidate rows. Agent Perps plans accept 20-USDC budgets without a 50-USDC allocation floor; each net opening order must meet the venue minimum after rounding. Under-minimum entries are skipped, so a valid preview does not guarantee a fill. Other settings are disclosed defaults/suggestions and remain editable. See [the 0.5.0 implementation and acceptance scope](docs/conversation-v050.md); production/npm availability is separate from this source revision.
+The new conversation flow starts with budget and risk preference only, then shows a recommended portfolio and the performance of those same selected traders. The five-row eligible candidate ranking remains separate for browsing alternatives. Agent Perps plans accept 20-USDC budgets without a 50-USDC allocation floor; each net opening order must meet the venue minimum after rounding. Under-minimum entries are skipped, so a valid preview does not guarantee a fill. Other settings are disclosed defaults/suggestions and remain editable. See [the 0.5.0 implementation and acceptance scope](docs/conversation-v050.md); production/npm availability is separate from this source revision.
 
 ```sh
 ride login --server https://mcp.onride.me/mcp --trade
