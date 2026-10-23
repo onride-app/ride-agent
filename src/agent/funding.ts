@@ -106,6 +106,36 @@ export class FundingService {
         D(d.funding.amount_usdc).eq(amount)
       )
         return this.view(d);
+      const observed = await this.adapter.depositStatus?.(d, user);
+      if (observed?.trading_balance_usdc == null)
+        throw new AgentError(
+          "TRADING_BALANCE_UNAVAILABLE",
+          "Verify current trading balance before preparing funding.",
+          true,
+        );
+      if (observed.wallet_balance_usdc == null)
+        throw new AgentError(
+          "FUNDING_WALLET_READ_UNAVAILABLE",
+          "Verify the Arbitrum funding-wallet balance before preparing funding.",
+          true,
+        );
+      for (const key of ["wallet_balance_usdc", "trading_balance_usdc"]) {
+        try {
+          if (!D(observed[key]).isFinite() || D(observed[key]).lt(0))
+            throw Error();
+        } catch {
+          throw new AgentError(
+            "FUNDING_BALANCE_UNAVAILABLE",
+            "Funding balances could not be verified. Retry the status read before preparing funding.",
+            true,
+          );
+        }
+      }
+      if (D(observed.wallet_balance_usdc).lt(amount))
+        throw new AgentError(
+          "FUNDING_WALLET_INSUFFICIENT",
+          `Preparing ${cash(amount)} USDC requires that amount in the Arbitrum funding wallet, which currently holds ${cash(observed.wallet_balance_usdc)} USDC. The trading account separately has ${cash(observed.trading_balance_usdc)} USDC available. No new funding was prepared; check existing trading funds before sending more.`,
+        );
       const quote = await this.call("quote", user, {
         amount_usdc: cash(amount),
         expected_master: d.address,
@@ -128,16 +158,11 @@ export class FundingService {
           "FUNDING_QUOTE_EXPIRED",
           "Review a fresh funding quote.",
         );
-      const observed = await this.adapter.depositStatus?.(d, user);
-      if (observed?.trading_balance_usdc == null)
-        throw new AgentError(
-          "TRADING_BALANCE_UNAVAILABLE",
-          "Verify current trading balance before preparing funding.",
-          true,
-        );
       quote.baseline_trading_available_usdc = cash(
         observed.trading_balance_usdc,
       );
+      if (observed.trading_account_mode != null)
+        quote.baseline_trading_account_mode = observed.trading_account_mode;
       d.funding = {
         id: uid("funding"),
         amount_usdc: cash(amount),

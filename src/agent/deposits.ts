@@ -2,6 +2,7 @@ import QRCode from "qrcode";
 import { Contract, JsonRpcProvider, FetchRequest, id as eventId } from "ethers";
 import { AgentError } from "./contracts.js";
 import { cash, D, uid, now } from "./domain.js";
+import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
 
 export interface Deposit {
   id: string;
@@ -133,8 +134,43 @@ export class DepositReads {
       );
       const balance = await token.balanceOf(address);
       return cash(D(balance.toString()).div(1e6));
+    } catch (error) {
+      if (error instanceof AgentError) throw error;
+      throw new AgentError(
+        "FUNDING_WALLET_READ_UNAVAILABLE",
+        "Arbitrum funding-wallet balance could not be verified. Retry the status read; do not repeat a transfer.",
+        true,
+        503,
+      );
     } finally {
       rpc.destroy();
+    }
+  }
+  private async tradingInfo(type: string, user: string): Promise<any> {
+    try {
+      const response = await this.request("https://api.hyperliquid.xyz/info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type, user }),
+        signal: AbortSignal.timeout(12000),
+        redirect: "error",
+      });
+      if (!response.ok)
+        throw new AgentError(
+          "TRADING_BALANCE_UNAVAILABLE",
+          "Trading balance could not be verified. Retry the status read; do not repeat a transfer.",
+          true,
+          503,
+        );
+      return await response.json();
+    } catch (error) {
+      if (error instanceof AgentError) throw error;
+      throw new AgentError(
+        "TRADING_BALANCE_UNAVAILABLE",
+        "Trading balance could not be verified. Retry the status read; do not repeat a transfer.",
+        true,
+        503,
+      );
     }
   }
   async address(
@@ -259,46 +295,73 @@ export class DepositReads {
             "FUNDING_WALLET_CHANGED",
             "This receiving account is no longer the active trading account. Review a new request.",
           );
-        const response = await this.request(
-          "https://api.hyperliquid.xyz/info",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              type: "clearinghouseState",
-              user: owned.master,
-            }),
-            signal: AbortSignal.timeout(12000),
-            redirect: "error",
-          },
+        const mode = perpsAccountMode(
+          await this.tradingInfo("userAbstraction", owned.master),
         );
-        if (!response.ok)
+        if (mode === "unsupported")
           throw new AgentError(
-            "TRADING_BALANCE_UNAVAILABLE",
-            "Trading balance could not be verified.",
+            "TRADING_ACCOUNT_MODE_UNAVAILABLE",
+            "Trading account mode could not be verified.",
             true,
             503,
           );
-        const state = (await response.json()) as any;
+        let available: string;
+        if (mode === "unified") {
+          const spot = await this.tradingInfo(
+            "spotClearinghouseState",
+            owned.master,
+          );
+          available = unifiedUsdc(spot).available;
+        } else {
+          const state = await this.tradingInfo(
+            "clearinghouseState",
+            owned.master,
+          );
+          try {
+            if (
+              typeof state.withdrawable !== "string" ||
+              !state.marginSummary ||
+              !Array.isArray(state.assetPositions) ||
+              !D(state.withdrawable).isFinite() ||
+              D(state.withdrawable).lt(0)
+            )
+              throw Error();
+            available = cash(state.withdrawable);
+          } catch {
+            throw new AgentError(
+              "TRADING_BALANCE_UNAVAILABLE",
+              "Trading balance evidence is incomplete.",
+              true,
+              503,
+            );
+          }
+        }
         if (
-          typeof state.withdrawable !== "string" ||
-          !state.marginSummary ||
-          !Array.isArray(state.assetPositions) ||
-          !D(state.withdrawable).isFinite() ||
-          D(state.withdrawable).lt(0)
+          perpsAccountMode(
+            await this.tradingInfo("userAbstraction", owned.master),
+          ) !== mode
         )
           throw new AgentError(
             "TRADING_BALANCE_UNAVAILABLE",
-            "Trading balance evidence is incomplete.",
+            "Trading account mode changed during the balance read. Retry the status read.",
             true,
             503,
           );
         const active = owned.status === 4 || owned.status === "active";
+        const supported =
+          mode === "standard" ||
+          process.env.RIDE_AGENT_UNIFIED_ENABLED === "true";
         trading = {
-          trading_balance_usdc: cash(state.withdrawable),
+          trading_balance_usdc: available,
           trading_observed_at: now(),
-          available_to_copy: active && D(state.withdrawable).gt(0),
-          sufficient_for_amount: D(state.withdrawable).gte(
+          trading_account_mode: mode,
+          trading_balance_basis:
+            mode === "unified"
+              ? "spot_usdc_total_minus_hold"
+              : "perps_withdrawable",
+          account_mode_supported: supported,
+          available_to_copy: active && supported && D(available).gt(0),
+          sufficient_for_amount: D(available).gte(
             deposit.funding?.amount_usdc ?? deposit.amount_usdc ?? "5",
           ),
           activation_required: !active,
@@ -360,6 +423,10 @@ export class DepositReads {
             fundingReceipt = "confirmed";
             verifiedCredit =
               trading.trading_observation === "verified" &&
+              (f.quote.baseline_trading_account_mode ===
+                trading.trading_account_mode ||
+                (f.quote.baseline_trading_account_mode == null &&
+                  trading.trading_account_mode === "standard")) &&
               D(trading.trading_balance_usdc).gte(
                 D(f.quote.baseline_trading_available_usdc ?? "0").plus(
                   f.amount_usdc,
@@ -372,11 +439,13 @@ export class DepositReads {
         deposit_id: deposit.id,
         status: trading.available_to_copy
           ? "trading_ready"
-          : D(trading.trading_balance_usdc ?? "0").gt(0)
-            ? "activation_required"
-            : received.gt(0)
-              ? "wallet_balance_increased"
-              : "awaiting_deposit",
+          : trading.account_mode_supported === false
+            ? "account_mode_unsupported"
+            : D(trading.trading_balance_usdc ?? "0").gt(0)
+              ? "activation_required"
+              : received.gt(0)
+                ? "wallet_balance_increased"
+                : "awaiting_deposit",
         wallet_balance_usdc: balance,
         received_usdc: received.gt(0) ? cash(received) : null,
         ...trading,
@@ -386,10 +455,12 @@ export class DepositReads {
         transaction_hash: deposit.funding?.transaction_hash ?? null,
         next_action: trading.available_to_copy
           ? "Trading balance is verified. Refresh the saved plan before confirming copying."
-          : trading.activation_required &&
-              D(trading.trading_balance_usdc ?? "0").gt(0)
-            ? "Open the Ride funding confirmation page to activate this funded trading account."
-            : "Use prepare_deposit with the exact amount to open Ride's funding confirmation page. Wallet receipt alone is not trading credit. Do not repeat an unresolved submission.",
+          : trading.account_mode_supported === false
+            ? "Trading balance is verified, but this account mode is not enabled for Agent execution. Review account compatibility; do not repeat funding or switch account mode automatically."
+            : trading.activation_required &&
+                D(trading.trading_balance_usdc ?? "0").gt(0)
+              ? "Open the Ride funding confirmation page to activate this funded trading account."
+              : "Use prepare_deposit with the exact amount to open Ride's funding confirmation page. Wallet receipt alone is not trading credit. Do not repeat an unresolved submission.",
       };
     }
     const response = await this.bridge(`status/${deposit.address}`);

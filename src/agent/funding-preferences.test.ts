@@ -30,6 +30,8 @@ function fixture() {
   let calls = 0;
   adapter.depositStatus = async () => ({
     trading_balance_usdc: "0",
+    wallet_balance_usdc: "10",
+    trading_account_mode: "standard",
     available_to_copy: false,
   });
   adapter.fundingOperation = async (operation, _user, input) => {
@@ -192,6 +194,98 @@ it("requires fresh displayed parameters and wallet signature, executes once unde
     ),
   );
   assert.equal(f.calls(), 1);
+});
+it("does not prepare or quote another transfer when funds are already at the venue and the funding wallet is empty", async () => {
+  const f = fixture();
+  await f.repository.transact("alice", async (s) => {
+    s.deposits = [f.deposit];
+  });
+  let quoteCalls = 0;
+  f.adapter.fundingOperation = async () => {
+    quoteCalls++;
+    throw Error("must not reach the funding boundary");
+  };
+  f.adapter.depositStatus = async () => ({
+    trading_balance_usdc: "36.279657",
+    trading_account_mode: "unified",
+    wallet_balance_usdc: "0.000000",
+    available_to_copy: true,
+  });
+  await assert.rejects(
+    f.funding.prepare("alice", f.deposit.id, "10"),
+    (error: any) => {
+      assert.equal(error.code, "FUNDING_WALLET_INSUFFICIENT");
+      assert.match(error.message, /36.279657/);
+      assert.match(error.message, /No new funding was prepared/);
+      return true;
+    },
+  );
+  assert.equal(quoteCalls, 0);
+  await f.repository.transact("alice", async (s) => {
+    assert.equal(s.deposits![0].funding, undefined);
+  });
+});
+it("fails closed before quoting when funding balances are missing, malformed or unreadable", async () => {
+  const f = fixture();
+  await f.repository.transact("alice", async (s) => {
+    s.deposits = [f.deposit];
+  });
+  let quoteCalls = 0;
+  f.adapter.fundingOperation = async () => {
+    quoteCalls++;
+    throw Error("must not quote");
+  };
+  for (const observation of [
+    { trading_balance_usdc: "36" },
+    { trading_balance_usdc: "36", wallet_balance_usdc: "NaN" },
+    { trading_balance_usdc: "-1", wallet_balance_usdc: "10" },
+    { trading_balance_usdc: "unknown", wallet_balance_usdc: "10" },
+  ]) {
+    f.adapter.depositStatus = async () => observation;
+    await assert.rejects(
+      f.funding.prepare("alice", f.deposit.id, "10"),
+      (error: any) => {
+        assert.match(error.code, /^FUNDING_.*UNAVAILABLE$/);
+        return true;
+      },
+    );
+  }
+  f.adapter.depositStatus = async () => {
+    throw Error("read timeout");
+  };
+  await assert.rejects(
+    f.funding.prepare("alice", f.deposit.id, "10"),
+    /read timeout/,
+  );
+  assert.equal(quoteCalls, 0);
+  await f.repository.transact("alice", async (s) => {
+    assert.equal(s.deposits![0].funding, undefined);
+  });
+});
+it("freezes the Unified balance baseline and reuses the same unexpired exact-amount preview", async () => {
+  const f = fixture();
+  await f.repository.transact("alice", async (s) => {
+    s.deposits = [f.deposit];
+  });
+  f.adapter.depositStatus = async () => ({
+    wallet_balance_usdc: "10",
+    trading_balance_usdc: "36.279657",
+    trading_account_mode: "unified",
+  });
+  const first = (await f.funding.prepare("alice", f.deposit.id, "10")).data
+    .funding as any;
+  f.adapter.depositStatus = async () => {
+    throw Error("reuse does not start a second preparation");
+  };
+  const second = (await f.funding.prepare("alice", f.deposit.id, "10")).data
+    .funding as any;
+  assert.deepEqual(second, first);
+  assert.equal(f.calls(), 0);
+  await f.repository.transact("alice", async (s) => {
+    const quote = s.deposits![0].funding!.quote;
+    assert.equal(quote.baseline_trading_available_usdc, "36.279657");
+    assert.equal(quote.baseline_trading_account_mode, "unified");
+  });
 });
 it("persists uncertain submission and blocks replacement even if the boundary times out", async () => {
   const f = fixture();
