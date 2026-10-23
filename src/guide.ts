@@ -39,12 +39,12 @@ export async function fetchGuide(server: string): Promise<RideGuide> {
     signal: AbortSignal.timeout(10000),
   });
   if (!response.ok)
-    throw new Error("Current Ride Agent workflow is unavailable; retry later.");
+    throw new Error("Current Rider workflow is unavailable; retry later.");
   if (!response.headers.get("content-type")?.includes("application/json"))
-    throw new Error("Invalid Ride Agent guide response.");
+    throw new Error("Invalid Rider guide response.");
   // Bound the body even when the server omits or lies about Content-Length.
   const reader = response.body?.getReader();
-  if (!reader) throw new Error("Empty Ride Agent guide response.");
+  if (!reader) throw new Error("Empty Rider guide response.");
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
@@ -52,7 +52,7 @@ export async function fetchGuide(server: string): Promise<RideGuide> {
       const chunk = await reader.read();
       if (chunk.done) break;
       size += chunk.value.byteLength;
-      if (size > 262144) throw new Error("Ride Agent guide response is too large.");
+      if (size > 262144) throw new Error("Rider guide response is too large.");
       chunks.push(chunk.value);
     }
   } finally {
@@ -64,7 +64,7 @@ export async function fetchGuide(server: string): Promise<RideGuide> {
   if (
     createHash("sha256").update(guide.workflow).digest("hex") !== guide.sha256
   )
-    throw new Error("Ride Agent guide content is inconsistent.");
+    throw new Error("Rider guide content is inconsistent.");
   return guide;
 }
 
@@ -75,9 +75,9 @@ export function registerGuide(
   server.registerTool(
     "get_ride_guide",
     {
-      title: "Current Ride Agent workflow",
+      title: "Current Rider workflow",
       description:
-        "Read Ride Agent's current workflow before using its tools. Updates independently of the installed Skill; this read does not authorize trading or change local files.",
+        "Read Rider's current workflow before using its tools. Updates independently of the installed Skill; this read does not authorize trading or change local files.",
       inputSchema: z.object({}).strict(),
       outputSchema: guideSchema,
       annotations: {
@@ -99,7 +99,7 @@ export function registerGuide(
           content: [
             {
               type: "text" as const,
-              text: "Current Ride Agent workflow is unavailable. Retry the guide read before creating financial proposals.",
+              text: "Current Rider workflow is unavailable. Retry the guide read before creating financial proposals.",
             },
           ],
           isError: true,

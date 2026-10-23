@@ -164,7 +164,7 @@ export function registerAgentTools(
     server.registerTool(
       "show_confirmation_card",
       {
-        title: "Ride Agent confirmation card",
+        title: "Rider confirmation card",
         description:
           "Show an owned frozen proposal in a human confirmation card. mode:demo renders a 0-USDC interface test without account changes or any execution. This tool never confirms, signs or submits a proposal.",
         inputSchema: z
@@ -316,7 +316,7 @@ export async function invokeAgent(
   if (!response.ok && !(body as Result).error)
     throw new AgentError(
       "BACKEND_UNAVAILABLE",
-      "Ride Agent request failed.",
+      "Rider request failed.",
       response.status >= 500,
       response.status,
     );
@@ -327,7 +327,7 @@ function description(name: ToolName): string {
     get_preferences:
       "Read saved/partial answers. Start in chat with budget and risk preference only; ask only returned missing questions. Preserve earlier answers. Numeric risk presets are suggestions requiring final confirmation, not user consent.",
     prepare_deposit:
-      "Prepare an exact-amount deposit activation for an owned funding request. Returns a human Ride Agent confirmation URL; no funds move until the user confirms and signs there.",
+      "Prepare an exact-amount deposit activation for an owned funding request. Returns a human Rider confirmation URL; no funds move until the user confirms and signs there.",
     get_deposit_options:
       "Read currently supported funding routes. No funds are transferred.",
     get_deposit_address:
@@ -337,7 +337,7 @@ function description(name: ToolName): string {
     get_daily_checkin:
       "Offer one portfolio performance review per local day and timezone; does not send a message or notification.",
     update_portfolio:
-      "Propose changing the owned portfolio loss threshold; requires Ride Agent confirmation and cannot unlatch a triggered stop.",
+      "Propose changing the owned portfolio loss threshold; requires Rider confirmation and cannot unlatch a triggered stop.",
     set_preferences:
       "Save only supplied user answers, including partial budget/risk answers. Defaults and numeric risk suggestions are marked separately; do not ask for optional settings up front. Existing portfolios are unchanged.",
     recalculate_plan:

@@ -1,10 +1,12 @@
-# Ride Agent
+# Rider
+
+**Rider** is the public MCP and CLI display name for Ride Agent. The package stays `@onride/agent`, the CLI and MCP configuration key stay `ride`, and the hosted URL stays `https://mcp.onride.me/mcp`.
 
 **AI Copy-Trading Agent**
 
-Ride Agent helps you discover traders, build a personalized copy-trading portfolio, and start copying after your confirmation.
+Rider helps you discover traders, build a personalized copy-trading portfolio, and start copying after your confirmation.
 
-Ride Agent V3 selects a diversified trader basket and manages owned Perps and prediction-market copies. It exposes twenty-three Agent MCP tools plus an authenticated Ride App copy read and a live workflow guide, equivalent JSON CLI commands, conversation-first recommendation tables and Ride confirmation cards, and a portable agent Skill.
+Rider V3 selects a diversified trader basket and manages owned Perps and prediction-market copies. It exposes twenty-three Agent MCP tools plus an authenticated Ride App copy read and a live workflow guide, equivalent JSON CLI commands, conversation-first recommendation tables and Ride confirmation cards, and a portable agent Skill.
 
 **Company distribution:** `@onride/agent` is owned by the `onride` npm organization; source and releases live in [`onride-app/ride-agent`](https://github.com/onride-app/ride-agent). Existing users can follow the [compatible upgrade guide](docs/ride-agent-migration.md).
 
@@ -23,18 +25,18 @@ The installer detects Codex, Claude Code and Cursor. With one detected client it
 For unattended configuration or an explicit client, the existing options remain available:
 
 ```sh
-npx -y @onride/agent@0.5.2 setup --client codex --trade
-npx -y @onride/agent@0.5.2 setup --client claude-code --trade
-npx -y @onride/agent@0.5.2 setup --client cursor --trade
+npx -y @onride/agent@0.5.3 setup --client codex --trade
+npx -y @onride/agent@0.5.3 setup --client claude-code --trade
+npx -y @onride/agent@0.5.3 setup --client cursor --trade
 ```
 
-Codex uses native HTTP MCP and its own OAuth credential storage. If the Codex CLI is absent, setup runs the official `@openai/codex@0.162.0` CLI through npx automatically. Claude Code and Cursor use the automatically updated Ride Agent CLI's stdio MCP and private OAuth session. `setup` without `--trade` requests read access. Add `--skip-login` for configuration only; `--server https://YOUR-RIDE-HOST/mcp` selects another deployment.
+Codex uses native HTTP MCP and its own OAuth credential storage. If the Codex CLI is absent, setup runs the official `@openai/codex@0.162.0` CLI through npx automatically. Claude Code and Cursor use the automatically updated Rider CLI's stdio MCP and private OAuth session. `setup` without `--trade` requests read access. Add `--skip-login` for configuration only; `--server https://YOUR-RIDE-HOST/mcp` selects another deployment.
 
 Setup preserves unrelated settings, upgrades unmodified managed installations and refuses to overwrite a foreign `ride` entry or customized Skill. If login is cancelled or fails, rerun the same command to retry; the installed configuration is retained.
 
-Registry installation is the default. To use the pinned GitHub release source, run `npx -y github:onride-app/ride-agent#v0.5.2 setup --client CLIENT --trade --distribution github`. Other clients supporting remote Streamable HTTP MCP with OAuth can connect to `https://mcp.onride.me/mcp`; their registration and consent interface is managed by that client. The installer currently configures Codex, Claude Code and Cursor.
+Registry installation is the default. To use the pinned GitHub release source, run `npx -y github:onride-app/ride-agent#v0.5.3 setup --client CLIENT --trade --distribution github`. Other clients supporting remote Streamable HTTP MCP with OAuth can connect to `https://mcp.onride.me/mcp`; their registration and consent interface is managed by that client. The installer currently configures Codex, Claude Code and Cursor.
 
-For ChatGPT, connect Ride through ChatGPT's app/connector settings using the hosted MCP URL. npm setup and standalone CLI login do not authorize a ChatGPT connection. If a tool returns `AUTH_REQUIRED`, reconnect Ride in those settings and finish its OAuth flow, then retry in a new chat. Keep the user's previously supplied preferences; authentication does not require repeating their budget or risk answers. A chat message cannot itself open the host's login interface or create a valid OAuth authorization URL.
+For ChatGPT, add a custom MCP server with **Name: Rider**, **Server URL: https://mcp.onride.me/mcp**, and **Authentication: OAuth**. ChatGPT stores the connection name entered during setup; server metadata cannot rename another user's custom connection. Existing users can rename their connection to Rider without reinstalling or changing access. See [Rider naming and upgrade](docs/rider-mcp-name.md). npm setup and standalone CLI login do not authorize a ChatGPT connection. If a tool returns `AUTH_REQUIRED`, reconnect Rider in those settings and finish its OAuth flow, then retry in a new chat. Keep the user's previously supplied preferences; authentication does not require repeating their budget or risk answers. A chat message cannot itself open the host's login interface or create a valid OAuth authorization URL.
 
 For the Skill alone:
 
@@ -42,7 +44,7 @@ For the Skill alone:
 npx skills add onride-app/ride-agent --skill ride
 ```
 
-The Skill-only command does not register an MCP server. For standalone CLI commands, prefix the commands below with `npx -y @onride/agent@0.5.2`, or install the pinned package with `npm install -g @onride/agent@0.5.2` to obtain `ride`.
+The Skill-only command does not register an MCP server. For standalone CLI commands, prefix the commands below with `npx -y @onride/agent@0.5.3`, or install the pinned package with `npm install -g @onride/agent@0.5.3` to obtain `ride`.
 
 ## Automatic updates and existing users
 

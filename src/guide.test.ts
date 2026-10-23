@@ -132,7 +132,7 @@ it("guide reads reject redirects, inconsistent content, unsupported protocol and
     respond((res) =>
       res.setHeader("Content-Type", "text/html").end("<html>Login</html>"),
     );
-    await assert.rejects(fetchGuide(url), /Invalid Ride Agent guide/);
+    await assert.rejects(fetchGuide(url), /Invalid Rider guide/);
     await assert.rejects(
       fetchGuide("https://user:secret@other.test/mcp"),
       /HTTPS MCP/,

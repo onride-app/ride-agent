@@ -1,6 +1,6 @@
 {
   "name": "@onride/agent",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": false,
   "type": "module",
   "scripts": {
@@ -47,7 +47,7 @@
   "engines": {
     "node": ">=20"
   },
-  "description": "Ride Agent helps you discover traders, build a personalized copy-trading portfolio, and start copying after your confirmation.",
+  "description": "Rider helps you discover traders, build a personalized copy-trading portfolio, and start copying after your confirmation.",
   "license": "MIT",
   "repository": {
     "type": "git",

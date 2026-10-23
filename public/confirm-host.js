@@ -30,7 +30,7 @@ const showError = (e) => {
 async function init() {
   if (client) return client;
   if (initialization) return initialization;
-  if (!config.privy_app_id) throw Error("Ride Agent sign-in is unavailable.");
+  if (!config.privy_app_id) throw Error("Rider sign-in is unavailable.");
   const { default: Privy, LocalStorage } = await import(config.privy_sdk);
   initialization = (async () => {
     const next = new Privy({
@@ -63,7 +63,7 @@ async function call(operation, body = {}) {
   const payload = await response.json();
   if (!response.ok) {
     const error = new Error(
-      payload.error?.message ?? "Ride Agent request failed.",
+      payload.error?.message ?? "Rider request failed.",
     );
     error.code = payload.error?.code;
     throw error;
@@ -121,7 +121,7 @@ async function ready() {
       location.origin,
     );
     status.textContent =
-      "Ride Agent 已连接，请返回聊天卡片确认操作。此窗口没有提交交易。";
+      "Rider 已连接，请返回聊天卡片确认操作。此窗口没有提交交易。";
     return;
   }
   await loadProposal();
@@ -328,7 +328,7 @@ async function start() {
     url.searchParams.delete("error_description");
     history.replaceState({}, "", url.href);
     showLogin();
-    showError(Error("Ride Agent 登录已取消。"));
+    showError(Error("Rider 登录已取消。"));
     return;
   }
   try {

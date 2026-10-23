@@ -42,7 +42,7 @@ export function mountHumanConfirmation(
     if (req.get("origin") !== origin)
       throw new AgentError(
         "ORIGIN_REQUIRED",
-        "Ride Agent browser origin is required.",
+        "Rider browser origin is required.",
         false,
         403,
       );
@@ -166,7 +166,7 @@ export function mountHumanConfirmation(
       )
         throw new AgentError(
           "AUTH_REQUIRED",
-          "Ride Agent sign-in handoff expired. Reopen sign-in.",
+          "Rider sign-in handoff expired. Reopen sign-in.",
           false,
           401,
         );
@@ -293,7 +293,7 @@ export function mountHumanConfirmation(
       if (req.get("origin") !== origin)
         throw new AgentError(
           "ORIGIN_REQUIRED",
-          "Ride Agent browser origin is required.",
+          "Rider browser origin is required.",
           false,
           403,
         );
@@ -368,7 +368,7 @@ export function mountHumanConfirmation(
         if (req.get("origin") !== origin)
           throw new AgentError(
             "ORIGIN_REQUIRED",
-            "Ride Agent browser origin is required.",
+            "Rider browser origin is required.",
             false,
             403,
           );

@@ -23,7 +23,7 @@ import {
 
 export type ClientName = "codex" | "claude-code" | "cursor";
 const legacySkillHashes = new Set([
-  // Complete company bootstrap Skill shipped in @onride/agent@0.5.1-rc.0.
+  // Complete company bootstrap Skill shipped in @onride/agent@0.5.1-rc.0 and 0.5.2.
   "5c7f618213f7a57d1582c05db6e91916841fa073e40e0767580808818cbe101d",
   // Complete Skill shipped in the public @glenyang/ride-cli@0.5.0 tarball.
   "352f6193233417a573d583669a7effc396a46746085ee6e81197923030a64fb3",
@@ -63,6 +63,7 @@ const managedVersions = [
   "0.5.0",
   "0.5.1",
   "0.5.1-rc.0",
+  "0.5.2",
   VERSION,
 ];
 
@@ -70,7 +71,7 @@ async function skillHash(root: string): Promise<string | undefined> {
   try {
     const info = await lstat(root);
     if (info.isSymbolicLink() || !info.isDirectory())
-      throw new Error("Unsafe existing Ride Agent Skill");
+      throw new Error("Unsafe existing Rider Skill");
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw e;
@@ -82,10 +83,10 @@ async function skillHash(root: string): Promise<string | undefined> {
     })) {
       const name = relative ? `${relative}/${item.name}` : item.name;
       if (item.isSymbolicLink())
-        throw new Error("Unsafe existing Ride Agent Skill");
+        throw new Error("Unsafe existing Rider Skill");
       if (item.isDirectory()) await visit(name);
       else if (item.isFile()) files.set(name, await readFile(join(root, name)));
-      else throw new Error("Unsafe existing Ride Agent Skill");
+      else throw new Error("Unsafe existing Rider Skill");
     }
   }
   await visit("");
@@ -189,7 +190,7 @@ export async function setup(
   }
   const conflict = () =>
     new Error(
-      `Existing Ride Agent MCP registration differs at ${config}; no files changed. Back up this file, retain your server URL and custom parameters, and replace only the old package with ${PACKAGE_NAME}@latest after review. Keep a customized registration under manual management; see docs/ride-agent-migration.md.`,
+      `Existing Rider MCP registration differs at ${config}; no files changed. Back up this file, retain your server URL and custom parameters, and replace only the old package with ${PACKAGE_NAME}@latest after review. Keep a customized registration under manual management; see docs/ride-agent-migration.md.`,
     );
   const parsed =
     client === "codex"
@@ -253,7 +254,7 @@ export async function setup(
     incoming = await skillHash(packaged);
   if (present && present !== incoming && !legacySkillHashes.has(present))
     throw new Error(
-      `Existing Ride Agent Skill differs at ${skill}; no files changed. Back up and compare your custom instructions with the packaged skills/ride. Keep a merged Skill under manual management, or move your backup aside yourself before retrying setup --skip-login.`,
+      `Existing Rider Skill differs at ${skill}; no files changed. Back up and compare your custom instructions with the packaged skills/ride. Keep a merged Skill under manual management, or move your backup aside yourself before retrying setup --skip-login.`,
     );
   await mkdir(dirname(skill), { recursive: true });
   await mkdir(dirname(config), { recursive: true });

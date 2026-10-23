@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ride Agent · Confirmation</title><style>/*INLINE_CSS*/:root {
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rider · Confirmation</title><style>/*INLINE_CSS*/:root {
   font-family:
     Inter,
     -apple-system,
@@ -258,7 +258,7 @@ summary {
   border-radius: 16px;
   background: #fcfbf8;
 }
-</style></head><body><main><header><div class="brand"><span>Ride Agent</span> / confirmation</div><span class="tag">Human approval</span></header><div id="login" class="card"><h1>Sign in to review your proposal</h1><p class="muted">Ride verifies your account before displaying or confirming changes.</p><label>Access code, if required<input id="access-code" autocomplete="off"></label><button id="sign-in">Continue with Google</button></div><div id="status" aria-live="polite"></div><div id="content"></div><div id="actions" class="actions" hidden><button id="approve">Confirm these parameters</button><button id="reject" class="secondary">Reject proposal</button></div></main><script type="module">/*INLINE_VIEW*/const el = (tag, text, cls) => {
+</style></head><body><main><header><div class="brand"><span>Rider</span> / confirmation</div><span class="tag">Human approval</span></header><div id="login" class="card"><h1>Sign in to review your proposal</h1><p class="muted">Ride verifies your account before displaying or confirming changes.</p><label>Access code, if required<input id="access-code" autocomplete="off"></label><button id="sign-in">Continue with Google</button></div><div id="status" aria-live="polite"></div><div id="content"></div><div id="actions" class="actions" hidden><button id="approve">Confirm these parameters</button><button id="reject" class="secondary">Reject proposal</button></div></main><script type="module">/*INLINE_VIEW*/const el = (tag, text, cls) => {
   const node = document.createElement(tag);
   if (text !== undefined && text !== null) node.textContent = String(text);
   if (cls) node.className = cls;
@@ -325,7 +325,7 @@ function sleeveCards(
           : "Sleeve exit trigger",
         s.stop_loss_pct == null ? null : `${s.stop_loss_pct}%`,
       ),
-      row("Copy mode", s.copy_mode ?? "Ride Agent recommended"),
+      row("Copy mode", s.copy_mode ?? "Rider recommended"),
       ...(s.copy_mode === "fixed"
         ? [row("Fixed margin per source entry", usdc(s.fixed_margin_usdc))]
         : []),
@@ -754,7 +754,7 @@ function render(
         controls,
         "Copy mode",
         [
-          ["ride_recommends", "Ride Agent recommended"],
+          ["ride_recommends", "Rider recommended"],
           ["fixed", "Fixed margin"],
           ["proportional", "Proportional"],
         ],
@@ -944,7 +944,7 @@ function render(
     ) {
       confirmationCard(root, q, d.confirmation_demo === true);
     } else if (q.status === "requires_confirmation" && q.confirmation_url) {
-      const b = el("button", "Open Ride Agent confirmation");
+      const b = el("button", "Open Rider confirmation");
       b.addEventListener("click", () => openLink(q.confirmation_url));
       root.append(b);
     }
@@ -967,7 +967,7 @@ function render(
       );
   }
   if (d.updates) {
-    root.append(el("h1", "Ride Agent updates"));
+    root.append(el("h1", "Rider updates"));
     for (const u of d.updates) {
       const c = card(u.kind);
       c.append(
@@ -1340,7 +1340,7 @@ function planEditor(plan, data, callTool, start) {
         r,
         "Copy mode",
         [
-          ["ride_recommends", "Ride Agent recommended"],
+          ["ride_recommends", "Rider recommended"],
           ["fixed", "Fixed margin"],
           ["proportional", "Proportional"],
         ],
@@ -2005,7 +2005,7 @@ function renderDiagnostic(root, d) {
   root.append(c);
 }
 function renderNotifications(root, d, callTool) {
-  root.append(el("h1", "Daily Ride Agent report"));
+  root.append(el("h1", "Daily Rider report"));
   const p = d.notification_preferences,
     c = card("Notification settings");
   const enabled = select(
@@ -2130,7 +2130,7 @@ const showError = (e) => {
 async function init() {
   if (client) return client;
   if (initialization) return initialization;
-  if (!config.privy_app_id) throw Error("Ride Agent sign-in is unavailable.");
+  if (!config.privy_app_id) throw Error("Rider sign-in is unavailable.");
   const { default: Privy, LocalStorage } = await import(config.privy_sdk);
   initialization = (async () => {
     const next = new Privy({
@@ -2163,7 +2163,7 @@ async function call(operation, body = {}) {
   const payload = await response.json();
   if (!response.ok) {
     const error = new Error(
-      payload.error?.message ?? "Ride Agent request failed.",
+      payload.error?.message ?? "Rider request failed.",
     );
     error.code = payload.error?.code;
     throw error;
@@ -2221,7 +2221,7 @@ async function ready() {
       location.origin,
     );
     status.textContent =
-      "Ride Agent 已连接，请返回聊天卡片确认操作。此窗口没有提交交易。";
+      "Rider 已连接，请返回聊天卡片确认操作。此窗口没有提交交易。";
     return;
   }
   await loadProposal();
@@ -2428,7 +2428,7 @@ async function start() {
     url.searchParams.delete("error_description");
     history.replaceState({}, "", url.href);
     showLogin();
-    showError(Error("Ride Agent 登录已取消。"));
+    showError(Error("Rider 登录已取消。"));
     return;
   }
   try {

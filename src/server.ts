@@ -75,7 +75,7 @@ async function main(): Promise<void> {
             authProvider: input.authProvider ?? "GOOGLE",
             appVersion: "1.0.0",
             platform: "WEB",
-            deviceName: "Ride Agent",
+            deviceName: "Rider",
           },
         },
       }),
@@ -92,7 +92,7 @@ async function main(): Promise<void> {
     )
       throw new AgentError(
         "AUTH_REQUIRED",
-        "Ride Agent sign-in failed.",
+        "Rider sign-in failed.",
         false,
         401,
       );
@@ -129,7 +129,7 @@ async function main(): Promise<void> {
       baseUrl: base,
       resourceServerUrl: resource,
       scopesSupported: [...RIDE_OAUTH_SCOPES],
-      resourceName: "Ride Agent",
+      resourceName: "Rider",
     }),
   );
   app.use(createRideOAuthApprovalRouter(provider));
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
   );
   app.post("/mcp", auth, async (req, res) => {
     const server = new McpServer(
-      { name: "ride", title: "Ride Agent", version: VERSION },
+      { name: "ride", title: "Rider", version: VERSION },
       { instructions: GUIDE_INSTRUCTIONS },
     );
     registerGuide(server);
@@ -178,7 +178,7 @@ async function main(): Promise<void> {
         )
           throw new AgentError(
             "SCOPE_REQUIRED",
-            "Ride Agent OAuth scope is missing.",
+            "Rider OAuth scope is missing.",
             false,
             403,
           );
@@ -255,12 +255,12 @@ async function main(): Promise<void> {
   });
   app.use(requestBodyErrorHandler);
   app.listen(port, host, () =>
-    console.error(`Ride Agent listening on ${base.origin}/mcp`),
+    console.error(`Rider listening on ${base.origin}/mcp`),
   );
 }
 main().catch(() => {
   console.error(
-    "Ride Agent startup failed. Check required OAuth and backend configuration.",
+    "Rider startup failed. Check required OAuth and backend configuration.",
   );
   process.exitCode = 1;
 });

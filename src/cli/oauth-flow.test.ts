@@ -59,7 +59,7 @@ it("completes SDK OAuth PKCE through the loopback callback and refreshes without
       assert.equal(
         (await provider.clientsStore.getClient(q.get("client_id")!))
           ?.client_name,
-        "Ride Agent",
+        "Rider",
       );
       assert.equal(q.get("code_challenge_method"), "S256");
       assert(q.get("state"));

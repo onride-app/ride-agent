@@ -83,7 +83,7 @@ export function backendApp(
       if (!header?.startsWith("Bearer "))
         throw new AgentError(
           "AUTH_REQUIRED",
-          "Ride Agent authentication required.",
+          "Rider authentication required.",
           false,
           401,
         );

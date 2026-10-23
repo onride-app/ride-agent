@@ -65,10 +65,10 @@ function confirmationCard(container, proposal, demo) {
         new URL(proposal.confirmation_url).pathname !== `/agent/confirm/${id}`)
     )
       throw Error(
-        "The confirmation address does not match this Ride Agent proposal.",
+        "The confirmation address does not match this Rider proposal.",
       );
     const frame = document.createElement("iframe");
-    frame.title = demo ? "Ride Agent 模拟确认卡片" : "Ride Agent 操作确认";
+    frame.title = demo ? "Rider 模拟确认卡片" : "Rider 操作确认";
     frame.className = "confirmation-frame";
     frame.referrerPolicy = "no-referrer";
     frame.setAttribute(
@@ -117,7 +117,7 @@ function confirmationCard(container, proposal, demo) {
         confirmed: "已确认",
         expired: "方案已过期",
       };
-      state.textContent = names[event.data.status] ?? "Ride Agent 状态已更新";
+      state.textContent = names[event.data.status] ?? "Rider 状态已更新";
       if (Number.isFinite(event.data.height))
         frame.style.height = `${Math.min(1400, Math.max(420, event.data.height))}px`;
     };
@@ -189,7 +189,7 @@ async function callTool(name, args) {
         );
     }
   } catch (e) {
-    showError(e.message ?? "Ride Agent request failed.");
+    showError(e.message ?? "Rider request failed.");
   } finally {
     busy = false;
     buttons.forEach(({ button, disabled }) => {
@@ -201,13 +201,13 @@ async function openLink(url) {
   try {
     const target = new URL(url);
     if (target.protocol !== "https:" && target.hostname !== "127.0.0.1")
-      throw new Error("Ride Agent requires a secure confirmation URL.");
+      throw new Error("Rider requires a secure confirmation URL.");
     const response = window.openai?.openExternal
       ? await window.openai.openExternal({ href: url })
       : await request("ui/open-link", { url });
     if (response?.isError)
       throw new Error(
-        `The host could not open the link. Open Ride Agent confirmation manually: ${url}`,
+        `The host could not open the link. Open Rider confirmation manually: ${url}`,
       );
   } catch (e) {
     showError(e.message);
@@ -264,7 +264,7 @@ window.addEventListener("message", (event) => {
         try {
           accept(JSON.parse(text));
         } catch {
-          showError("Ride Agent returned an unreadable result.");
+          showError("Rider returned an unreadable result.");
         }
       }
     }
@@ -275,7 +275,7 @@ window.addEventListener("message", (event) => {
 });
 if (!window.openai?.callTool)
   request("ui/initialize", {
-    appInfo: { name: "Ride Agent", version: "0.5.2" },
+    appInfo: { name: "Rider", version: "0.5.3" },
     appCapabilities: {},
     protocolVersion: "2026-01-26",
   })

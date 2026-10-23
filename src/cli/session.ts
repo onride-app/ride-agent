@@ -59,7 +59,7 @@ async function secureDirectory(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const s = await lstat(dir);
   if (s.isSymbolicLink() || !s.isDirectory() || s.uid !== process.getuid?.())
-    throw new Error("Unsafe Ride Agent credential directory");
+    throw new Error("Unsafe Rider credential directory");
   await chmod(dir, 0o700);
 }
 export async function loadSession(
@@ -114,7 +114,7 @@ export async function withSessionLock<T>(
   } catch {
     throw new AgentError(
       "SESSION_BUSY",
-      "Another Ride Agent command is updating credentials. Retry after it finishes.",
+      "Another Rider command is updating credentials. Retry after it finishes.",
       true,
     );
   }
@@ -157,7 +157,7 @@ export function providerFor(
   return {
     redirectUrl: redirectUri ?? session.redirect_uri,
     clientMetadata: {
-      client_name: "Ride Agent",
+      client_name: "Rider",
       redirect_uris: [
         redirectUri ?? session.redirect_uri ?? "http://127.0.0.1/unused",
       ],
@@ -221,7 +221,7 @@ export async function login(
       return;
     }
     if (u.searchParams.has("error")) {
-      res.writeHead(400).end("Ride Agent authorization declined");
+      res.writeHead(400).end("Rider authorization declined");
       rejectCode(new Error("Authorization declined"));
       return;
     }
@@ -235,7 +235,7 @@ export async function login(
         "Content-Type": "text/plain",
         "Cache-Control": "no-store",
       })
-      .end("Ride Agent connected. You can close this window.");
+      .end("Rider connected. You can close this window.");
     resolveCode(code);
   });
   await new Promise<void>((resolve) =>
