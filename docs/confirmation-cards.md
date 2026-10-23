@@ -66,6 +66,11 @@ approval; refreshing never signs or submits. The human `funding_prepare` route
 returns its complete signing view, while MCP `prepare_deposit` still excludes
 signing identities and challenges. The human cookie is restored before loading
 the Privy SDK, so missing wallet local storage cannot block a valid read session.
+For signing, the funding page preloads the secure wallet frame and verifies its
+origin-bound ready response before enabling approval. Loading the frame is kept
+outside Privy's short signing timeout. A failed connection exposes a read-only
+reconnect action; it never retries signing or submits funds. Quotes that expire
+while connecting still require renewal and another explicit approval.
 An unknown submission response locks approval and renewal and permits status
 reads only. Backend persistence remains authoritative for exactly-once submission.
 

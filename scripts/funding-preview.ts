@@ -138,10 +138,11 @@ const user = { id: "fixture", linked_accounts: [{ type: "wallet", chain_type: "e
 export class LocalStorage {}
 export default class Privy {
   user = { get: async () => ({ user }) };
-  initialize = async () => {};
+  // This fictional frame uses a local document and never contacts a wallet host.
+  initialize = async () => { const frame = document.querySelector('iframe[title="Privy secure wallet"]'); if (frame) frame.srcdoc = '<!doctype html><title>Fictional wallet transport</title>'; };
   getAccessToken = async () => "local-funding-privy";
   auth = { oauth: { generateURL: async () => ({ url: location.href }), loginWithCode: async () => ({ user }) } };
-  embeddedWallet = { getURL: () => "https://wallet.test.invalid/fixture", onMessage() {}, getProvider: async () => ({ request: async () => (await (await fetch("/fixture/signature", {method:"POST"})).json()).signature }) };
+  embeddedWallet = { getURL: () => "https://wallet.test.invalid/fixture", onMessage() {}, ping: async () => true, reload: () => { const frame = document.querySelector('iframe[title="Privy secure wallet"]'); if (frame) frame.srcdoc = '<!doctype html><title>Fictional wallet transport</title>'; }, getProvider: async () => ({ request: async () => (await (await fetch("/fixture/signature", {method:"POST"})).json()).signature }) };
 }`),
 );
 app.get("/fixture/widget", async (_req, res) => {
