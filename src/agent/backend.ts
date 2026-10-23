@@ -154,11 +154,14 @@ export function backendApp(
             .object({ deposit_id: id, amount_usdc: positiveMoney })
             .strict()
             .parse(req.body);
-          value = await service.funding.prepare(
+          await service.funding.prepare(
             user,
             a.deposit_id,
             String(a.amount_usdc),
           );
+          // The human surface needs the refreshed signing challenge. The MCP
+          // prepare_deposit tool still returns only the public funding view.
+          value = await service.funding.read(user, a.deposit_id);
           break;
         }
         case "funding":

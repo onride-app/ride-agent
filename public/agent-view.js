@@ -108,6 +108,11 @@ export function render(
     welcome(root, callTool);
     return;
   }
+  if (value.data?.funding && confirmationCard) {
+    root.append(el("h1", "确认入金"));
+    confirmationCard(root, value.data.funding, false, "funding");
+    return;
+  }
   if (value.data?.preference_saved)
     root.append(el("p", "Preferences saved", "status"));
   else if (

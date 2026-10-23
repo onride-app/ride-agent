@@ -36,6 +36,14 @@ export function mountHumanConfirmation(
     origin = new URL(options.base).origin,
     handoffs = options.handoffs ?? new MemoryHumanHandoffs();
   const proposalId = z.string().regex(/^proposal_[a-zA-Z0-9_-]{8,100}$/);
+  const depositId = z.string().regex(/^deposit_[a-f0-9]{32}$/);
+  const handoffSubject = {
+    proposal_id: proposalId.optional(),
+    deposit_id: depositId.optional(),
+    challenge: z.string().regex(/^[a-f0-9]{64}$/),
+  };
+  const singleSubject = (v: { proposal_id?: string; deposit_id?: string }) =>
+    !!v.proposal_id !== !!v.deposit_id;
   const browserCookie = "ride_agent_human",
     embedCookie = "ride_agent_embedded";
   const requireOrigin = (req: import("express").Request) => {
@@ -81,6 +89,7 @@ export function mountHumanConfirmation(
         csrf: string;
         expires_at: number;
         embedded?: boolean;
+        deposit_id?: string;
       };
     } catch {
       throw new AgentError(
@@ -132,10 +141,10 @@ export function mountHumanConfirmation(
       checkCsrf(req, session.csrf);
       const input = z
         .object({
-          proposal_id: proposalId,
-          challenge: z.string().regex(/^[a-f0-9]{64}$/),
+          ...handoffSubject,
         })
         .strict()
+        .refine(singleSubject, "Choose one confirmation subject")
         .parse(req.body);
       const ticket = await handoffs.issue({
         ...input,
@@ -153,16 +162,17 @@ export function mountHumanConfirmation(
       const input = z
         .object({
           ticket: z.string().regex(/^[a-zA-Z0-9_-]{43}$/),
-          proposal_id: proposalId,
-          challenge: z.string().regex(/^[a-f0-9]{64}$/),
+          ...handoffSubject,
         })
         .strict()
+        .refine(singleSubject, "Choose one confirmation subject")
         .parse(req.body);
       const handoff = await handoffs.consume(input.ticket);
       if (
         !handoff ||
         handoff.challenge !== input.challenge ||
-        handoff.proposal_id !== input.proposal_id
+        handoff.proposal_id !== input.proposal_id ||
+        handoff.deposit_id !== input.deposit_id
       )
         throw new AgentError(
           "AUTH_REQUIRED",
@@ -174,6 +184,7 @@ export function mountHumanConfirmation(
       const embedded = {
         ...session,
         embedded: true,
+        deposit_id: input.deposit_id,
         csrf: randomBytes(32).toString("base64url"),
       };
       res.cookie(embedCookie, seal(embedded), {
@@ -191,53 +202,74 @@ export function mountHumanConfirmation(
       res.status(e instanceof AgentError ? e.httpStatus : 400).json(failure(e));
     }
   });
-  app.get(["/agent/card/:proposalId", "/agent/card-demo"], async (req, res) => {
-    const demo = req.path === "/agent/card-demo";
-    if (!demo && !proposalId.safeParse(req.params.proposalId).success) {
-      res.status(404).end();
-      return;
-    }
-    const template = await readFile(
-      fileURLToPath(new URL("../../public/confirm.html", import.meta.url)),
-      "utf8",
-    );
-    const ancestors = options.frameAncestors ?? [
-      "'self'",
-      "https://chatgpt.com",
-      "https://*.chatgpt.com",
-      "https://*.oaiusercontent.com",
-      "codex-sandbox://*.web-sandbox.oaiusercontent.com",
-      "https://claude.ai",
-      // Claude assigns each MCP endpoint its own sandbox origin. Allow only
-      // this server's origin, rather than every connector hosted by Claude.
-      `https://${claudeCardDomain(options.base)}`,
-    ];
-    if (ancestors.some((x) => /[;\r\n]/.test(x)))
-      throw Error("Invalid card frame ancestor");
-    // Only the dedicated card route can be framed; existing confirmation,
-    // OAuth, funding, App and API routes retain DENY/frame-ancestors none.
-    res.removeHeader("X-Frame-Options");
-    res.set(
-      "Content-Security-Policy",
-      `base-uri 'self'; frame-ancestors ${ancestors.join(" ")}; object-src 'none'`,
-    );
-    res
-      .set("Cache-Control", "no-store")
-      .type("html")
-      .send(
-        template.replace(
-          "/*CONFIG*/{}",
-          JSON.stringify({
-            proposal_id: req.params.proposalId,
-            embedded: true,
-            demo,
-            privy_app_id: options.auth.privyAppId,
-            privy_client_id: options.auth.privyClientId,
-            privy_sdk: options.auth.jsSdkUrl,
-          }).replaceAll("<", "\\u003c"),
+  app.get(
+    [
+      "/agent/card/:proposalId",
+      "/agent/card-demo",
+      "/agent/fund-card/:depositId",
+    ],
+    async (req, res) => {
+      const demo = req.path === "/agent/card-demo";
+      const funding = req.path.startsWith("/agent/fund-card/");
+      if (
+        !demo &&
+        !(
+          funding
+            ? depositId.safeParse(req.params.depositId)
+            : proposalId.safeParse(req.params.proposalId)
+        ).success
+      ) {
+        res.status(404).end();
+        return;
+      }
+      const template = await readFile(
+        fileURLToPath(
+          new URL(
+            funding ? "../../public/fund.html" : "../../public/confirm.html",
+            import.meta.url,
+          ),
         ),
+        "utf8",
       );
-  });
+      const ancestors = options.frameAncestors ?? [
+        "'self'",
+        "https://chatgpt.com",
+        "https://*.chatgpt.com",
+        "https://*.oaiusercontent.com",
+        "codex-sandbox://*.web-sandbox.oaiusercontent.com",
+        "https://claude.ai",
+        // Claude assigns each MCP endpoint its own sandbox origin. Allow only
+        // this server's origin, rather than every connector hosted by Claude.
+        `https://${claudeCardDomain(options.base)}`,
+      ];
+      if (ancestors.some((x) => /[;\r\n]/.test(x)))
+        throw Error("Invalid card frame ancestor");
+      // Only dedicated card routes can be framed. Standalone confirmation,
+      // OAuth, funding, App and API routes retain DENY.
+      res.removeHeader("X-Frame-Options");
+      res.set(
+        "Content-Security-Policy",
+        `base-uri 'self'; frame-ancestors ${ancestors.join(" ")}; object-src 'none'`,
+      );
+      res
+        .set("Cache-Control", "no-store")
+        .type("html")
+        .send(
+          template.replace(
+            "/*CONFIG*/{}",
+            JSON.stringify({
+              proposal_id: req.params.proposalId,
+              ...(funding ? { deposit_id: req.params.depositId } : {}),
+              embedded: true,
+              demo,
+              privy_app_id: options.auth.privyAppId,
+              privy_client_id: options.auth.privyClientId,
+              privy_sdk: options.auth.jsSdkUrl,
+            }).replaceAll("<", "\\u003c"),
+          ),
+        );
+    },
+  );
   app.get("/agent/confirm/:proposalId", async (req, res) => {
     if (!/^proposal_[a-zA-Z0-9_-]{8,100}$/.test(req.params.proposalId)) {
       res.status(404).end();
@@ -374,16 +406,28 @@ export function mountHumanConfirmation(
           );
         const { session } = sessionFor(req);
         checkCsrf(req, session.csrf);
-        if (
-          session.embedded &&
-          !["proposal", "confirm", "reject"].includes(req.params.operation)
-        )
-          throw new AgentError(
-            "NOT_FOUND",
-            "This operation is unavailable in a confirmation card.",
-            false,
-            404,
-          );
+        if (session.embedded) {
+          const operations = session.deposit_id
+            ? [
+                "funding",
+                "funding_prepare",
+                "funding_confirm",
+                "funding_status",
+                "funding_activation_quote",
+                "funding_activate",
+              ]
+            : ["proposal", "confirm", "reject"];
+          if (
+            !operations.includes(req.params.operation) ||
+            (session.deposit_id && req.body?.deposit_id !== session.deposit_id)
+          )
+            throw new AgentError(
+              "NOT_FOUND",
+              "This operation is unavailable in this confirmation card.",
+              false,
+              404,
+            );
+        }
         token = session.token;
       }
       const response = await fetch(

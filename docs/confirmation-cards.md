@@ -6,8 +6,8 @@ financial proposal or calls the executor. `mode: proposal` reads an owned frozen
 proposal; the backend continues to validate its owner. Recommendation and
 preference tools keep their conversation-first outputs.
 
-MCP Apps use the versioned `ui://ride/agent-v7-confirmation.html` resource. The
-previous v6, v5, v4 and v3 URIs remain registered. Only the configured Ride origin is added to
+MCP Apps use the versioned `ui://ride/agent-v8-confirmation.html` resource. The
+previous v7, v6, v5, v4 and v3 URIs remain registered. Only the configured Ride origin is added to
 the resource's frame policy. The card embeds `/agent/card/:proposalId`; its
 content and human approval requests run at the Ride origin, separate from the
 model and the MCP App sandbox. Existing confirmation, OAuth and funding pages
@@ -39,9 +39,10 @@ bound to a random challenge and proposal ID. It sends the ticket only to its
 same-origin opener. The trusted child frame checks the popup source and origin,
 then exchanges it for a separate HttpOnly, Secure, SameSite=None, Partitioned
 cookie. Redis GETDEL consumes tickets atomically across gateway replicas. The
-embedded cookie retains the original human-session expiry and is limited to
-proposal reads, confirm and reject. It cannot grant autonomous authority or fund
-an account. Blocked popups or unavailable partitioned storage fall back to the
+embedded cookie retains the original human-session expiry. Proposal sessions
+are limited to proposal reads, confirm and reject. A funding handoff is bound
+to one deposit ID and only its human funding operations; it cannot confirm
+proposals, grant authority, or operate on another deposit. Blocked popups or unavailable partitioned storage fall back to the
 normal Ride page; no authentication or approval checks are bypassed.
 
 Only sanitized status/height notifications leave the trusted frame. Tokens,
@@ -51,10 +52,47 @@ Preview hashes, ownership, expiry, portfolio revision and backend idempotency
 remain authoritative. A failed or timed-out confirmation disables repeat
 submission and offers a read of the same proposal ID.
 
-All source changes belong to the independent Ride MCP gateway and its UI. Core,
-GraphQL, workers, legacy App endpoints/schema, approved portfolio settings and
-existing copy configurations are unchanged. Only the gateway needs deployment;
-do not redeploy the bridge, backend or legacy App services for this change.
+The inline funding flow also updates the independent Agent human backend so that
+quote renewal returns the fresh signing challenge to the human surface. Deploy
+the gateway and Agent backend together. Core, GraphQL, workers, legacy App
+endpoints/schema, approved portfolio settings and existing copy configurations
+are unchanged; this change does not require their deployment.
+
+## Funding quotes and inline approval (Lark 233 and 232)
+
+Funding quotes last at most five minutes. An expired quote disables approval and
+offers an explicit refresh. The refreshed quote is displayed for another human
+approval; refreshing never signs or submits. The human `funding_prepare` route
+returns its complete signing view, while MCP `prepare_deposit` still excludes
+signing identities and challenges. The human cookie is restored before loading
+the Privy SDK, so missing wallet local storage cannot block a valid read session.
+An unknown submission response locks approval and renewal and permits status
+reads only. Backend persistence remains authoritative for exactly-once submission.
+
+`prepare_deposit` renders `/agent/fund-card/:depositId` in the conversation using
+the same narrowly allowed Ride origin as proposal cards. Its ordinary
+`/agent/fund/:depositId` fallback remains unframeable. Inline confirmation stays
+inside the human frame, never a model-callable tool. When a wallet signature is
+needed, the explicit approval click opens a same-origin wallet window. That
+window rereads the owned frozen quote, validates its hash, expiry, amount and
+signing wallet, then returns only the signature to its exact opener. It never
+calls the funding submission endpoint. The frame checks origin, popup source,
+random challenge, deposit and hash before submitting. Closing or cancelling the
+wallet prompt leaves the transfer unsubmitted and allows another explicit review.
+
+Sanitized deposit ID/status notifications update the outer card and the AI's
+widget context using the [MCP Apps UI bridge](https://developers.openai.com/plugins/build/chatgpt-ui).
+The UI distinguishes submitted, uncertain, failed and verified credited states,
+and performs a bounded series of status reads. Credentials, CSRF, wallet
+identities, signing challenges and signatures stay out of host/model context.
+
+`npx tsx scripts/funding-preview.ts` serves a loopback-only fixture with fictional
+wallet/signature/balance data and no real transfers. It covers expired quote
+renewal, login handoff, inline approval, wallet signature return, verified credit
+and lost submission responses. Unit/HTTP tests also reject foreign origins,
+cross-deposit handoffs, stale signatures and duplicate approvals. Local acceptance
+does not establish deployment, real Google/Privy signing or host-specific nested
+frame compatibility. Unsupported hosts keep the normal Ride page fallback.
 
 ## Acceptance
 

@@ -3,12 +3,13 @@ import { readFileSync } from "node:fs";
 import { it } from "node:test";
 import vm from "node:vm";
 
-function fixture() {
+function fixture(funding = false, wrongUrl = false) {
   const listeners = new Set<(event: any) => void>();
   const timers = new Map<number, () => void>();
   let timerId = 0;
   let toolCalls = 0;
   const nodes: any[] = [];
+  const contexts: any[] = [];
   const node = (tag: string, textContent = "") => ({
     tag,
     textContent,
@@ -34,6 +35,13 @@ function fixture() {
     confirmation_url:
       "https://ride.test/agent/confirm/proposal_fallback_fixture_00000000",
   };
+  const fundingView = {
+    deposit_id: "deposit_" + "a".repeat(32),
+    amount_usdc: "30.000000",
+    network: "Arbitrum",
+    status: "requires_confirmation",
+    confirmation_url: `https://${wrongUrl ? "foreign.test" : "ride.test"}/agent/fund/deposit_${"a".repeat(32)}`,
+  };
   vm.runInNewContext(
     readFileSync("public/agent-host.js", "utf8").replace(
       "/*HOST_CONFIG*/ {}",
@@ -46,6 +54,9 @@ function fixture() {
           toolOutput: {},
           callTool() {
             toolCalls++;
+          },
+          setWidgetState(value: any) {
+            contexts.push(value);
           },
         },
         addEventListener(name: string, handler: any) {
@@ -65,7 +76,12 @@ function fixture() {
       },
       el: node,
       render(_root: any, _data: any, _open: any, _tool: any, card: any) {
-        card(root, proposal, false);
+        card(
+          root,
+          funding ? fundingView : proposal,
+          false,
+          funding ? "funding" : "proposal",
+        );
       },
     },
   );
@@ -76,6 +92,7 @@ function fixture() {
     state,
     timers,
     toolCalls: () => toolCalls,
+    contexts,
     expire() {
       for (const callback of [...timers.values()]) callback();
       timers.clear();
@@ -85,9 +102,12 @@ function fixture() {
         source: frame.contentWindow,
         origin: "https://ride.test",
         data: {
-          type: "ride:confirmation-state",
-          proposal_id: proposal.id,
-          status: "completed",
+          type: funding ? "ride:funding-state" : "ride:confirmation-state",
+          ...(funding
+            ? { deposit_id: fundingView.deposit_id }
+            : { proposal_id: proposal.id }),
+          status: funding ? "credited" : "completed",
+          signing_challenge: "must never enter model context",
         },
         ...overrides,
       };
@@ -101,6 +121,32 @@ it("unresponsive confirmation frames show a usable fallback without calling an a
   f.expire();
   assert.equal(f.frame.hidden, true);
   assert.match(f.state.textContent, /在 Ride 页面中打开/);
+  assert.equal(f.toolCalls(), 0);
+});
+
+it("funding cards validate their own URL/frame/deposit and send only public funding status into AI context", () => {
+  const rejected = fixture(true, true);
+  assert.equal(rejected.frame, undefined);
+  const f = fixture(true);
+  assert.equal(
+    f.frame.src,
+    `https://ride.test/agent/fund-card/deposit_${"a".repeat(32)}`,
+  );
+  f.message({ origin: "https://evil.test" });
+  f.message({ source: {} });
+  f.message({
+    data: {
+      type: "ride:funding-state",
+      deposit_id: "deposit_" + "b".repeat(32),
+      status: "credited",
+    },
+  });
+  assert.equal(f.contexts.length, 0);
+  f.message();
+  assert.equal(f.state.textContent, "入金已到账");
+  assert.deepEqual(JSON.parse(JSON.stringify(f.contexts)), [
+    { deposit_id: "deposit_" + "a".repeat(32), funding_status: "credited" },
+  ]);
   assert.equal(f.toolCalls(), 0);
 });
 

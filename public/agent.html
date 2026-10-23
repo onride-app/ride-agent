@@ -368,6 +368,11 @@ function render(
     welcome(root, callTool);
     return;
   }
+  if (value.data?.funding && confirmationCard) {
+    root.append(el("h1", "确认入金"));
+    confirmationCard(root, value.data.funding, false, "funding");
+    return;
+  }
   if (value.data?.preference_saved)
     root.append(el("p", "Preferences saved", "status"));
   else if (
@@ -2152,23 +2157,37 @@ function draw() {
     root.prepend(back);
   }
 }
-function confirmationCard(container, proposal, demo) {
+function confirmationCard(container, proposal, demo, kind = "proposal") {
   try {
     const base = new URL(hostConfig.confirmation_origin);
-    const id = proposal.id;
+    const funding = kind === "funding";
+    const id = funding ? proposal.deposit_id : proposal.id;
+    const subject = funding ? "deposit_id" : "proposal_id";
+    const messageType = funding
+      ? "ride:funding-state"
+      : "ride:confirmation-state";
+    const standalonePath = funding
+      ? `/agent/fund/${id}`
+      : `/agent/confirm/${id}`;
     if (base.protocol !== "https:" && base.hostname !== "127.0.0.1")
       throw Error("Secure Ride origin unavailable.");
     if (
       !demo &&
-      (!/^proposal_[a-zA-Z0-9_-]{8,100}$/.test(id) ||
+      (!(
+        funding ? /^deposit_[a-f0-9]{32}$/ : /^proposal_[a-zA-Z0-9_-]{8,100}$/
+      ).test(id) ||
         new URL(proposal.confirmation_url).origin !== base.origin ||
-        new URL(proposal.confirmation_url).pathname !== `/agent/confirm/${id}`)
+        new URL(proposal.confirmation_url).pathname !== standalonePath)
     )
       throw Error(
         "The confirmation address does not match this Rider proposal.",
       );
     const frame = document.createElement("iframe");
-    frame.title = demo ? "Rider 模拟确认卡片" : "Rider 操作确认";
+    frame.title = funding
+      ? "Rider 入金确认"
+      : demo
+        ? "Rider 模拟确认卡片"
+        : "Rider 操作确认";
     frame.className = "confirmation-frame";
     frame.referrerPolicy = "no-referrer";
     frame.setAttribute(
@@ -2176,7 +2195,11 @@ function confirmationCard(container, proposal, demo) {
       "allow-scripts allow-same-origin allow-popups allow-forms allow-popups-to-escape-sandbox",
     );
     frame.src = new URL(
-      demo ? "/agent/card-demo" : `/agent/card/${id}`,
+      funding
+        ? `/agent/fund-card/${id}`
+        : demo
+          ? "/agent/card-demo"
+          : `/agent/card/${id}`,
       base,
     ).href;
     container.append(frame);
@@ -2200,8 +2223,8 @@ function confirmationCard(container, proposal, demo) {
       if (
         event.source !== frame.contentWindow ||
         event.origin !== base.origin ||
-        event.data?.type !== "ride:confirmation-state" ||
-        (!demo && event.data.proposal_id !== id)
+        event.data?.type !== messageType ||
+        (!demo && event.data[subject] !== id)
       )
         return;
       clearTimeout(readyTimeout);
@@ -2216,8 +2239,39 @@ function confirmationCard(container, proposal, demo) {
         rejected: "方案已取消",
         confirmed: "已确认",
         expired: "方案已过期",
+        quote_expired: "入金报价已过期，请在卡片内刷新后重新确认",
+        submitting: "入金正在提交，请勿重复确认",
+        submitted: "入金交易已提交，等待交易账户到账",
+        credited: "入金已到账",
+        uncertain: "入金结果待核实，请在卡片内查询状态",
+        failed: "入金失败，请核对交易记录",
       };
-      state.textContent = names[event.data.status] ?? "Rider 状态已更新";
+      state.textContent =
+        funding && event.data.status === "requires_confirmation"
+          ? "请在卡片内核对金额并确认入金"
+          : (names[event.data.status] ?? "Rider 状态已更新");
+      if (
+        funding &&
+        [
+          "requires_confirmation",
+          "quote_expired",
+          "submitting",
+          "submitted",
+          "credited",
+          "uncertain",
+          "failed",
+        ].includes(event.data.status)
+      ) {
+        // Only fixed public identifiers/status are copied into conversation
+        // context; no signature, account identity or arbitrary frame fields.
+        const context = { deposit_id: id, funding_status: event.data.status };
+        if (window.openai?.setWidgetState)
+          window.openai.setWidgetState(context);
+        else if (connected)
+          request("ui/update-model-context", {
+            content: [{ type: "text", text: JSON.stringify(context) }],
+          }).catch(() => {});
+      }
       if (Number.isFinite(event.data.height))
         frame.style.height = `${Math.min(1400, Math.max(420, event.data.height))}px`;
     };
@@ -2233,7 +2287,9 @@ function confirmationCard(container, proposal, demo) {
         "p",
         demo
           ? "0 USDC 界面测试 · 不连接账户或执行服务"
-          : `操作 ${proposal.action} · 状态 ${proposal.status} · 请在 Ride 中核对完整方案`,
+          : funding
+            ? `${proposal.amount_usdc} USDC · ${proposal.network} · 入金结果以上方卡片状态为准`
+            : `操作 ${proposal.action} · 状态 ${proposal.status} · 请在 Ride 中核对完整方案`,
         "muted",
       ),
     );

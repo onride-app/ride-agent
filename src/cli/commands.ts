@@ -218,33 +218,50 @@ export async function runCli(
         ),
       );
     });
-    registerAgentTools(server, async (tool, input) =>
-      withSessionLock(async () => {
-        const session = await loadSession();
-        if (!session)
-          throw new AgentError(
-            "AUTH_REQUIRED",
-            "Run ride login first.",
-            false,
-            401,
+    const cardSession =
+      flags.server || process.env.RIDE_MCP_URL
+        ? undefined
+        : await loadSession();
+    registerAgentTools(
+      server,
+      async (tool, input) =>
+        withSessionLock(async () => {
+          const session = await loadSession();
+          if (!session)
+            throw new AgentError(
+              "AUTH_REQUIRED",
+              "Run ride login first.",
+              false,
+              401,
+            );
+          if (
+            flags.server &&
+            serverUrl(flags.server as string) !== session.server
+          )
+            throw new AgentError(
+              "AUTH_REQUIRED",
+              "Login issuer does not match this MCP configuration.",
+              false,
+              401,
+            );
+          return invokeAgent(
+            session.server,
+            await accessToken(session),
+            tool,
+            input,
           );
-        if (
-          flags.server &&
-          serverUrl(flags.server as string) !== session.server
-        )
-          throw new AgentError(
-            "AUTH_REQUIRED",
-            "Login issuer does not match this MCP configuration.",
-            false,
-            401,
-          );
-        return invokeAgent(
-          session.server,
-          await accessToken(session),
-          tool,
-          input,
-        );
-      }),
+        }),
+      false,
+      {
+        base: serverUrl(
+          String(
+            flags.server ??
+              process.env.RIDE_MCP_URL ??
+              cardSession?.server ??
+              "https://mcp.onride.me/mcp",
+          ),
+        ),
+      },
     );
     registerAppAccountRead(server, async (input) =>
       withSessionLock(async () => {

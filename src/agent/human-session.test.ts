@@ -272,6 +272,13 @@ it("only the dedicated card routes can be framed and demo rendering never calls 
     assert(csp.includes("https://claude.ai "));
     assert(csp.includes(claudeSandbox));
     assert(!csp.includes("https://*.claudemcpcontent.com"));
+    const fundingCard = await fetch(
+      `${f.base}/agent/fund-card/deposit_${"a".repeat(32)}`,
+    );
+    assert.equal(fundingCard.status, 200);
+    assert.equal(fundingCard.headers.get("x-frame-options"), null);
+    assert.equal(fundingCard.headers.get("content-security-policy"), csp);
+    assert((await fundingCard.text()).includes('"embedded":true'));
     // Framing permission must not become permission to call a human endpoint.
     for (const origin of ["https://claude.ai", claudeSandbox]) {
       const read = await f.post("session", {}, { Origin: origin });
@@ -281,6 +288,100 @@ it("only the dedicated card routes can be framed and demo rendering never calls 
     const demo = await fetch(`${f.base}/agent/card-demo`);
     assert((await demo.text()).includes('"demo":true'));
     assert.deepEqual(f.counts(), { exchanges: 0, writes: 0 });
+  } finally {
+    f.close();
+  }
+});
+
+it("funding handoffs are single-use, deposit-bound and cannot confirm proposals or grant authority", async () => {
+  const f = await fixture();
+  try {
+    const session = await f.login(),
+      challenge = "f".repeat(64),
+      deposit_id = "deposit_" + "a".repeat(32);
+    const browserHeaders = {
+      Cookie: session.cookie,
+      "X-Ride-CSRF": session.csrf,
+    };
+    assert.equal(
+      (
+        await f.post(
+          "embed-ticket",
+          { deposit_id, proposal_id: proposal, challenge },
+          browserHeaders,
+        )
+      ).status,
+      400,
+    );
+    const issued = await f.post(
+      "embed-ticket",
+      { deposit_id, challenge },
+      browserHeaders,
+    );
+    const { ticket } = await issued.json();
+    const accepted = await f.post("embed-session", {
+      deposit_id,
+      challenge,
+      ticket,
+    });
+    assert.equal(accepted.status, 200);
+    const embedded = await accepted.json();
+    const headers = {
+      Cookie: accepted.headers.get("set-cookie")!.split(";")[0],
+      "X-Ride-Embedded": "1",
+      "X-Ride-CSRF": embedded.csrf,
+    };
+    assert.equal(
+      (await f.post("embed-session", { deposit_id, challenge, ticket })).status,
+      401,
+    );
+    for (const operation of [
+      "funding",
+      "funding_prepare",
+      "funding_confirm",
+      "funding_status",
+      "funding_activation_quote",
+      "funding_activate",
+    ])
+      assert.equal(
+        (await f.post(operation, { deposit_id }, headers)).status,
+        200,
+        operation,
+      );
+    for (const body of [{}, { deposit_id: "deposit_" + "b".repeat(32) }])
+      assert.equal(
+        (await f.post("funding_confirm", body, headers)).status,
+        404,
+      );
+    for (const operation of [
+      "proposal",
+      "confirm",
+      "reject",
+      "authorize",
+      "revoke",
+      "portfolio",
+    ])
+      assert.equal(
+        (
+          await f.post(
+            operation,
+            { deposit_id, proposal_id: proposal },
+            headers,
+          )
+        ).status,
+        404,
+      );
+    assert.equal(
+      (
+        await f.post(
+          "funding_confirm",
+          { deposit_id },
+          { ...headers, "X-Ride-CSRF": "wrong" },
+        )
+      ).status,
+      403,
+    );
+    assert.deepEqual(f.counts(), { exchanges: 1, writes: 0 });
   } finally {
     f.close();
   }
