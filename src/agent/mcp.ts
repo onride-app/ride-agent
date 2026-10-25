@@ -308,7 +308,7 @@ export async function invokeAgent(
 ): Promise<Result> {
   if (!token)
     throw new AgentError("AUTH_REQUIRED", "Log in to Ride first.", false, 401);
-  let response: Response;
+  let response: Response | undefined;
   let body: unknown;
   try {
     response = await fetcher(new URL(`/agent/v1/${name}`, url), {
@@ -323,6 +323,25 @@ export async function invokeAgent(
     });
     body = await response.json();
   } catch {
+    // An explicit auth rejection remains authoritative even if its body is HTML.
+    if (response?.status === 401)
+      return failure(
+        new AgentError(
+          "AUTH_REQUIRED",
+          "Ride 登录已失效，请重新连接。",
+          false,
+          401,
+        ),
+      );
+    if (response?.status === 403)
+      return failure(
+        new AgentError(
+          "ACCESS_DENIED",
+          "Ride 拒绝了此请求，请检查账户权限。",
+          false,
+          403,
+        ),
+      );
     if (name === "recommend_traders" || name === "recalculate_plan") {
       const value = failure(
         new AgentError(
@@ -350,6 +369,13 @@ export async function invokeAgent(
       503,
     );
   }
+  if (!body || typeof body !== "object")
+    throw new AgentError(
+      "BACKEND_UNAVAILABLE",
+      "Ride 返回了无效结果，请先查询已保存状态。",
+      false,
+      503,
+    );
   if (!response.ok && !(body as Result).error)
     throw new AgentError(
       "BACKEND_UNAVAILABLE",

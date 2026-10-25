@@ -5,6 +5,24 @@ import { AgentService } from "./service.js";
 import { MemoryRepository, Cursor } from "./repository.js";
 import { FakeAdapter, candidate } from "./fixtures.js";
 
+it("does not mistake non-JSON authentication rejections for a saved preview", async () => {
+  for (const status of [401, 403]) {
+    const r = await invokeAgent(
+      "https://backend.test",
+      "fixture-token",
+      "recommend_traders",
+      {},
+      (async () =>
+        new Response("<html>denied</html>", { status })) as typeof fetch,
+    );
+    assert.equal(
+      r.error?.code,
+      status === 401 ? "AUTH_REQUIRED" : "ACCESS_DENIED",
+    );
+    assert.equal(r.data.recovery, undefined);
+  }
+});
+
 it("recovers a saved preview after losing its response without re-running recommendations or submitting trades", async () => {
   const adapter = new FakeAdapter();
   adapter.pool = [candidate(1), candidate(2)];
