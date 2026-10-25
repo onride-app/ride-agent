@@ -29,6 +29,20 @@ export async function validateCoreIdentity(
   token: string,
   graphqlUrl: string,
 ): Promise<string> {
+  const unavailable = () =>
+    new AgentError(
+      "BACKEND_UNAVAILABLE",
+      "Ride identity verification is temporarily unavailable. Retry without signing in again.",
+      true,
+      503,
+    );
+  const unauthenticated = () =>
+    new AgentError(
+      "AUTH_REQUIRED",
+      "A valid Ride session is required.",
+      false,
+      401,
+    );
   const response = await fetch(graphqlUrl, {
     method: "POST",
     headers: {
@@ -41,24 +55,37 @@ export async function validateCoreIdentity(
     }),
     signal: AbortSignal.timeout(12000),
     redirect: "error",
+  }).catch(() => {
+    throw unavailable();
   });
-  const payload = (await response.json()) as {
+  // A Core outage must not invalidate a healthy OAuth session or start a login loop.
+  if (response.status === 401) throw unauthenticated();
+  if (!response.ok) throw unavailable();
+  const payload = (await response.json().catch(() => {
+    throw unavailable();
+  })) as {
     data?: { me?: { id?: string }; copyTradeSummary?: unknown };
-    errors?: unknown[];
-  };
-  const user = payload.data?.me?.id;
+    errors?: Array<{ extensions?: { code?: string } }>;
+  } | null;
+  if (!payload || typeof payload !== "object") throw unavailable();
   if (
-    !response.ok ||
-    payload.errors?.length ||
-    !payload.data?.copyTradeSummary ||
-    !user
+    Array.isArray(payload.errors) &&
+    payload.errors.some(
+      (error) =>
+        error?.extensions?.code === "UNAUTHENTICATED" ||
+        error?.extensions?.code === "UNAUTHORIZED",
+    )
   )
-    throw new AgentError(
-      "AUTH_REQUIRED",
-      "A valid Ride session is required.",
-      false,
-      401,
-    );
+    throw unauthenticated();
+  if (payload.errors?.length) throw unavailable();
+  const user = payload.data?.me?.id;
+  // Preserve both existing identity checks; incomplete responses never grant access.
+  if (
+    !payload.data?.copyTradeSummary ||
+    typeof user !== "string" ||
+    !user.trim()
+  )
+    throw unavailable();
   return user;
 }
 export function backendApp(

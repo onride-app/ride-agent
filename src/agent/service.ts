@@ -1031,6 +1031,21 @@ export class AgentService {
             ? result(
                 {
                   portfolio: null,
+                  ...conversationView(
+                    plan,
+                    preferenceCollection(s),
+                    plan.allocations.map((a) => a.trader),
+                    !!s.selected_trader_ids?.length,
+                  ),
+                  recovery: {
+                    source: "saved_preview",
+                    plan_id: plan.id,
+                    created_at: plan.created_at,
+                    expires_at: plan.expires_at,
+                    read_only: true,
+                    instruction:
+                      "这是已保存的方案，读取不会重新生成或执行交易。先核对预算、风险、选择和创建时间是否对应刚才的请求；不匹配时不可宣称恢复成功。过期时只刷新此方案，不重复推荐。",
+                  },
                   plan,
                   compatibility: compatibility(plan),
                   recommendation_batches: s.recommendation_batches,

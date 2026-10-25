@@ -250,6 +250,10 @@ export async function readAccountBalances(
       status: missing ? "partial" : "ok",
       account_value_usd: missing ? null : sum("account_value_usd"),
       known_subtotal_usd: sum("account_value_usd"),
+      known_available_trading_usdc: sum("available_trading_usdc"),
+      availability_note: missing
+        ? "已核实钱包的可用金额仅为小计；其他钱包数据缺失，市场完整可用金额未知。跟单前还需校验选定账户。"
+        : "市场钱包可用金额已核实；这不是已批准的跟单额度。",
       available_trading_usdc: missing ? null : sum("available_trading_usdc"),
       occupied_or_reserved_usdc: missing
         ? null
@@ -504,7 +508,7 @@ export async function readAccountBalances(
     ? cash(knownValues.reduce((n, v) => n.plus(v), D(0)))
     : null;
   const availableValues = (Object.values(markets) as any[])
-    .map((m) => m.available_trading_usdc)
+    .map((m) => m.available_trading_usdc ?? m.known_available_trading_usdc)
     .filter((v) => v != null);
   const knownAvailable = availableValues.length
     ? cash(availableValues.reduce((n, v) => n.plus(v), D(0)))
@@ -520,6 +524,9 @@ export async function readAccountBalances(
       available_trading_usdc: null,
       known_subtotal_usd: known,
       known_available_trading_usdc: knownAvailable,
+      copy_ready_usdc: null,
+      availability_note:
+        "已核实可用金额是不同市场的钱包小计，不可跨市场直接用于同一跟单。完整账户总额仍未知；方案可用额度需在选定账户上单独校验。预算不等于余额。",
       coverage_complete: false,
       supported_markets_complete:
         markets.perps.status === "ok" && markets.prediction.status === "ok",

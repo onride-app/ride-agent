@@ -232,6 +232,26 @@ it("shows existing App holdings even when the Agent has only an empty portfolio"
   assert.equal((value.data.app_copies as any).perps.positions.length, 1);
 });
 
+it("separates a ready preview from incomplete balance coverage", async () => {
+  const value = await invokeAccountRead(
+    "get_portfolio",
+    {},
+    "fixture-session",
+    "https://core.test/graphql",
+    async () => result({ portfolio: null, plan_status: "ready" }, "empty"),
+    fixtureFetch(),
+  );
+  assert.equal(value.status, "stale");
+  assert.equal((value.data.status_breakdown as any).plan, "ready");
+  assert.equal(
+    (value.data.status_breakdown as any).authentication,
+    "authenticated",
+  );
+  assert.equal(
+    (value.data.status_breakdown as any).account_coverage,
+    "partial",
+  );
+});
 it("keeps authoritative execution states even when account balance coverage is partial", async () => {
   for (const status of [
     "uncertain",

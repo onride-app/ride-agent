@@ -143,6 +143,8 @@ it("keeps missing historical values and actual periods instead of relabelling th
   assert.equal(row.historical_drawdown_pct, 2);
   assert.equal(row.metric_window, null);
   assert.equal(row.metric_periods.roi.period, "source_all_time");
+  assert.match(row.metric_period_labels.roi, /未核实/);
+  assert.match(row.metric_period_labels.drawdown, /不可视为同周期比较/);
 });
 
 it("leaves the recommended comparison empty on plan failure while retaining the candidate ranking", async () => {

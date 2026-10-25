@@ -79,6 +79,20 @@ export function traderRow(c: Candidate) {
     metric_provenance: c.metric_provenance ?? null,
     metric_unavailable_reason: c.metric_unavailable_reason ?? null,
     metric_periods: c.metric_periods ?? null,
+    metric_period_labels: {
+      roi:
+        c.metric_periods?.roi?.start_at != null &&
+        c.metric_periods?.roi?.end_at != null
+          ? `${new Date(c.metric_periods.roi.start_at).toISOString()} — ${new Date(c.metric_periods.roi.end_at).toISOString()}`
+          : c.metric_periods?.roi?.period === "source_month"
+            ? "来源标注月收益，具体起止日期未核实"
+            : "收益统计周期未核实",
+      drawdown:
+        c.metric_periods?.drawdown?.start_at != null &&
+        c.metric_periods?.drawdown?.end_at != null
+          ? `${new Date(c.metric_periods.drawdown.start_at).toISOString()} — ${new Date(c.metric_periods.drawdown.end_at).toISOString()}`
+          : "回撤统计周期未核实，不可视为同周期比较",
+    },
     score_explanation: c.score_explanation ?? null,
     last_trade_at: c.last_trade_at,
     eligibility: c.eligibility,
@@ -158,6 +172,10 @@ export function browse(
       has_more: next < rows.length,
       next_cursor: next < rows.length ? cursor.encode(user, next, query) : null,
       sort_by: sort,
+      sort_warning:
+        sort === "score"
+          ? null
+          : "按来源数值排序，不代表同周期比较，也不是收益或风险预测；请同时展示每行统计周期。",
       direction,
       snapshot_at: snapshot.created_at,
       expires_at: snapshot.expires_at,
@@ -216,7 +234,7 @@ export function conversationView(
         leverage_cap_inherited_from_plan_id:
           a.leverage_cap_inherited_from_plan_id ?? null,
         maximum_leverage_cap: maximumUserLeverage(a.trader),
-        reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.${a.leverage_cap_source === "inherited" || (a.trader.market === "perps" && a.leverage_cap != null && !a.leverage_mode) ? ` Inherited leverage setting: ${a.leverage_cap == null ? "no extra cap" : `${a.leverage_cap}x`}; explicitly clear leverage_cap to follow source without an extra cap.` : ""}`,
+        reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.${a.leverage_cap_source === "inherited" || (a.trader.market === "perps" && a.leverage_cap != null && !a.leverage_mode) ? (a.leverage_cap == null ? " 保留原设置：跟随源杠杆，无额外上限，无需再次清除。" : ` 保留原杠杆上限 ${a.leverage_cap}x；可明确选择取消额外上限。`) : ""}`,
       })) ?? [],
     // Compare the same immutable selection in the same order. The candidate
     // ranking can contain other traders and must not stand in for this table.
@@ -269,6 +287,9 @@ export function conversationView(
             ...new Set(plan.allocations.map((a) => a.trader.market)),
           ],
           portfolio_loss_trigger_pct: plan.preferences.loss_trigger_pct,
+          risk_setting_source:
+            plan.preference_sources?.loss_trigger_pct ?? "unknown",
+          risk_setting_explanation: `${plan.preference_sources?.loss_trigger_pct === "user" ? "使用你之前明确选择的" : plan.preference_sources?.loss_trigger_pct === "recommended" ? "系统建议，待你确认：" : "当前方案设置，来源未核实："}${plan.preferences.loss_trigger_pct}% 组合退出触发值；按预算 ${plan.preferences.budget_usdc} USDC，触发金额为 ${cash(D(plan.preferences.budget_usdc).times(plan.preferences.loss_trigger_pct).div(100))} USDC。触发后尝试退出，不保证最大亏损。单个交易员的暂停和紧急退出设置见高级详情。`,
           portfolio_loss_trigger_usdc: cash(
             D(plan.preferences.budget_usdc)
               .times(plan.preferences.loss_trigger_pct)
