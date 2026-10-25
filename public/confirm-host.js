@@ -62,9 +62,7 @@ async function call(operation, body = {}) {
   });
   const payload = await response.json();
   if (!response.ok) {
-    const error = new Error(
-      payload.error?.message ?? "Rider request failed.",
-    );
+    const error = new Error(payload.error?.message ?? "Rider request failed.");
     error.code = payload.error?.code;
     throw error;
   }
@@ -311,6 +309,13 @@ function demo() {
         id === "approve"
           ? "模拟确认成功 · 未提交交易"
           : "模拟已取消 · 未提交交易";
+      content.append(
+        el(
+          "p",
+          "下一步：回到聊天查看或调整方案。真实跟单仍需单独确认；提交后可在聊天查询启动状态、首单和暂停方式。",
+          "muted",
+        ),
+      );
       announce(id === "approve" ? "demo_confirmed" : "demo_rejected");
     };
   announce("demo_ready");

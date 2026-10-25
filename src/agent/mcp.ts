@@ -304,20 +304,78 @@ export async function invokeAgent(
   token: string | undefined,
   name: string,
   args: unknown,
+  fetcher: typeof fetch = fetch,
 ): Promise<Result> {
   if (!token)
     throw new AgentError("AUTH_REQUIRED", "Log in to Ride first.", false, 401);
-  const response = await fetch(new URL(`/agent/v1/${name}`, url), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(args),
-    signal: AbortSignal.timeout(25000),
-    redirect: "error",
-  });
-  const body = await response.json();
+  let response: Response | undefined;
+  let body: unknown;
+  try {
+    response = await fetcher(new URL(`/agent/v1/${name}`, url), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(args),
+      signal: AbortSignal.timeout(25000),
+      redirect: "error",
+    });
+    body = await response.json();
+  } catch {
+    // An explicit auth rejection remains authoritative even if its body is HTML.
+    if (response?.status === 401)
+      return failure(
+        new AgentError(
+          "AUTH_REQUIRED",
+          "Ride 登录已失效，请重新连接。",
+          false,
+          401,
+        ),
+      );
+    if (response?.status === 403)
+      return failure(
+        new AgentError(
+          "ACCESS_DENIED",
+          "Ride 拒绝了此请求，请检查账户权限。",
+          false,
+          403,
+        ),
+      );
+    if (name === "recommend_traders" || name === "recalculate_plan") {
+      const value = failure(
+        new AgentError(
+          "PREVIEW_RESULT_UNKNOWN",
+          "推荐结果未完整送达，方案可能已保存。请先读取已保存方案并核对本次预算、风险、选择及创建时间，不要重复提交或重新登录。",
+          false,
+          503,
+        ),
+      );
+      value.data = {
+        recovery: {
+          next_tool: "get_portfolio",
+          replay_original_request: false,
+          execution_authorized: false,
+          instruction:
+            "核对 recovery 和 plan；匹配且未过期则展示原方案，过期则用原 plan_id 刷新。找不到匹配结果时说明尚无法确认，不要自动重试原请求。",
+        },
+      };
+      return value;
+    }
+    throw new AgentError(
+      "BACKEND_UNAVAILABLE",
+      "Ride 服务暂时无法返回完整结果，请稍后查询状态。",
+      true,
+      503,
+    );
+  }
+  if (!body || typeof body !== "object")
+    throw new AgentError(
+      "BACKEND_UNAVAILABLE",
+      "Ride 返回了无效结果，请先查询已保存状态。",
+      false,
+      503,
+    );
   if (!response.ok && !(body as Result).error)
     throw new AgentError(
       "BACKEND_UNAVAILABLE",

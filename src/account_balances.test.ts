@@ -181,6 +181,29 @@ it("reads the App's 43 USD Perps separately from 7 USDC Prediction cash and neve
   assert(!JSON.stringify(out).includes(owner));
   assert(!JSON.stringify(out).includes(proxy));
 });
+it("keeps verified wallet availability in the subtotal while incomplete market totals stay unknown", async () => {
+  const f = fixture({ sameWallet: true });
+  const partial = (async (url: any, init: any) => {
+    if (
+      String(url).includes("core.test") &&
+      JSON.parse(init.body).query.includes("RideOwnedPerpsBalance") &&
+      !new Headers(init.headers).has("x-hyperliquid-wallet-mode")
+    )
+      return Response.json({ errors: [{}] });
+    return f.request(url, init);
+  }) as typeof fetch;
+  const out = await readAccountBalances(
+    "https://core.test/graphql",
+    "fixture",
+    partial,
+  );
+  assert.equal(out.markets.perps.status, "partial");
+  assert.equal(out.markets.perps.available_trading_usdc, null);
+  assert.equal(out.markets.perps.known_available_trading_usdc, "40.000000");
+  assert.equal(out.summary.known_available_trading_usdc, "47.000000");
+  assert.equal(out.summary.available_trading_usdc, null);
+  assert.equal(out.summary.copy_ready_usdc, null);
+});
 it("Unified account equity already includes Spot USDC and is never counted twice", async () => {
   const f = fixture({ unified: true, sameWallet: true });
   const out = await readAccountBalances(

@@ -259,6 +259,15 @@ export async function invokeAccountRead(
       query_scope: "agent_portfolio_and_ride_app",
       agent_portfolio_status: portfolio.status,
       account_coverage_status: partial ? "partial" : "complete",
+      status_breakdown: {
+        authentication: "authenticated",
+        plan: portfolio.data.plan_status ?? "none",
+        agent_portfolio: portfolio.status,
+        account_coverage: partial ? "partial" : "complete",
+        explanation: partial
+          ? "部分账户数据不完整，不代表登录失效或推荐方案过期。请分别查看方案有效期和余额覆盖范围。"
+          : "账户数据完整；方案有效期与交易执行状态分别显示。",
+      },
       app_copies: app?.data ?? {
         coverage_complete: false,
         status: "unavailable",
