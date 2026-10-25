@@ -1,4 +1,10 @@
 import { it } from "node:test";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { AgentService } from "../agent/service.js";
+import { MemoryRepository, Cursor } from "../agent/repository.js";
+import { FakeAdapter, candidate } from "../agent/fixtures.js";
+import { backendApp } from "../agent/backend.js";
+import { mountAgentProxy } from "../agent/http.js";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -53,6 +59,27 @@ it("completes SDK OAuth PKCE through the loopback callback and refreshes without
       )
       .json({ error: "auth_required" }),
   );
+  const venue = new FakeAdapter();
+  venue.pool = [candidate(1), candidate(2), candidate(3), candidate(4)];
+  const service = new AgentService(
+    new MemoryRepository(),
+    venue,
+    base.href,
+    new Cursor("c".repeat(32)),
+  );
+  const backend = backendApp(service, async (token) => {
+    assert.equal(token, "core-test-session");
+    return "alice";
+  }).listen(0, "127.0.0.1");
+  await once(backend, "listening");
+  const backendAddr = backend.address();
+  if (!backendAddr || typeof backendAddr === "string")
+    throw Error("No backend port");
+  mountAgentProxy(
+    app,
+    requireBearerAuth({ verifier: provider }),
+    `http://127.0.0.1:${backendAddr.port}`,
+  );
   try {
     await login(new URL("/mcp", base).href, true, async (url) => {
       const q = new URL(url).searchParams;
@@ -93,6 +120,47 @@ it("completes SDK OAuth PKCE through the loopback callback and refreshes without
     assert(session.tokens?.access_token);
     assert(session.tokens?.scope?.includes("ride:trade"));
     assert.equal((await stat(join(dir, "session.json"))).mode & 0o777, 0o600);
+    // Real OAuth, HTTP gateway and backend; only external identity/venue are fixtures.
+    const call = async (operation: string, body = {}) => {
+      const response = await fetch(new URL(`/agent/v1/${operation}`, base), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${await accessToken(session)}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 200);
+      return (await response.json()) as any;
+    };
+    let preferences = await call("get_preferences");
+    assert.deepEqual(preferences.data.preference_collection.missing_fields, [
+      "budget_usdc",
+      "risk_tolerance",
+    ]);
+    assert.equal(
+      (await call("recommend_traders")).status,
+      "requires_preferences",
+    );
+    await call("set_preferences", { budget_usdc: "600" });
+    preferences = await call("get_preferences");
+    assert.deepEqual(preferences.data.preference_collection.missing_fields, [
+      "risk_tolerance",
+    ]);
+    await call("set_preferences", { risk_tolerance: "medium" });
+    const recommendation = await call("recommend_traders");
+    assert.equal(recommendation.status, "ok");
+    assert(recommendation.data.recommended_portfolio.length > 0);
+    assert.deepEqual(
+      recommendation.data.recommended_portfolio.map((r: any) => r.trader_id),
+      recommendation.data.recommended_trader_comparison.map(
+        (r: any) => r.trader_id,
+      ),
+    );
+    assert.equal(recommendation.data.final_review.execution_authorized, false);
+    assert.equal(recommendation.data.plan.preferences.budget_usdc, "600");
+    assert.equal(recommendation.data.plan.preferences.asset_category, "any");
+    assert.equal(venue.submitCount, 0);
     const first = session.tokens!.access_token;
     session.expires_at = 0;
     await saveSession(session);
@@ -103,6 +171,7 @@ it("completes SDK OAuth PKCE through the loopback callback and refreshes without
       "ride:trade",
     ]);
   } finally {
+    backend.close();
     listener.close();
     if (old === undefined) delete process.env.RIDE_CONFIG_DIR;
     else process.env.RIDE_CONFIG_DIR = old;

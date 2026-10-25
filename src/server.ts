@@ -29,6 +29,7 @@ import { redisHumanHandoffs } from "./agent/human_handoffs.js";
 import { validateCoreIdentity } from "./agent/backend.js";
 import { AgentError, mutationTools } from "./agent/contracts.js";
 import { VERSION } from "./version.js";
+import { requestDiagnostics } from "./request_diagnostics.js";
 
 async function main(): Promise<void> {
   const required = (key: string) => {
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
       resourceMetadataUrl: oauth.resourceMetadataUrl,
     }),
     readOnly = process.env.RIDE_PUBLIC_SUBMISSION_MODE === "true";
+  app.use(requestDiagnostics("gateway"));
   app.use(
     mcpAuthRouter({
       provider,
