@@ -2,6 +2,7 @@
 import "dotenv/config";
 import express from "express";
 import { VERSION } from "../version.js";
+import { requestDiagnostics } from "../request_diagnostics.js";
 import { z } from "zod";
 import { PgRepository, Cursor } from "./repository.js";
 import { BridgeAdapter } from "./adapter.js";
@@ -95,6 +96,7 @@ export function backendApp(
   readOnly = false,
 ) {
   const app = createRideHttpApp(host);
+  app.use(requestDiagnostics("backend"));
   app.get("/health", (_req, res) =>
     res.json({
       service: "ride-agent",

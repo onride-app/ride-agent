@@ -5,6 +5,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { accountCopiesInput } from "../account_reads.js";
 import { claudeCardDomain } from "./card_hosts.js";
+import { connectionReason, fetchAgentResponse } from "./connection.js";
+import { requestContext } from "../request_diagnostics.js";
 import {
   AgentError,
   failure,
@@ -311,18 +313,33 @@ export async function invokeAgent(
   let response: Response | undefined;
   let body: unknown;
   try {
-    response = await fetcher(new URL(`/agent/v1/${name}`, url), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+    response = await fetchAgentResponse(
+      fetcher,
+      new URL(`/agent/v1/${name}`, url),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(args),
+        signal: AbortSignal.timeout(25000),
+        redirect: "error",
       },
-      body: JSON.stringify(args),
-      signal: AbortSignal.timeout(25000),
-      redirect: "error",
-    });
+      name,
+    );
     body = await response.json();
-  } catch {
+  } catch (error) {
+    // Only fixed diagnostic codes; never log credentials, args, URLs or raw errors.
+    console.error(
+      JSON.stringify({
+        event: "agent_connection_failure",
+        request_id: requestContext.getStore()?.request_id,
+        operation: TOOL_NAMES.includes(name as ToolName) ? name : "other",
+        stage: response ? "response_body" : "connection",
+        reason: connectionReason(error),
+      }),
+    );
     // An explicit auth rejection remains authoritative even if its body is HTML.
     if (response?.status === 401)
       return failure(
@@ -362,6 +379,15 @@ export async function invokeAgent(
       };
       return value;
     }
+    if (mutationTools.has(name as ToolName) || stateTools.has(name as ToolName))
+      return failure(
+        new AgentError(
+          "REQUEST_RESULT_UNKNOWN",
+          "请求结果未完整送达。请先查询现有状态，不要重复提交；此错误不代表登录失效。",
+          false,
+          503,
+        ),
+      );
     throw new AgentError(
       "BACKEND_UNAVAILABLE",
       "Ride 服务暂时无法返回完整结果，请稍后查询状态。",
