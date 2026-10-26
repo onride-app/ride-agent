@@ -183,3 +183,8 @@ Widget/account repairs in 0.4.3 default asset preferences to unrestricted Crypto
 Native recommendations default to `conversation_display.markdown`: one combined allocation/performance table, concrete copy-sizing and exit-trigger summaries, and a details action. `get_portfolio` with `plan_id` and `detail: detailed` explains the same immutable preview without regenerating it. Compatible recommendation/comparison fields remain available.
 
 For alternatives, `browse_traders` accepts `plan_id` and `exclude_selected: true`; browsing or refreshing candidate data never changes plans or preferences. An explicit one-for-one edit uses `recalculate_plan.replacements`, preserving count, slot amounts and risk/copy settings. Other count or amount edits retain the existing explicit allocation API. Returned `plan_change` identifies each compared plan; capital concentration and qualitative overlap flags are not measured risk reduction.
+
+
+### HTTP proxy rate limits
+
+Railway public HTTP deployments trust one ingress hop for Express client IP resolution. Local/direct deployments keep proxy trust disabled. `HTTP_TRUST_PROXY_HOPS` explicitly overrides the hop count (0–3); invalid values fail startup. Do not use an unrestricted `trust proxy=true` setting or expose an untrusted shorter ingress path. Quotas remain enabled, and spoofed prefixes to `X-Forwarded-For` do not change the nearest trusted client identity.
