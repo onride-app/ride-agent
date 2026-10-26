@@ -29,7 +29,7 @@ import { redisHumanHandoffs } from "./agent/human_handoffs.js";
 import { validateCoreIdentity } from "./agent/backend.js";
 import { AgentError, mutationTools } from "./agent/contracts.js";
 import { VERSION } from "./version.js";
-import { requestDiagnostics } from "./request_diagnostics.js";
+import { recordMcpProtocolError, requestDiagnostics } from "./request_diagnostics.js";
 import { exchangePrivyForRide } from "./auth_exchange.js";
 
 async function main(): Promise<void> {
@@ -193,6 +193,7 @@ async function main(): Promise<void> {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });
+    transport.onerror = (error) => recordMcpProtocolError(res, error);
     res.on("close", () => {
       void transport.close();
       void server.close();
@@ -200,7 +201,8 @@ async function main(): Promise<void> {
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
-    } catch {
+    } catch (error) {
+      recordMcpProtocolError(res, error);
       if (!res.headersSent)
         res.status(500).json({ error: "mcp_request_failed" });
     }
