@@ -2167,9 +2167,18 @@ try {
         /分配资金与源账户权益的比例/,
       );
       assert.match(brief.conversation_display.markdown, /不足最小下单额则跳过/);
-      assert.match(brief.conversation_display.markdown, /展开说明/);
+      assert.match(brief.conversation_display.markdown, /分析这组 trader/);
+      assert.doesNotMatch(JSON.stringify(detail), /目标数量 = 源仓位数量/);
+      assert.equal(detail.conversation_display.analysis_depth, "summary");
+      const calculation = (
+        await ok(widgetClient, "get_portfolio", {
+          plan_id: swap.plan.id,
+          detail: "detailed",
+          include_calculations: true,
+        })
+      ).data;
       assert.match(
-        detail.conversation_display.markdown,
+        calculation.conversation_display.markdown,
         /目标数量 = 源仓位数量/,
       );
       assert.equal(detail.plan_change.base_plan_id, original.id);
@@ -2232,6 +2241,190 @@ try {
       original_plan_preserved: true,
       count_unchanged: true,
       no_budget_or_risk_change: true,
+    };
+  });
+  let riskReselectAcceptance: any;
+  await check("49 风险偏好系统重选保留四人槽位金额与明确止损", async () => {
+    venue.pool = Array.from({ length: 8 }, (_, i) => {
+      const c = candidate(i + 1),
+        stability = i < 4 ? 95 : 55,
+        opportunity = i < 4 ? 55 : 95;
+      return {
+        ...c,
+        score: 85,
+        assets: [`ASSET${i}`],
+        style: `style${i}`,
+        components: {
+          ...c.components,
+          stability,
+          pathSmoothness: stability,
+          drawdownRecovery: stability,
+          positionLeverageStability: stability,
+          profitQuality: opportunity,
+          copyability: opportunity,
+        },
+      };
+    });
+    const submits = venue.submits.length;
+    const original = (
+      await ok(widgetClient, "recommend_traders", {
+        selection: "system",
+        preferences: {
+          market: "perps",
+          assets: [],
+          allow_altcoins: true,
+          asset_category: "any",
+          copy_mode: "ride_recommends",
+          portfolio_kind: "basket",
+          basket_size: 4,
+          budget_usdc: "30",
+          risk_tolerance: "low",
+          loss_trigger_pct: 10,
+        },
+      })
+    ).data.plan;
+    const next = (
+      await ok(widgetClient, "recommend_traders", {
+        base_plan_id: original.id,
+        selection: "system",
+        preferences: { risk_tolerance: "high" },
+      })
+    ).data;
+    const ids = (p: any) => p.allocations.map((a: any) => a.trader.id);
+    assert.notDeepEqual(ids(next.plan), ids(original));
+    assert.equal(next.plan.risk_selection.status, "applied");
+    assert.equal(next.plan.allocations.length, 4);
+    assert.deepEqual(
+      next.plan.allocations.map((a: any) => a.amount_usdc),
+      original.allocations.map((a: any) => a.amount_usdc),
+    );
+    assert.equal(next.plan.preferences.loss_trigger_pct, 10);
+    assert.equal(next.plan.preference_sources.loss_trigger_pct, "user");
+    assert.equal(next.plan_change.original_plan_unchanged, true);
+    assert.equal(next.final_review.execution_authorized, false);
+    assert.deepEqual(
+      next.recommended_portfolio.map((a: any) => a.trader_id),
+      ids(next.plan),
+    );
+    assert.deepEqual(
+      next.recommended_trader_comparison.map((a: any) => a.trader_id),
+      ids(next.plan),
+    );
+    const stored = (
+      await ok(widgetClient, "get_portfolio", { plan_id: original.id })
+    ).data.plan;
+    assert.deepEqual(stored, original);
+    assert.equal(venue.submits.length, submits);
+    riskReselectAcceptance = { original, next, submits };
+    return {
+      risk_changes_selection: true,
+      old_plan_preserved: true,
+      count: 4,
+      each: "7.500000",
+      exit_pct: 10,
+      real_execution: false,
+    };
+  });
+  await check("50 指标筛选覆盖完整快照且分页不改原方案", async () => {
+    assert(riskReselectAcceptance);
+    const { original, submits } = riskReselectAcceptance;
+    const before = await repo.transact(users.widget, async (s) =>
+      structuredClone({
+        plans: s.plans,
+        preferences: s.preferences,
+        selected: s.selected_trader_ids,
+      }),
+    );
+    const query = {
+      plan_id: original.id,
+      exclude_selected: true,
+      filters: { min_score: 80, max_drawdown_pct: 3 },
+      limit: 2,
+    };
+    const first = (await ok(widgetClient, "browse_traders", query)).data;
+    const second = (
+      await ok(widgetClient, "browse_traders", {
+        ...query,
+        cursor: first.candidates_meta.next_cursor,
+      })
+    ).data;
+    assert.equal(first.candidates_meta.total, 4);
+    assert.equal(first.candidates.length, 2);
+    assert.equal(second.candidates.length, 2);
+    assert(
+      !first.candidates.some((a: any) =>
+        second.candidates.some((b: any) => a.id === b.id),
+      ),
+    );
+    assert.equal(first.metric_basis.kind, "source_reported_values");
+    assert.match(first.conversation_display.markdown, /来源回撤 ≤ 3%/);
+    const empty = (
+      await ok(widgetClient, "browse_traders", {
+        ...query,
+        filters: { max_drawdown_pct: 0 },
+      })
+    ).data;
+    assert.equal(empty.candidate_availability.status, "no_matching_candidates");
+    assert.equal(empty.candidates_meta.total, 0);
+    const after = await repo.transact(users.widget, async (s) =>
+      structuredClone({
+        plans: s.plans,
+        preferences: s.preferences,
+        selected: s.selected_trader_ids,
+      }),
+    );
+    assert.deepEqual(after, before);
+    assert.equal(venue.submits.length, submits);
+    return {
+      filtered_before_paging: true,
+      total_matches: 4,
+      original_plan_and_preferences_preserved: true,
+      real_execution: false,
+    };
+  });
+  await check("51 旧调用改风险不会重置不等额槽位", async () => {
+    assert(riskReselectAcceptance);
+    const { original, submits } = riskReselectAcceptance;
+    const configured = (
+      await ok(widgetClient, "recalculate_plan", {
+        plan_id: original.id,
+        allocations: original.allocations.map((a: any, i: number) => ({
+          trader_id: a.trader.id,
+          amount_usdc: ["9", "8", "7", "6"][i],
+        })),
+      })
+    ).data.plan;
+    const high = (
+      await ok(widgetClient, "recommend_traders", {
+        base_plan_id: configured.id,
+        selection: "system",
+        preferences: { risk_tolerance: "high" },
+      })
+    ).data.plan;
+    const low = (
+      await ok(widgetClient, "recommend_traders", {
+        preferences: { risk_tolerance: "low" },
+      })
+    ).data;
+    assert.equal(low.edit_kind, "system_reselection");
+    assert.deepEqual(
+      low.plan.allocations.map((a: any) => a.amount_usdc),
+      ["9.000000", "8.000000", "7.000000", "6.000000"],
+    );
+    assert.deepEqual(
+      low.plan.risk_selection.selected.map((a: any) => a.trader_id),
+      low.plan.allocations.map((a: any) => a.trader.id),
+    );
+    assert.equal(low.plan.preferences.loss_trigger_pct, 10);
+    assert.deepEqual(
+      (await ok(widgetClient, "get_portfolio", { plan_id: high.id })).data.plan,
+      high,
+    );
+    assert.equal(venue.submits.length, submits);
+    return {
+      old_schema_risk_edit_preserves_amounts: true,
+      canonical_analysis_order: true,
+      real_execution: false,
     };
   });
 } catch (e) {

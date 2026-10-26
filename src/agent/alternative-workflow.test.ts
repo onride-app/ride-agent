@@ -252,7 +252,17 @@ it("reads brief/detailed explanations of an exact immutable plan even after a ne
   });
   assert.equal(detailed.conversation_display.plan_id, initial.plan.id);
   assert.equal(detailed.plan.preferences.budget_usdc, "30");
-  assert.match(detailed.conversation_display.markdown, /目标数量 = 源仓位数量/);
+  assert.doesNotMatch(JSON.stringify(detailed), /目标数量 = 源仓位数量/);
+  assert.equal(detailed.conversation_display.analysis_depth, "summary");
+  const calculation = await call("get_portfolio", {
+    plan_id: initial.plan.id,
+    detail: "detailed",
+    include_calculations: true,
+  });
+  assert.match(
+    calculation.conversation_display.markdown,
+    /目标数量 = 源仓位数量/,
+  );
   const brief = await call("get_portfolio", { plan_id: newer.plan.id });
   assert.equal(brief.conversation_display.detail, "brief");
   assert.match(brief.conversation_display.markdown, /原方案保留/);
@@ -274,7 +284,7 @@ it("keeps default output short with every selected trader, concrete copy rules a
   assert(d.markdown.length < 1300);
   assert.match(d.markdown, /分配资金与源账户权益的比例/);
   assert.match(d.markdown, /不足最小下单额则跳过/);
-  assert.match(d.markdown, /展开说明/);
+  assert.match(d.markdown, /分析这组 trader/);
   assert.doesNotMatch(d.markdown, /目标数量 =|2.Trader Alternative|两人替代/);
   for (const row of initial.final_review.traders) {
     assert.equal(row.copy_rule.allocated_usdc, "7.500000");

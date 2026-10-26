@@ -1,6 +1,12 @@
 import { Decimal } from "decimal.js";
 import { createHash, randomUUID } from "node:crypto";
 import { AgentError, type Preferences } from "./contracts.js";
+import {
+  createRiskSelectionPolicy,
+  type RecommendationOptions,
+  type RiskSelectionSummary,
+  type SelectionSource,
+} from "./risk-selection.js";
 
 Decimal.set({ precision: 48, rounding: Decimal.ROUND_DOWN });
 export const D = Object.assign((v: Decimal.Value) => new Decimal(v), {
@@ -112,6 +118,8 @@ export interface Allocation {
 }
 export interface Plan {
   previous_plan_id?: string;
+  selection_source?: SelectionSource;
+  risk_selection?: RiskSelectionSummary;
   preference_sources?: Partial<
     Record<keyof Preferences, "user" | "default" | "recommended">
   >;
@@ -437,24 +445,35 @@ function selectForCount(
   p: Preferences,
   candidates: Candidate[],
   count: number,
-): Candidate[] {
+  options: RecommendationOptions = {},
+): { chosen: Candidate[]; riskSelection: RiskSelectionSummary } {
   const amount = D(p.budget_usdc)
     .div(count)
     .toDecimalPlaces(6, Decimal.ROUND_DOWN);
   const allowed = eligibleCandidates(p, candidates).filter((c) =>
     amount.gte(minimumAllocation(p, c)),
   );
+  const policy = createRiskSelectionPolicy(p, allowed, options);
   const chosen: Candidate[] = [];
   while (chosen.length < count && allowed.length) {
-    allowed.sort(
-      (a, b) =>
-        diversity(b, chosen) - diversity(a, chosen) || a.id.localeCompare(b.id),
-    );
+    allowed.sort((a, b) => {
+      const utilityA = diversity(a, chosen);
+      const utilityB = diversity(b, chosen);
+      return (
+        policy.compare(a, b, utilityA, utilityB) ||
+        utilityB - utilityA ||
+        a.id.localeCompare(b.id)
+      );
+    });
     chosen.push(allowed.shift()!);
   }
-  return chosen;
+  return { chosen, riskSelection: policy.summary(chosen) };
 }
-export function recommend(p: Preferences, candidates: Candidate[]): Plan {
+export function recommend(
+  p: Preferences,
+  candidates: Candidate[],
+  options: RecommendationOptions = {},
+): Plan {
   const maximum = requestedTraderCount(p);
   const minimum =
     p.portfolio_kind === "single" ? 1 : p.portfolio_kind === "basket" ? 2 : 3;
@@ -466,15 +485,17 @@ export function recommend(p: Preferences, candidates: Candidate[]): Plan {
       400,
     );
   let chosen: Candidate[] = [];
+  let riskSelection: RiskSelectionSummary | undefined;
   // An explicit count is never silently reduced. Return feasible alternatives instead.
   for (
     let count = maximum;
     count >= (p.portfolio_kind ? maximum : minimum);
     count--
   ) {
-    const selection = selectForCount(p, candidates, count);
-    if (selection.length === count) {
-      chosen = selection;
+    const selection = selectForCount(p, candidates, count, options);
+    if (selection.chosen.length === count) {
+      chosen = selection.chosen;
+      riskSelection = selection.riskSelection;
       break;
     }
   }
@@ -487,6 +508,10 @@ export function recommend(p: Preferences, candidates: Candidate[]): Plan {
   const amounts = allocate(p.budget_usdc, chosen.length);
   return {
     asset_filter_version: 2,
+    selection_source:
+      options.selection_source ??
+      (p.portfolio_kind ? "system" : "legacy_unknown"),
+    risk_selection: riskSelection,
     id: uid("plan"),
     created_at: now(),
     expires_at: now() + 10 * 60_000,
@@ -551,7 +576,9 @@ export function recommendationDiagnostics(
         portfolio_kind: count === 1 ? ("single" as const) : ("basket" as const),
         basket_size: count,
       };
-      return selectForCount(alternative, candidates, count).length === count;
+      return (
+        selectForCount(alternative, candidates, count).chosen.length === count
+      );
     },
   );
   const blocker = !candidates.length

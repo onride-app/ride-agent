@@ -61,7 +61,12 @@ import {
   conversationView,
 } from "./discovery.js";
 import { FundingService } from "./funding.js";
-import { planChange, type Detail } from "./conversation-presentation.js";
+import {
+  planChange,
+  type Detail,
+  type AnalysisOptions,
+} from "./conversation-presentation.js";
+import { inheritReselectedSlots } from "./plan-reselection.js";
 
 export class AgentService {
   get funding() {
@@ -159,6 +164,48 @@ export class AgentService {
     }
     if (name === "recommend_traders") {
       return this.repository.transact(user, async (s) => {
+        if (args.base_plan_id) return this.reselectPlan(user, s, args);
+        // Older catalogs can still express a risk-only change. Resolve that
+        // intent against the owned last preview instead of re-equalizing money.
+        const existing = s.plans.at(-1);
+        const patch = (args.preferences ?? {}) as Partial<Preferences>;
+        const projected = preferenceCollection(s, patch);
+        if (
+          existing &&
+          !args.trader_ids &&
+          !args.batch_action &&
+          (args.selection === "system" ||
+            (!s.selected_trader_ids?.length &&
+              existing.selection_source !== "explicit")) &&
+          projected.ready &&
+          projected.answers.risk_tolerance &&
+          projected.answers.risk_tolerance !==
+            existing.preferences.risk_tolerance
+        ) {
+          const base = normalizedAssetPreferences(
+            existing.preferences,
+            existing.asset_filter_version ?? 1,
+          );
+          const desired = { ...base, ...projected.answers };
+          const omitRecommendedExit =
+            existing.preference_sources?.loss_trigger_pct === "recommended" &&
+            projected.sources.loss_trigger_pct === "recommended";
+          const controls = (value: Partial<Preferences>) =>
+            Object.fromEntries(
+              Object.entries(value).filter(
+                ([key]) =>
+                  key !== "risk_tolerance" &&
+                  !(omitRecommendedExit && key === "loss_trigger_pct"),
+              ),
+            );
+          if (fingerprint(controls(base)) === fingerprint(controls(desired)))
+            return this.reselectPlan(user, s, {
+              ...args,
+              base_plan_id: existing.id,
+              selection: "system",
+              preferences: { risk_tolerance: projected.answers.risk_tolerance },
+            });
+        }
         const answers = (args.preferences ?? {}) as any;
         const collection = preferenceCollection(s, answers);
         savePreferenceCollection(s, collection);
@@ -169,9 +216,14 @@ export class AgentService {
           );
         }
         const savedPref = s.preferences!;
-        if (args.selection === "system") s.selected_trader_ids = undefined;
-        if (args.trader_ids)
+        if (args.selection === "system") {
+          s.selected_trader_ids = undefined;
+          s.selection_source = "system";
+        }
+        if (args.trader_ids) {
           s.selected_trader_ids = [...new Set(args.trader_ids as string[])];
+          s.selection_source = "explicit";
+        }
         const selectedIds = s.selected_trader_ids;
         let pool: Candidate[];
         try {
@@ -295,7 +347,12 @@ export class AgentService {
             saved &&
             fingerprint(saved.preferences) === fingerprint(pref)
               ? structuredClone(saved)
-              : recommend(pref, planningPool);
+              : recommend(pref, planningPool, {
+                  selection_source: selectedIds
+                    ? (s.selection_source ?? "legacy_unknown")
+                    : "system",
+                  risk_selection: selectedIds ? "preserve" : "apply",
+                });
           // Browsing must preserve a user's edited plan. Preference changes keep
           // custom weights if still valid, or explain the conflict instead of resetting them.
           if (
@@ -474,6 +531,8 @@ export class AgentService {
               eligibleCandidates(pref, pool),
               !!selectedIds,
               args.detail as Detail,
+              undefined,
+              args as AnalysisOptions,
             ),
             plan,
             preferences: pref,
@@ -755,7 +814,13 @@ export class AgentService {
         const pool = await Promise.all(
           requested.map((x) => this.adapter.profile(x.trader_id)),
         );
-        const plan = recommend(effectivePref, pool);
+        const plan = recommend(effectivePref, pool, {
+          selection_source:
+            args.allocations || replacements
+              ? "explicit"
+              : (previous.selection_source ?? "legacy_unknown"),
+          risk_selection: "preserve",
+        });
         plan.previous_plan_id = previous.id;
         plan.preference_sources = args.preferences
           ? editCollection.sources
@@ -861,6 +926,15 @@ export class AgentService {
               settings.emergency_exit_pct ?? pref.emergency_exit_pct,
           };
         });
+        if (plan.risk_selection) {
+          const byId = new Map(
+            plan.risk_selection.selected.map((row) => [row.trader_id, row]),
+          );
+          plan.risk_selection.selected = plan.allocations.flatMap((a) => {
+            const row = byId.get(a.trader.id);
+            return row ? [row] : [];
+          });
+        }
         s.plans = s.plans
           .filter((x) => x.created_at > now() - 90 * 86400_000)
           .slice(-99);
@@ -871,8 +945,10 @@ export class AgentService {
             s,
             preferenceCollection(s, args.preferences as Partial<Preferences>),
           );
-        if ((args.allocations || replacements) && pref.portfolio_kind)
+        if ((args.allocations || replacements) && pref.portfolio_kind) {
           s.selected_trader_ids = requested.map((x) => x.trader_id);
+          s.selection_source = "explicit";
+        }
         const sourcePool = await this.adapter.candidates(pref.market);
         const candidates = eligibleCandidates(pref, sourcePool);
         const savedPreferences = completePreferences(s)!;
@@ -886,6 +962,7 @@ export class AgentService {
               !!s.selected_trader_ids,
               args.detail as Detail,
               previous,
+              args as AnalysisOptions,
             ),
             plan,
             candidates,
@@ -1128,6 +1205,7 @@ export class AgentService {
               !!s.selected_trader_ids?.length,
               args.detail as Detail,
               previous,
+              args as AnalysisOptions,
             ),
             plan,
             compatibility: compatibility(plan),
@@ -1152,6 +1230,7 @@ export class AgentService {
                     !!s.selected_trader_ids?.length,
                     args.detail as Detail,
                     s.plans.find((p) => p.id === plan.previous_plan_id),
+                    args as AnalysisOptions,
                   ),
                   recovery: {
                     source: "saved_preview",
@@ -1414,6 +1493,122 @@ export class AgentService {
       return this.proposalView(proposal, s);
     }
     return this.proposalView(proposal, s);
+  }
+  private async reselectPlan(
+    user: string,
+    state: State,
+    args: Record<string, unknown>,
+  ): Promise<Result> {
+    const previous = state.plans.find((p) => p.id === args.base_plan_id);
+    if (!previous)
+      throw new AgentError(
+        "NOT_FOUND",
+        "Saved plan not found for this account.",
+        false,
+        404,
+      );
+    const basePreferences = normalizedAssetPreferences(
+      previous.preferences,
+      previous.asset_filter_version ?? 1,
+    );
+    if (
+      (basePreferences.basket_size != null &&
+        basePreferences.basket_size !== previous.allocations.length) ||
+      (basePreferences.portfolio_kind === "single" &&
+        previous.allocations.length !== 1)
+    )
+      throw new AgentError(
+        "RESELECT_SETTINGS_CONFLICT",
+        "The original count and stored preferences disagree; review the original plan first.",
+      );
+    const answers = (args.preferences ?? {}) as Partial<Preferences>;
+    for (const key of Object.keys(answers) as (keyof Preferences)[]) {
+      if (
+        key !== "risk_tolerance" &&
+        fingerprint(answers[key] ?? null) !==
+          fingerprint(basePreferences[key] ?? null)
+      )
+        throw new AgentError(
+          "RESELECT_SETTINGS_CONFLICT",
+          "A system reselect preserves the original budget, count and settings. Edit other fields separately.",
+        );
+    }
+    const collection = preferenceCollection(
+      {
+        ...state,
+        preferences: basePreferences,
+        preference_asset_filter_version: previous.asset_filter_version,
+        preference_sources: previous.preference_sources ?? {},
+        preference_draft: undefined,
+      },
+      answers,
+    );
+    const pref = preferences.parse(collection.answers);
+    if (!pref.risk_tolerance)
+      throw new AgentError(
+        "RISK_PREFERENCE_REQUIRED",
+        "Choose a risk preference for system reselection; a numerical exit trigger does not imply one.",
+      );
+    const pool = await this.adapter.candidates(pref.market);
+    const plan = recommend(
+      { ...pref, basket_size: previous.allocations.length },
+      pool,
+      {
+        selection_source: "system",
+        risk_selection: "apply",
+      },
+    );
+    if (plan.risk_selection?.status !== "applied")
+      throw new AgentError(
+        "RISK_FIT_UNAVAILABLE",
+        "The complete comparable risk evidence is unavailable. The original plan, preferences and selection were preserved.",
+        true,
+        409,
+      );
+    plan.preference_sources = collection.sources;
+    inheritReselectedSlots(previous, plan);
+    const candidates = eligibleCandidates(pref, pool);
+    // Stage everything before touching persisted account state, including in-memory repositories.
+    const next = structuredClone(state);
+    savePreferenceCollection(next, collection);
+    next.selected_trader_ids = undefined;
+    next.selection_source = "system";
+    next.recommendation_batches = undefined;
+    next.plans = [
+      structuredClone(previous),
+      ...next.plans
+        .filter(
+          (p) => p.id !== previous.id && p.created_at > now() - 90 * 86400_000,
+        )
+        .slice(-98),
+      plan,
+    ];
+    saveDiscovery(next, pref, pool);
+    const data = {
+      ...conversationView(
+        plan,
+        collection,
+        candidates,
+        false,
+        args.detail as Detail,
+        previous,
+        args as AnalysisOptions,
+      ),
+      plan,
+      preferences: pref,
+      candidates,
+      candidate_page: browse(next, pref, { limit: 5 }, user, this.cursor)
+        .candidates_meta,
+      previous_plan_id: previous.id,
+      plan_change: planChange(previous, plan),
+      edit_kind: "system_reselection",
+      original_plan_unchanged: true,
+      slot_amounts_unchanged: true,
+      requires_new_confirmation: true,
+      execution_authorized: false,
+    };
+    Object.assign(state, next);
+    return result(data);
   }
   async proposal(user: string, id: string): Promise<Result> {
     return this.repository.transact(user, async (s) => {

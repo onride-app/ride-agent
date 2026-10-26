@@ -55,6 +55,7 @@ export interface State {
     Record<keyof Preferences, "user" | "default" | "recommended">
   >;
   selected_trader_ids?: string[];
+  selection_source?: "system" | "explicit" | "legacy_unknown";
   discovery?: {
     id: string;
     preference_hash: string;

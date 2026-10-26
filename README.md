@@ -46,6 +46,14 @@ npx skills add onride-app/ride-agent --skill ride
 
 The Skill-only command does not register an MCP server. For standalone CLI commands, prefix the commands below with `npx -y @onride/agent@0.5.3`, or install the pinned package with `npm install -g @onride/agent@0.5.3` to obtain `ride`.
 
+## Preview edits and analysis
+
+A saved preview is immutable. `recommend_traders` with `base_plan_id`, `selection: "system"`, and a risk-preference patch generates a new system preview while preserving the original trader count, slot amounts and copy/risk controls. Risk selection uses a versioned product policy over comparable Perps model components; it does not change Copy Score or prove an improvement in realized portfolio risk. Missing or unsupported evidence blocks this explicit reselect. Manual selections and legacy pinned IDs stay protected until system reselection is explicitly requested.
+
+Analysis reads the exact plan with `get_portfolio`: `detail: "detailed"` gives a concise summary; `analysis_depth: "extended"` gives more evidence. Formulas appear only with explicitly requested `include_calculations: true`. These reads do not create a new preview.
+
+Candidate browsing accepts query-only `filters` (`min_score`, `max_drawdown_pct`, `min_roi_pct`, `max_roi_pct`) and an optional exact `metric_window`. Filtering precedes pagination and preserves plans, preferences and selections. Unknown periods stay unknown; an explicit window excludes unverified or mismatched evidence. Source coverage remains the verified snapshot (currently at most 30 Perps profiles).
+
 ## Automatic updates and existing users
 
 The installed Skill is a stable entry point. At the start of each Ride task it calls `get_ride_guide` to load the workflow from the configured Ride server. Deploying a new workflow updates its behavior without reinstalling local Skill files. The guide never grants new trading authority. If the live guide is unavailable, account reads and explanations can use the bundled reference; new financial proposals wait for the guide to recover.
@@ -168,7 +176,7 @@ To test the actual feature journey locally, use an isolated disposable PostgreSQ
 RIDE_AGENT_FUNCTIONAL_DATABASE_URL='postgresql://USER@127.0.0.1:5432/ride_functional_acceptance' npm run test:functional
 ```
 
-This starts the real MCP gateway, HTTP backend, OAuth PKCE flow and CLI, and runs 45 scenarios through the Agent tools, live guide and account reads with persisted PostgreSQL state. It covers recommendation risk filters, frozen human proposals, partial fills, fees/funding, position closes, wind-down, delegated limits, both loss triggers, replacement limits, stale proposals and monitor recovery. Only Core identities and venue reads/fills are simulated; this does not verify a real login, wallet signing or exchange settlement. The script removes its own fixture states and writes `output/deployment/functional-acceptance.json` with every scenario and tool response.
+This starts the real MCP gateway, HTTP backend, OAuth PKCE flow and CLI, and runs 51 scenarios through the Agent tools, live guide and account reads with persisted PostgreSQL state. It covers recommendation risk filters, slot-preserving risk reselection, read-only analysis and candidate filters, frozen human proposals, partial fills, fees/funding, position closes, wind-down, delegated limits, both loss triggers, replacement limits, stale proposals and monitor recovery. Only Core identities and venue reads/fills are simulated; this does not verify a real login, wallet signing or exchange settlement. The script removes its own fixture states and writes `output/deployment/functional-acceptance.json` with every scenario and tool response.
 
 MIT. The open repository is created from a clean history and contains no private Ride repository history, credentials, or user account data.
 

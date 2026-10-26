@@ -15,10 +15,20 @@ import { compatibility } from "./conversational.js";
 import {
   candidateDisplay,
   copyRule,
+  historicalPeriodLabel,
   planDisplay,
   type Detail,
+  type AnalysisOptions,
 } from "./conversation-presentation.js";
 import type { State, Cursor } from "./repository.js";
+import {
+  candidateMetricValue,
+  filterCandidates,
+  metricPeriodsComparable,
+  normalizeCandidateQuery,
+  type CandidateFilters,
+  type MetricWindow,
+} from "./candidate-filters.js";
 
 export function choosePlanPreferences(
   p: Preferences,
@@ -86,18 +96,8 @@ export function traderRow(c: Candidate) {
     metric_unavailable_reason: c.metric_unavailable_reason ?? null,
     metric_periods: c.metric_periods ?? null,
     metric_period_labels: {
-      roi:
-        c.metric_periods?.roi?.start_at != null &&
-        c.metric_periods?.roi?.end_at != null
-          ? `${new Date(c.metric_periods.roi.start_at).toISOString()} — ${new Date(c.metric_periods.roi.end_at).toISOString()}`
-          : c.metric_periods?.roi?.period === "source_month"
-            ? "来源标注月收益，具体起止日期未核实"
-            : "收益统计周期未核实",
-      drawdown:
-        c.metric_periods?.drawdown?.start_at != null &&
-        c.metric_periods?.drawdown?.end_at != null
-          ? `${new Date(c.metric_periods.drawdown.start_at).toISOString()} — ${new Date(c.metric_periods.drawdown.end_at).toISOString()}`
-          : "回撤统计周期未核实，不可视为同周期比较",
+      roi: historicalPeriodLabel(c, "roi"),
+      drawdown: historicalPeriodLabel(c, "drawdown"),
     },
     score_explanation: c.score_explanation ?? null,
     last_trade_at: c.last_trade_at,
@@ -117,6 +117,8 @@ export function browse(
     limit?: number;
     cursor?: string;
     compare_ids?: string[];
+    filters?: CandidateFilters;
+    metric_window?: MetricWindow;
   },
   user: string,
   cursor: Cursor,
@@ -142,6 +144,14 @@ export function browse(
       false,
       404,
     );
+  if (
+    args.compare_ids &&
+    (args.filters !== undefined || args.metric_window !== undefined)
+  )
+    throw new AgentError(
+      "INVALID_BROWSE",
+      "Choose explicit comparison or candidate filters/window, not both; comparison never silently removes requested traders.",
+    );
   if (args.exclude_selected && args.compare_ids)
     throw new AgentError(
       "INVALID_BROWSE",
@@ -150,11 +160,17 @@ export function browse(
   const selected = new Set(plan?.allocations.map((a) => a.trader.id) ?? []);
   const sort = args.sort_by ?? "score",
     direction = args.direction ?? (sort === "drawdown" ? "asc" : "desc");
+  const normalizedQuery = normalizeCandidateQuery(
+    args.filters,
+    args.metric_window,
+  );
   const query = fingerprint({
     snapshot: snapshot.id,
     sort,
     direction,
     compare_ids: args.compare_ids,
+    filters: normalizedQuery.filters,
+    metric_window: normalizedQuery.metric_window,
     ...(args.exclude_selected
       ? { exclude_selected: [...selected], plan_id: plan!.id }
       : {}),
@@ -167,15 +183,17 @@ export function browse(
     );
   const allowed = eligibleCandidates(pref, snapshot.candidates);
   const ids = args.compare_ids;
-  const rows = ids
+  const beforeFilters = ids
     ? snapshot.candidates.filter((c) => ids.includes(c.id))
     : allowed.filter((c) => !args.exclude_selected || !selected.has(c.id));
-  const metric = (c: Candidate) =>
-    sort === "score"
-      ? c.score
-      : sort === "drawdown"
-        ? c.source_drawdown_pct
-        : c.source_roi_pct;
+  const filtered = filterCandidates(
+    beforeFilters,
+    normalizedQuery.filters,
+    normalizedQuery.metric_window,
+    sort,
+  );
+  const rows = filtered.rows;
+  const metric = (c: Candidate) => candidateMetricValue(c, sort);
   rows.sort((a, b) => {
     const av = metric(a),
       bv = metric(b);
@@ -190,6 +208,42 @@ export function browse(
     limit = args.limit ?? 5,
     page = rows.slice(offset, offset + limit);
   const next = offset + page.length;
+  const display = candidateDisplay(
+    page,
+    plan,
+    args.detail,
+    page.length
+      ? "available"
+      : !snapshot.candidates.length
+        ? "source_empty"
+        : rows.length
+          ? "end_of_results"
+          : "no_matching_candidates",
+    { historical_metrics: filtered.metric_basis.applied_to_metrics },
+  );
+  const f = normalizedQuery.filters;
+  const filterLabels = [
+    f.min_score == null ? null : `评分 ≥ ${f.min_score}`,
+    f.max_drawdown_pct == null ? null : `来源回撤 ≤ ${f.max_drawdown_pct}%`,
+    f.min_roi_pct == null ? null : `来源收益 ≥ ${f.min_roi_pct}%`,
+    f.max_roi_pct == null ? null : `来源收益 ≤ ${f.max_roi_pct}%`,
+  ].filter(Boolean);
+  if (filterLabels.length || normalizedQuery.metric_window) {
+    const window = normalizedQuery.metric_window;
+    display.markdown += `\n筛选：${filterLabels.join("；") || "指定统计窗口"}。符合 ${rows.length} 人，本页 ${page.length} 人。`;
+    const windowDate = new Intl.DateTimeFormat("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      dateStyle: "short",
+      timeStyle: "short",
+      hour12: false,
+    });
+    display.markdown += window
+      ? `\n统计窗口：${windowDate.format(window.start_at)} 至 ${windowDate.format(window.end_at)}（上海）；仅采用已核实且完全匹配的指标。周期缺失 ${filtered.counts.unavailable_window_count} 人，周期不符 ${filtered.counts.mismatched_window_count} 人。`
+      : "\n按来源报告值筛选；统计周期未核实时，不代表同周期收益或风险比较。";
+    if (filtered.counts.missing_metric_count)
+      display.markdown += ` 指标缺失 ${filtered.counts.missing_metric_count} 人，已排除。`;
+    display.markdown += " 范围为当前已验证候选快照，Perps 最多 30 人。";
+  }
   const availability = page.length
     ? "available"
     : !snapshot.candidates.length
@@ -199,12 +253,7 @@ export function browse(
         : "no_matching_candidates";
   return {
     view_kind: "candidate_browse",
-    conversation_display: candidateDisplay(
-      page,
-      plan,
-      args.detail,
-      availability,
-    ),
+    conversation_display: display,
     candidate_availability: {
       status: availability,
       source_count: snapshot.candidates.length || null,
@@ -212,6 +261,14 @@ export function browse(
       matching_count: snapshot.candidates.length ? rows.length : null,
       instruction:
         "来源未返回可用数据时，不将其解释为预算不足或市场没有 trader；保留原方案，稍后只刷新候选。",
+    },
+    applied_filters: filtered.applied_filters,
+    metric_basis: filtered.metric_basis,
+    filter_counts: {
+      source_count: snapshot.candidates.length,
+      eligible_count: allowed.length,
+      selected_excluded_count: ids ? 0 : allowed.length - beforeFilters.length,
+      ...filtered.counts,
     },
     base_plan_id: plan?.id ?? null,
     base_trader_ids: [...selected],
@@ -239,10 +296,11 @@ export function browse(
         "Source history is not follower profit. Compare periods and score versions before drawing conclusions; unknown periods are unavailable, never assumed equal.",
       score_tie_note:
         "Equal display scores can result from tier caps. Use each row's score_explanation; missing tier evidence remains unavailable. Public trader ID is the deterministic tie-breaker, not a return forecast.",
-      period_comparable:
-        page.length > 0 &&
-        page.every((c) => c.metric_window != null) &&
-        new Set(page.map((c) => fingerprint(c.metric_window))).size === 1,
+      period_comparable: metricPeriodsComparable(page),
+      period_comparable_by_metric: {
+        roi: metricPeriodsComparable(page, "roi"),
+        drawdown: metricPeriodsComparable(page, "drawdown"),
+      },
     },
     missing_trader_ids:
       ids?.filter((id) => !rows.some((c) => c.id === id)) ?? [],
@@ -270,10 +328,14 @@ export function conversationView(
   selectedByUser: boolean,
   detail: Detail = "brief",
   previous?: Plan,
+  analysisOptions: AnalysisOptions = {},
 ) {
   return {
     presentation: "native_conversation",
-    conversation_display: plan ? planDisplay(plan, detail, previous) : null,
+    conversation_display: plan
+      ? planDisplay(plan, detail, previous, analysisOptions)
+      : null,
+    risk_selection: plan?.risk_selection ?? null,
     preference_collection: collection,
     recommended_portfolio:
       plan?.allocations.map((a) => ({
@@ -291,6 +353,9 @@ export function conversationView(
         leverage_cap_inherited_from_plan_id:
           a.leverage_cap_inherited_from_plan_id ?? null,
         maximum_leverage_cap: maximumUserLeverage(a.trader),
+        risk_selection_reasons:
+          plan.risk_selection?.selected.find((r) => r.trader_id === a.trader.id)
+            ?.reasons ?? [],
         reason: `Copy Score ${a.trader.score}; ${a.trader.style}; ${a.trader.assets.join("/")}; ${plan.allocations.length === 1 ? "single-trader concentration" : `capital spread across ${plan.allocations.length} selected traders`}.${a.leverage_cap_source === "inherited" || (a.trader.market === "perps" && a.leverage_cap != null && !a.leverage_mode) ? (a.leverage_cap == null ? " 保留原设置：跟随源杠杆，无额外上限，无需再次清除。" : ` 保留原杠杆上限 ${a.leverage_cap}x；可明确选择取消额外上限。`) : ""}`,
       })) ?? [],
     // Compare the same immutable selection in the same order. The candidate
@@ -302,7 +367,16 @@ export function conversationView(
       source: "plan_allocations",
     },
     candidate_table: candidates.slice(0, 5).map(traderRow),
-    selection_origin: selectedByUser ? "user" : "system_recommendation",
+    selection_origin:
+      plan?.selection_source === "system"
+        ? "system_recommendation"
+        : plan?.selection_source === "explicit"
+          ? "user"
+          : plan?.selection_source === "legacy_unknown"
+            ? "legacy_unknown"
+            : selectedByUser
+              ? "user"
+              : "system_recommendation",
     planning_constraints: {
       max_traders: 8,
       minimum_allocation_usdc:
@@ -354,7 +428,7 @@ export function conversationView(
           ),
           traders: plan.allocations.map((a) => ({
             trader_id: a.trader.id,
-            copy_rule: copyRule(a),
+            copy_rule: copyRule(a, analysisOptions),
             amount_usdc: a.amount_usdc,
             copy_mode: a.copy_mode ?? "ride_recommends",
             leverage_cap: a.leverage_cap,
@@ -370,6 +444,6 @@ export function conversationView(
         }
       : null,
     instruction:
-      "Default to conversation_display.markdown: one compact combined allocation/performance table, a short copy-rule explanation, the exit trigger and next actions. Do not append repeated portfolio analysis or alternative plans. Use detailed output only when requested, reading that exact plan_id with get_portfolio; do not recalculate to explain. Underlying recommended_portfolio and recommended_trader_comparison retain identical selected IDs/order. Never replace the recommended performance comparison with candidate_table or the top five ranking. Use this same plan selection for any following portfolio analysis or final review. On older responses without recommended_trader_comparison, use the metrics already in recommended_portfolio. For alternatives, use browse_traders with plan_id and exclude_selected:true; this only browses, including after snapshot expiry. Only explicitly chosen replacements use recalculate_plan.replacements: one-for-one, preserving count, amounts, copy settings and risk. Do not invent a two-trader alternative based on a small budget; only an explicit count change uses allocations or basket_size. Distinguish every plan by ID and use returned plan_change when comparing; fewer overlap flags or larger per-trader amounts are not verified risk reduction. Candidate discovery is separate: label candidate_table as the eligible candidate ranking and show it when the user asks for candidates, or when no plan is feasible; do not call it the recommended portfolio's performance comparison. The first browse request starts without a cursor unless a candidate page was actually displayed. A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
+      "Default to conversation_display.markdown. The first analysis is a concise conclusion and at most three evidence points; analysis_depth:extended reads the same plan for more detail. Calculations are omitted unless include_calculations:true is explicitly requested. Never reconstruct or append formulas from raw values, repeat per-trader control explanations, evaluate the interface, or create another plan to explain. Risk-selection reasons are versioned product rules, not measured portfolio risk optimization. Underlying recommended_portfolio and recommended_trader_comparison retain identical selected IDs/order. Never replace the recommended performance comparison with candidate_table or the top five ranking. Use this same plan selection for any following portfolio analysis or final review. On older responses without recommended_trader_comparison, use the metrics already in recommended_portfolio. For alternatives, use browse_traders with plan_id and exclude_selected:true; this only browses, including after snapshot expiry. Only explicitly chosen replacements use recalculate_plan.replacements: one-for-one, preserving count, amounts, copy settings and risk. Do not invent a two-trader alternative based on a small budget; only an explicit count change uses allocations or basket_size. Distinguish every plan by ID and use returned plan_change when comparing; fewer overlap flags or larger per-trader amounts are not verified risk reduction. Candidate discovery is separate: label candidate_table as the eligible candidate ranking and show it when the user asks for candidates, or when no plan is feasible; do not call it the recommended portfolio's performance comparison. The first browse request starts without a cursor unless a candidate page was actually displayed. A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
   };
 }

@@ -51,6 +51,35 @@ export const preferenceAnswers = z
   })
   .partial()
   .strict();
+export const analysisOptions = {
+  analysis_depth: z.enum(["summary", "extended"]).default("summary"),
+  include_calculations: z.boolean().default(false),
+};
+export const candidateFilters = z
+  .object({
+    min_score: z.number().finite().min(0).max(100).optional(),
+    max_drawdown_pct: z.number().finite().nonnegative().optional(),
+    min_roi_pct: z.number().finite().optional(),
+    max_roi_pct: z.number().finite().optional(),
+  })
+  .strict()
+  .refine(
+    (v) =>
+      v.min_roi_pct == null ||
+      v.max_roi_pct == null ||
+      v.min_roi_pct <= v.max_roi_pct,
+    "Minimum ROI must not exceed maximum ROI",
+  );
+export const candidateMetricWindow = z
+  .object({
+    start_at: z.number().int().positive(),
+    end_at: z.number().int().positive(),
+  })
+  .strict()
+  .refine(
+    (v) => v.start_at < v.end_at,
+    "Metric window must have start before end",
+  );
 export const inputs = {
   get_preferences: z.object({}).strict(),
   prepare_deposit: z
@@ -75,6 +104,8 @@ export const inputs = {
   set_preferences: preferenceAnswers,
   recommend_traders: z
     .object({
+      base_plan_id: id.optional(),
+      ...analysisOptions,
       detail: z.enum(["brief", "detailed"]).default("brief"),
       preferences: preferenceAnswers.optional(),
       batch_action: z.enum(["first", "next", "saved"]).optional(),
@@ -90,7 +121,13 @@ export const inputs = {
         .optional(),
       selection: z.enum(["system"]).optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (v) =>
+        !v.base_plan_id ||
+        (v.selection === "system" && !v.trader_ids && !v.batch_action),
+      "A base-plan reselect requires selection:system without trader_ids or batch actions",
+    ),
   browse_traders: z
     .object({
       plan_id: id.optional(),
@@ -101,8 +138,16 @@ export const inputs = {
       limit: z.number().int().min(1).max(20).default(5),
       cursor: z.string().max(1024).optional(),
       compare_ids: z.array(id).min(1).max(8).optional(),
+      filters: candidateFilters.optional(),
+      metric_window: candidateMetricWindow.optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (v) =>
+        !v.compare_ids ||
+        (v.filters === undefined && v.metric_window === undefined),
+      "Compare exact IDs or filter candidates, not both",
+    ),
   get_trader_profile: z
     .object({
       trader_id: id,
@@ -118,6 +163,7 @@ export const inputs = {
   recalculate_plan: z
     .object({
       plan_id: id,
+      ...analysisOptions,
       detail: z.enum(["brief", "detailed"]).default("brief"),
       replacements: z
         .array(
@@ -192,6 +238,7 @@ export const inputs = {
   get_portfolio: portfolioInput
     .extend({
       plan_id: id.optional(),
+      ...analysisOptions,
       detail: z.enum(["brief", "detailed"]).default("brief"),
     })
     .refine(
