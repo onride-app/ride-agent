@@ -2197,6 +2197,43 @@ try {
       };
     },
   );
+  await check("48 来源空列表不生成替代方案，不改变人数或风险", async () => {
+    assert(alternativesAcceptance);
+    const { original } = alternativesAcceptance;
+    venue.pool = [];
+    const before = await repo.transact(users.widget, async (state) => {
+      state.discovery!.expires_at = 0;
+      return structuredClone({
+        plans: state.plans,
+        preferences: state.preferences,
+        selection: state.selected_trader_ids,
+      });
+    });
+    const d = (
+      await ok(widgetClient, "browse_traders", {
+        plan_id: original.id,
+        exclude_selected: true,
+      })
+    ).data;
+    assert.equal(d.candidate_availability.status, "source_empty");
+    assert.equal(d.candidate_availability.source_count, null);
+    assert.match(d.conversation_display.markdown, /来源暂未返回可用/);
+    assert.doesNotMatch(d.conversation_display.markdown, /\| Trader \|/);
+    const after = await repo.transact(users.widget, async (state) =>
+      structuredClone({
+        plans: state.plans,
+        preferences: state.preferences,
+        selection: state.selected_trader_ids,
+      }),
+    );
+    assert.deepEqual(after, before);
+    return {
+      source_status: "source_empty",
+      original_plan_preserved: true,
+      count_unchanged: true,
+      no_budget_or_risk_change: true,
+    };
+  });
 } catch (e) {
   results.push({
     name: "Harness startup or critical journey prerequisite",

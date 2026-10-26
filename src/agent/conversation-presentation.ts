@@ -199,21 +199,43 @@ export function candidateDisplay(
   candidates: Candidate[],
   plan: Plan | undefined,
   detail: Detail = "brief",
+  availability:
+    | "available"
+    | "source_empty"
+    | "no_matching_candidates"
+    | "end_of_results" = candidates.length
+    ? "available"
+    : "no_matching_candidates",
 ) {
   return {
     detail,
+    availability,
     base_plan_id: plan?.id ?? null,
     markdown: [
       plan
         ? `其他候选 · 原 ${plan.allocations.length} 人方案 ${plan.id.slice(-8)} 保持不变`
         : "候选 trader",
-      "| Trader | Score | 资产 |",
-      "| --- | ---: | --- |",
-      ...candidates.map(
-        (c) =>
-          `| ${cell(c.handle)} | ${cell(c.score)} | ${cell(c.assets.join("/"))} |`,
-      ),
-      "这里只浏览候选，不生成新组合。选择替换对象后，一换一保留人数、金额和风险设置。",
+      ...(candidates.length
+        ? [
+            "| Trader | Score | 资产 |",
+            "| --- | ---: | --- |",
+            ...candidates.map(
+              (c) =>
+                `| ${cell(c.handle)} | ${cell(c.score)} | ${cell(c.assets.join("/"))} |`,
+            ),
+          ]
+        : [
+            availability === "source_empty"
+              ? "来源暂未返回可用 trader 数据，不能据此认定市场没有 trader。稍后可刷新候选；原方案保持不变，不因此缩减人数或调整预算和风险。"
+              : availability === "end_of_results"
+                ? "本页已到候选边界，原方案保持不变。可从首页重新浏览。"
+                : "当前没有符合原条件的其他候选；原方案保持不变。可保留方案，或明确调整筛选条件后再浏览。",
+          ]),
+      ...(candidates.length
+        ? [
+            "这里只浏览候选，不生成新组合。选择替换对象后，一换一保留人数、金额和风险设置。",
+          ]
+        : []),
       ...(detail === "detailed"
         ? [
             "候选排名与降低风险是不同的判断；来源历史周期须单独核对，未测得历史亏损相关性。",

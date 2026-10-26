@@ -37,6 +37,26 @@ async function fixture() {
 const ids = (p: any) => p.allocations.map((a: any) => a.trader.id);
 const savedState = ({ discovery, ...saved }: any) => saved;
 
+it("explains an empty live source without inventing alternatives or changing the saved plan", async () => {
+  const { call, initial, adapter, repo, state } = await fixture();
+  adapter.pool = [];
+  await repo.transact("alice", async (s) => {
+    s.discovery!.expires_at = 0;
+  });
+  const before = savedState(await state());
+  const d = await call("browse_traders", {
+    plan_id: initial.plan.id,
+    exclude_selected: true,
+  });
+  assert.equal(d.candidate_availability.status, "source_empty");
+  assert.equal(d.candidate_availability.source_count, null);
+  assert.equal(d.plan_unchanged, true);
+  assert.match(d.conversation_display.markdown, /来源暂未返回可用/);
+  assert.doesNotMatch(d.conversation_display.markdown, /\| Trader \||两人方案/);
+  assert.deepEqual(savedState(await state()), before);
+  assert.equal(adapter.submitCount, 0);
+});
+
 it("browses and pages alternatives without replacing a four-trader plan, preferences or pinned selection", async () => {
   const { call, initial, state, adapter } = await fixture();
   const before = await state();
