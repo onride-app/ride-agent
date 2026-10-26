@@ -23,7 +23,7 @@ import {
 import { event, AgentService } from "./service.js";
 import type { State } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
-import { observeSources } from "./source-observations.js";
+import { observeSources, sourceEvidenceReady } from "./source-observations.js";
 import {
   recordPerformance,
   recordReceipt,
@@ -48,12 +48,7 @@ export class AgentRunner {
             // Late public reads may update this bounded cache, never a state
             // transaction that already committed or any execution cursor.
             try {
-              if (
-                observation.ok &&
-                observation.value.complete &&
-                fresh(observation.value.observed_at) &&
-                D(observation.value.account_value_usdc).gt(0)
-              ) {
+              if (observation.ok && sourceEvidenceReady(observation.value)) {
                 if (this.sourceTimes.size >= 2000)
                   this.sourceTimes.delete(
                     this.sourceTimes.keys().next().value!,
@@ -306,11 +301,7 @@ export class AgentRunner {
             const observation = await sources.get(s.trader.id);
             if (!observation.ok) throw observation.error;
             const source = observation.value;
-            if (
-              !source.complete ||
-              !fresh(source.observed_at) ||
-              !D(source.account_value_usdc).gt(0)
-            )
+            if (!sourceEvidenceReady(source))
               throw new AgentError(
                 "SOURCE_STALE",
                 "Source coverage or equity is incomplete.",
@@ -398,6 +389,33 @@ export class AgentRunner {
                 (t.source_quantities ??= {})[fill.key] =
                   currentSource.toString();
                 (t.fixed_seen_fills ??= []).push(fill.id);
+              }
+            }
+            if (t.copy_mode === "fixed") {
+              // A complete snapshot may omit a closed position. Before
+              // clearing its target, verified fills must explain that closure.
+              // Check the full source set, before the user's asset filters.
+              const sourceKeys = new Set(source.positions.map((x) => x.key));
+              const trackedKeys = new Set([
+                ...Object.keys(t.source_quantities ?? {}),
+                ...Object.keys(t.fixed_targets ?? {}),
+                ...Object.keys(t.intents),
+              ]);
+              for (const key of trackedKeys) {
+                if (sourceKeys.has(key)) continue;
+                const quantity = t.source_quantities?.[key];
+                if (
+                  (quantity != null && !D(quantity).isZero()) ||
+                  (quantity == null &&
+                    [t.fixed_targets?.[key], t.intents[key]?.quantity].some(
+                      (value) => value != null && !D(value).isZero(),
+                    ))
+                )
+                  throw new AgentError(
+                    "SOURCE_FILL_EVIDENCE_MISSING",
+                    "A disappeared fixed-copy source position lacks verified closing fills.",
+                    true,
+                  );
               }
             }
             const permitted = source.positions.filter(

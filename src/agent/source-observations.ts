@@ -1,8 +1,28 @@
 import type { VenueAdapter, SourceSnapshot } from "./adapter.js";
-import type { Candidate } from "./domain.js";
+import { D, fresh, type Candidate } from "./domain.js";
 
 export type SourceObservation =
   { ok: true; value: SourceSnapshot } | { ok: false; error: unknown };
+
+// A verified empty account has no position to size. Its zero equity is valid
+// flat evidence; any nonempty position set still needs a positive denominator.
+export function sourceEvidenceReady(source: SourceSnapshot): boolean {
+  if (
+    source?.complete !== true ||
+    !fresh(source.observed_at) ||
+    !Array.isArray(source.positions)
+  )
+    return false;
+  try {
+    const equity = D(source.account_value_usdc);
+    return (
+      equity.isFinite() &&
+      (equity.gt(0) || (equity.isZero() && source.positions.length === 0))
+    );
+  } catch {
+    return false;
+  }
+}
 
 // Collect public source evidence independently of follower account eligibility.
 // Collection never changes target quantities, initialization, or source cursors.
