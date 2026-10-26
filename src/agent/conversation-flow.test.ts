@@ -281,7 +281,18 @@ it("cursor and snapshots are isolated, query bound and expirable without losing 
   await repo.transact("alice", async (s) => {
     s.discovery!.expires_at = now() - 1;
   });
-  await assert.rejects(api.tool("alice", "browse_traders", {}), /expired/);
+  await assert.rejects(
+    api.tool("alice", "browse_traders", {
+      cursor: first.candidates_meta.next_cursor,
+    }),
+    /expired/,
+  );
+  const before = await repo.transact("alice", async (s) =>
+    structuredClone(s.plans),
+  );
+  const refreshed = await call("browse_traders");
+  assert.equal(refreshed.plan_unchanged, true);
+  assert.deepEqual(await repo.transact("alice", async (s) => s.plans), before);
 });
 it("sorts missing metrics last and does not claim unknown source periods are comparable", async () => {
   const { call, adapter } = env(11);

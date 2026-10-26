@@ -111,6 +111,7 @@ export interface Allocation {
   emergency_exit_pct?: number;
 }
 export interface Plan {
+  previous_plan_id?: string;
   preference_sources?: Partial<
     Record<keyof Preferences, "user" | "default" | "recommended">
   >;

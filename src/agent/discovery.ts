@@ -12,6 +12,12 @@ import {
   type Plan,
 } from "./domain.js";
 import { compatibility } from "./conversational.js";
+import {
+  candidateDisplay,
+  copyRule,
+  planDisplay,
+  type Detail,
+} from "./conversation-presentation.js";
 import type { State, Cursor } from "./repository.js";
 
 export function choosePlanPreferences(
@@ -103,6 +109,9 @@ export function browse(
   s: State,
   pref: Preferences,
   args: {
+    plan_id?: string;
+    exclude_selected?: boolean;
+    detail?: Detail;
     sort_by?: "score" | "drawdown" | "roi";
     direction?: "asc" | "desc";
     limit?: number;
@@ -120,9 +129,25 @@ export function browse(
   )
     throw new AgentError(
       "DISCOVERY_REFRESH_REQUIRED",
-      "The candidate snapshot expired or preferences changed. Call recommend_traders to refresh; your choices and saved plan remain available.",
+      "The candidate snapshot expired or preferences changed. Call browse_traders without a cursor to refresh candidates; your choices and saved plan remain unchanged.",
       true,
     );
+  const plan = args.plan_id
+    ? s.plans.find((p) => p.id === args.plan_id)
+    : s.plans.at(-1);
+  if ((args.plan_id || args.exclude_selected) && !plan)
+    throw new AgentError(
+      "NOT_FOUND",
+      "Saved plan not found for this account.",
+      false,
+      404,
+    );
+  if (args.exclude_selected && args.compare_ids)
+    throw new AgentError(
+      "INVALID_BROWSE",
+      "Choose alternative browsing or explicit comparison, not both.",
+    );
+  const selected = new Set(plan?.allocations.map((a) => a.trader.id) ?? []);
   const sort = args.sort_by ?? "score",
     direction = args.direction ?? (sort === "drawdown" ? "asc" : "desc");
   const query = fingerprint({
@@ -130,6 +155,9 @@ export function browse(
     sort,
     direction,
     compare_ids: args.compare_ids,
+    ...(args.exclude_selected
+      ? { exclude_selected: [...selected], plan_id: plan!.id }
+      : {}),
   });
   const decoded = args.cursor ? cursor.decode(user, args.cursor) : null;
   if (decoded && (decoded.id !== query || decoded.at < 0))
@@ -141,7 +169,7 @@ export function browse(
   const ids = args.compare_ids;
   const rows = ids
     ? snapshot.candidates.filter((c) => ids.includes(c.id))
-    : allowed;
+    : allowed.filter((c) => !args.exclude_selected || !selected.has(c.id));
   const metric = (c: Candidate) =>
     sort === "score"
       ? c.score
@@ -163,6 +191,12 @@ export function browse(
     page = rows.slice(offset, offset + limit);
   const next = offset + page.length;
   return {
+    view_kind: "candidate_browse",
+    conversation_display: candidateDisplay(page, plan, args.detail),
+    base_plan_id: plan?.id ?? null,
+    base_trader_ids: [...selected],
+    excluded_selected_traders: args.exclude_selected ?? false,
+    preferences_unchanged: true,
     candidates: page,
     candidate_table: page.map(traderRow),
     candidates_meta: {
@@ -214,9 +248,12 @@ export function conversationView(
   collection: Record<string, unknown>,
   candidates: Candidate[],
   selectedByUser: boolean,
+  detail: Detail = "brief",
+  previous?: Plan,
 ) {
   return {
     presentation: "native_conversation",
+    conversation_display: plan ? planDisplay(plan, detail, previous) : null,
     preference_collection: collection,
     recommended_portfolio:
       plan?.allocations.map((a) => ({
@@ -297,6 +334,7 @@ export function conversationView(
           ),
           traders: plan.allocations.map((a) => ({
             trader_id: a.trader.id,
+            copy_rule: copyRule(a),
             amount_usdc: a.amount_usdc,
             copy_mode: a.copy_mode ?? "ride_recommends",
             leverage_cap: a.leverage_cap,
@@ -312,6 +350,6 @@ export function conversationView(
         }
       : null,
     instruction:
-      "When a plan exists, show two compact chat tables: recommended_portfolio (trader, amount, reason) and recommended_trader_comparison (the same selected trader IDs in the same order, with score, assets, style and source history/periods). Never replace the recommended performance comparison with candidate_table or the top five ranking. Use this same plan selection for any following portfolio analysis or final review. On older responses without recommended_trader_comparison, use the metrics already in recommended_portfolio. Candidate discovery is separate: label candidate_table as the eligible candidate ranking and show it when the user asks for candidates, or when no plan is feasible; do not call it the recommended portfolio's performance comparison. The first browse request starts without a cursor unless a candidate page was actually displayed. A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
+      "Default to conversation_display.markdown: one compact combined allocation/performance table, a short copy-rule explanation, the exit trigger and next actions. Do not append repeated portfolio analysis or alternative plans. Use detailed output only when requested, reading that exact plan_id with get_portfolio; do not recalculate to explain. Underlying recommended_portfolio and recommended_trader_comparison retain identical selected IDs/order. Never replace the recommended performance comparison with candidate_table or the top five ranking. Use this same plan selection for any following portfolio analysis or final review. On older responses without recommended_trader_comparison, use the metrics already in recommended_portfolio. For alternatives, use browse_traders with plan_id and exclude_selected:true; this only browses, including after snapshot expiry. Only explicitly chosen replacements use recalculate_plan.replacements: one-for-one, preserving count, amounts, copy settings and risk. Do not invent a two-trader alternative based on a small budget; only an explicit count change uses allocations or basket_size. Distinguish every plan by ID and use returned plan_change when comparing; fewer overlap flags or larger per-trader amounts are not verified risk reduction. Candidate discovery is separate: label candidate_table as the eligible candidate ranking and show it when the user asks for candidates, or when no plan is feasible; do not call it the recommended portfolio's performance comparison. The first browse request starts without a cursor unless a candidate page was actually displayed. A follow_source allocation with leverage_cap null follows verified source leverage without an extra user cap by default; say this explicitly. A numeric cap is user-editable independently of the recommendation (Perps 1–40x), and null clears it. Actual leverage still respects the approved optional cap, fresh venue limits, budget and risk checks. Never invent a 3x or 10x default cap. Disclose defaults and risk settings. Offer accept/customize; browse_traders pages or compares without replacing the plan. No funding needed for this preview. Missing history is unavailable. Best means prioritized within current conditions, not highest guaranteed returns.",
   };
 }

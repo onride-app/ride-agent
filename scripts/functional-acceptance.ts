@@ -447,7 +447,14 @@ try {
               ),
             },
           }
-        : { errors: [{ message: "Fixture identity rejected" }] },
+        : {
+            errors: [
+              {
+                message: "Fixture identity rejected",
+                extensions: { code: "UNAUTHENTICATED" },
+              },
+            ],
+          },
     );
   });
   const graphBase = await listen(graph);
@@ -1858,7 +1865,7 @@ try {
       }
     },
   );
-  await check("41 对话只追问预算和风险，默认不限并同时返回两张表", async () => {
+  await check("41 对话只追问预算和风险，返回对齐数据及简短展示", async () => {
     await repo.transact(users.widget, async (state) => {
       for (const key of Object.keys(state)) delete (state as any)[key];
       Object.assign(state, {
@@ -1913,7 +1920,8 @@ try {
       );
     return {
       two_core_answers: true,
-      two_chat_tables: true,
+      aligned_recommendation_comparison: true,
+      default_brief_display: d.conversation_display.detail === "brief",
       initial_widget: false,
     };
   });
@@ -2037,6 +2045,155 @@ try {
         exact_counts: [1, 2, 3, 4],
         failure_keeps_candidates: true,
         minimum_explained: true,
+      };
+    },
+  );
+  let alternativesAcceptance: any;
+  await check(
+    "46 alternatives 不改原方案，过期只刷新候选，明确换人保留人数和设置",
+    async () => {
+      venue.pool = Array.from({ length: 12 }, (_, i) => candidate(i + 1));
+      const d = (
+        await ok(widgetClient, "recommend_traders", {
+          selection: "system",
+          preferences: {
+            budget_usdc: "30",
+            risk_tolerance: "medium",
+            market: "perps",
+            portfolio_kind: "basket",
+            basket_size: 4,
+          },
+        })
+      ).data;
+      const original = structuredClone(d.plan);
+      const submits = venue.submits.length;
+      const before = await repo.transact(users.widget, async (state) => {
+        state.discovery!.expires_at = 0;
+        return structuredClone({
+          plans: state.plans,
+          preferences: state.preferences,
+          selection: state.selected_trader_ids,
+        });
+      });
+      const browse = (
+        await ok(widgetClient, "browse_traders", {
+          plan_id: original.id,
+          exclude_selected: true,
+          limit: 2,
+        })
+      ).data;
+      assert.equal(browse.plan_unchanged, true);
+      assert.equal(browse.base_plan_id, original.id);
+      assert.equal(browse.candidates.length, 2);
+      assert(
+        browse.candidates.every(
+          (c: any) =>
+            !original.allocations.some((a: any) => a.trader.id === c.id),
+        ),
+      );
+      const after = await repo.transact(users.widget, async (state) =>
+        structuredClone({
+          plans: state.plans,
+          preferences: state.preferences,
+          selection: state.selected_trader_ids,
+        }),
+      );
+      assert.deepEqual(after, before);
+      const swap = (
+        await ok(widgetClient, "recalculate_plan", {
+          plan_id: original.id,
+          replacements: [
+            {
+              outgoing_trader_id: original.allocations[0].trader.id,
+              incoming_trader_id: browse.candidates[0].id,
+            },
+          ],
+        })
+      ).data;
+      assert.equal(swap.plan.allocations.length, 4);
+      assert.deepEqual(swap.plan.preferences, original.preferences);
+      assert.equal(swap.plan_change.before_count, 4);
+      assert.equal(swap.plan_change.after_count, 4);
+      assert.equal(swap.plan_change.measured_portfolio_risk_improvement, null);
+      for (let i = 0; i < 4; i++)
+        for (const key of [
+          "amount_usdc",
+          "leverage_cap",
+          "leverage_mode",
+          "copy_mode",
+          "stop_loss_pct",
+        ])
+          assert.equal(
+            swap.plan.allocations[i][key],
+            original.allocations[i][key],
+          );
+      const saved = (
+        await ok(widgetClient, "get_portfolio", { plan_id: original.id })
+      ).data;
+      assert.deepEqual(saved.plan, original);
+      assert.equal(venue.submits.length, submits);
+      alternativesAcceptance = { original, swap, submits };
+      return {
+        original_plan_preserved: true,
+        alternatives_exclude_selected: true,
+        count_before: 4,
+        count_after: 4,
+        amount_each: "7.500000",
+        real_execution: false,
+      };
+    },
+  );
+  await check(
+    "47 默认简短、规则具体、原方案及换人方案可只读展开说明",
+    async () => {
+      assert(alternativesAcceptance);
+      const { original, swap, submits } = alternativesAcceptance;
+      const plansBefore = await repo.transact(users.widget, async (state) =>
+        structuredClone(state.plans),
+      );
+      const brief = (
+        await ok(widgetClient, "get_portfolio", { plan_id: swap.plan.id })
+      ).data;
+      const detail = (
+        await ok(widgetClient, "get_portfolio", {
+          plan_id: swap.plan.id,
+          detail: "detailed",
+        })
+      ).data;
+      assert.equal(brief.conversation_display.detail, "brief");
+      assert(brief.conversation_display.markdown.length < 1300);
+      assert.match(
+        brief.conversation_display.markdown,
+        /分配资金与源账户权益的比例/,
+      );
+      assert.match(brief.conversation_display.markdown, /不足最小下单额则跳过/);
+      assert.match(brief.conversation_display.markdown, /展开说明/);
+      assert.match(
+        detail.conversation_display.markdown,
+        /目标数量 = 源仓位数量/,
+      );
+      assert.equal(detail.plan_change.base_plan_id, original.id);
+      assert.equal(detail.plan_change.new_plan_id, swap.plan.id);
+      assert.deepEqual(
+        detail.conversation_display.trader_ids,
+        detail.plan.allocations.map((a: any) => a.trader.id),
+      );
+      assert(
+        detail.final_review.traders.every(
+          (t: any) => t.copy_rule.next_order_size === null,
+        ),
+      );
+      const plansAfter = await repo.transact(users.widget, async (state) =>
+        structuredClone(state.plans),
+      );
+      assert.deepEqual(plansAfter, plansBefore);
+      assert.equal(venue.submits.length, submits);
+      return {
+        default_detail: "brief",
+        characters: brief.conversation_display.markdown.length,
+        copy_rule: "allocation_over_verified_source_equity",
+        explanation_is_read_only: true,
+        plan_comparison_identified: true,
       };
     },
   );

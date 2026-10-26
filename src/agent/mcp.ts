@@ -430,7 +430,7 @@ function description(name: ToolName): string {
     set_preferences:
       "Save only supplied user answers, including partial budget/risk answers. Defaults and numeric risk suggestions are marked separately; do not ask for optional settings up front. Existing portfolios are unchanged.",
     recalculate_plan:
-      "Refresh a saved preview or validate edited trader allocations against fresh eligibility, budget and leverage limits. Returns a new frozen plan; no execution.",
+      "For an explicitly selected one-for-one swap, pass plan_id and replacements (outgoing_trader_id/incoming_trader_id); preserve count, slot amounts, copy settings and risk. Do not combine replacements with allocations/preferences. Generic allocations/count edits require an explicit user request. Returns a new immutable preview, original preserved, with plan_change and no execution. detail defaults brief; use get_portfolio with exact plan_id and detail:detailed to explain without recalculating.",
     get_performance:
       "Read persisted accounting snapshots for daily, weekly or inception performance. Historical sleeves remain after replacement; incomplete periods return null profit.",
     diagnose_copy:
@@ -440,15 +440,15 @@ function description(name: ToolName): string {
     set_notification_preferences:
       "Save explicitly requested daily Ride App digest opt-in, local time and IANA timezone. Critical risk alerts remain enabled; this does not authorize trading.",
     recommend_traders:
-      "After get_preferences collect only missing budget/risk in conversation. Show recommended_portfolio and recommended_trader_comparison as two compact chat tables with identical selected trader IDs/order. Do not use the top-five candidate_table as the recommended performance comparison; label candidate discovery separately. Assets default unrestricted, markets default both (either allowed); count is automatically feasible up to four unless user chooses 1–8 or trader_ids. Selections persist across edits; selection:system clears the pinned selection. Show candidates even if plan fails; no funding required. Defaults and risk parameters are suggestions for final Ride confirmation.",
+      "After get_preferences collect only missing budget/risk in conversation. Default to conversation_display.markdown: one brief combined allocation/performance table plus copy-rule and exit-trigger summaries. Both underlying tables retain identical selected trader IDs/order. Offer browse alternatives and expand details; never invent a two-trader alternative. Do not use the top-five candidate_table as the recommended performance comparison; label candidate discovery separately. Assets default unrestricted, markets default both (either allowed); count is automatically feasible up to four unless user chooses 1–8 or trader_ids. Selections persist across edits; selection:system clears the pinned selection. Show candidates even if plan fails; no funding required. Defaults and risk parameters are suggestions for final Ride confirmation.",
     browse_traders:
-      "Page or sort the entire current verified candidate snapshot by score/drawdown/ROI; missing metrics sort last. Default five, request limit:10 for ten more, pass next_cursor with the same sort. compare_ids compares named public IDs. Does not replace the plan, allocations or selections. Disclose source pool limits, metric periods and incomparable/missing data. Refresh expired snapshots through recommend_traders.",
+      "Browse alternatives without changing the saved plan or preferences: pass plan_id and exclude_selected:true to omit its selected traders; absent/expired snapshots refresh on a request without cursor. detail defaults brief. Page or sort the entire current verified candidate snapshot by score/drawdown/ROI; missing metrics sort last. Default five, request limit:10 for ten more, pass next_cursor with the same sort. compare_ids compares named public IDs. Does not replace the plan, allocations or selections. Disclose source pool limits, metric periods and incomparable/missing data. Refresh expired snapshots by browsing without a cursor; never generate a replacement plan to browse.",
     get_trader_profile:
       "Read verified source statistics and actual Copy Score components using a public trader ID.",
     start_copy:
       "Create an expiring start proposal. Human confirmation in Ride is required unless bounded Ride authority applies.",
     get_portfolio:
-      "Read the signed-in account, per-market account balances, Agent portfolio and existing Ride App copies and positions. Account funds and copy allocation remaining are distinct; unavailable modules are null, not zero. An empty Agent portfolio still confirms login. App copies remain separately managed in Ride. Missing values are null.",
+      "Read an owned saved preview by plan_id, optionally detail:detailed for explanations or detail:brief to collapse; never regenerates that plan or changes preferences. Without plan_id, read current owned portfolio/last saved preview. Show conversation_display.markdown concisely and distinguish preview from actual execution.",
     update_copy:
       "Propose amount, leverage cap, sleeve loss trigger or an explicit eligible replacement. Released funds must be verified.",
     stop_copy:

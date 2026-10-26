@@ -61,6 +61,7 @@ import {
   conversationView,
 } from "./discovery.js";
 import { FundingService } from "./funding.js";
+import { planChange, type Detail } from "./conversation-presentation.js";
 
 export class AgentService {
   get funding() {
@@ -123,13 +124,35 @@ export class AgentService {
     }
     if (name === "browse_traders") {
       return this.repository.transact(user, async (s) => {
-        const pref = completePreferences(s);
+        const base = args.plan_id
+          ? s.plans.find((p) => p.id === args.plan_id)
+          : args.exclude_selected
+            ? s.plans.at(-1)
+            : undefined;
+        if ((args.plan_id || args.exclude_selected) && !base)
+          throw new AgentError(
+            "NOT_FOUND",
+            "Saved plan not found for this account.",
+            false,
+            404,
+          );
+        const pref = base
+          ? normalizedAssetPreferences(
+              base.preferences,
+              base.asset_filter_version ?? 1,
+            )
+          : completePreferences(s);
         if (!pref)
           return result(
             { preference_collection: preferenceCollection(s) },
             "requires_preferences",
           );
-        if (!s.discovery && !args.cursor)
+        if (
+          !args.cursor &&
+          (!s.discovery ||
+            s.discovery.expires_at <= now() ||
+            s.discovery.preference_hash !== fingerprint(pref))
+        )
           saveDiscovery(s, pref, await this.adapter.candidates(pref.market));
         return result(browse(s, pref, args as any, user, this.cursor));
       });
@@ -450,6 +473,7 @@ export class AgentService {
               collection,
               eligibleCandidates(pref, pool),
               !!selectedIds,
+              args.detail as Detail,
             ),
             plan,
             preferences: pref,
@@ -626,6 +650,45 @@ export class AgentService {
             false,
             404,
           );
+        const replacements = args.replacements as
+          | { outgoing_trader_id: string; incoming_trader_id: string }[]
+          | undefined;
+        const replacedSlots = new Map<
+          string,
+          (typeof previous.allocations)[number]
+        >();
+        if (replacements) {
+          const outgoing = new Set(
+            replacements.map((r) => r.outgoing_trader_id),
+          );
+          const incoming = new Set(
+            replacements.map((r) => r.incoming_trader_id),
+          );
+          if (
+            outgoing.size !== replacements.length ||
+            incoming.size !== replacements.length
+          )
+            throw new AgentError(
+              "INVALID_REPLACEMENT",
+              "Each outgoing and incoming trader must be unique.",
+            );
+          for (const r of replacements) {
+            const slot = previous.allocations.find(
+              (a) => a.trader.id === r.outgoing_trader_id,
+            );
+            if (
+              !slot ||
+              previous.allocations.some(
+                (a) => a.trader.id === r.incoming_trader_id,
+              )
+            )
+              throw new AgentError(
+                "INVALID_REPLACEMENT",
+                "Replace an existing selected trader with an unselected trader; the original plan is unchanged.",
+              );
+            replacedSlots.set(r.incoming_trader_id, slot);
+          }
+        }
         const previousPreferences = normalizedAssetPreferences(
           previous.preferences,
           previous.asset_filter_version ?? 1,
@@ -643,13 +706,22 @@ export class AgentService {
         const pref = args.preferences
           ? preferences.parse(editCollection.answers)
           : previousPreferences;
-        const requested = (args.allocations ??
-          previous.allocations.map((x) => ({
-            trader_id: x.trader.id,
-            amount_usdc: x.amount_usdc,
-            leverage_cap: x.leverage_cap,
-            stop_loss_pct: x.stop_loss_pct,
-          }))) as {
+        const requested = (
+          replacements
+            ? previous.allocations.map((a) => ({
+                trader_id:
+                  replacements.find((r) => r.outgoing_trader_id === a.trader.id)
+                    ?.incoming_trader_id ?? a.trader.id,
+                amount_usdc: a.amount_usdc,
+              }))
+            : (args.allocations ??
+              previous.allocations.map((x) => ({
+                trader_id: x.trader.id,
+                amount_usdc: x.amount_usdc,
+                leverage_cap: x.leverage_cap,
+                stop_loss_pct: x.stop_loss_pct,
+              })))
+        ) as {
           trader_id: string;
           amount_usdc: string;
           leverage_cap?: number | null;
@@ -684,6 +756,7 @@ export class AgentService {
           requested.map((x) => this.adapter.profile(x.trader_id)),
         );
         const plan = recommend(effectivePref, pool);
+        plan.previous_plan_id = previous.id;
         plan.preference_sources = args.preferences
           ? editCollection.sources
           : previous.preference_sources;
@@ -699,9 +772,9 @@ export class AgentService {
             "Allocations exceed the requested budget.",
           );
         plan.allocations = requested.map((x, i) => {
-          const prior = previous.allocations.find(
-            (a) => a.trader.id === x.trader_id,
-          );
+          const prior =
+            previous.allocations.find((a) => a.trader.id === x.trader_id) ??
+            replacedSlots.get(x.trader_id);
           const settings = {
             ...prior,
             ...((args.preferences as Partial<Preferences>) ?? {}),
@@ -798,7 +871,7 @@ export class AgentService {
             s,
             preferenceCollection(s, args.preferences as Partial<Preferences>),
           );
-        if (args.allocations && pref.portfolio_kind)
+        if ((args.allocations || replacements) && pref.portfolio_kind)
           s.selected_trader_ids = requested.map((x) => x.trader_id);
         const sourcePool = await this.adapter.candidates(pref.market);
         const candidates = eligibleCandidates(pref, sourcePool);
@@ -811,6 +884,8 @@ export class AgentService {
               editCollection,
               candidates,
               !!s.selected_trader_ids,
+              args.detail as Detail,
+              previous,
             ),
             plan,
             candidates,
@@ -841,6 +916,12 @@ export class AgentService {
                     .candidates_meta
                 : null,
             previous_plan_id: previous.id,
+            plan_change: planChange(previous, plan),
+            edit_kind: replacements
+              ? "one_for_one_replacement"
+              : args.allocations || args.preferences
+                ? "explicit_edit"
+                : "refresh",
             requires_new_confirmation: true,
             unallocated_usdc: cash(D(pref.budget_usdc).minus(total)),
             portfolio_historical_drawdown_pct: null,
@@ -1023,6 +1104,39 @@ export class AgentService {
         );
       }
       if (name === "get_portfolio") {
+        if (args.plan_id) {
+          const plan = s.plans.find((p) => p.id === args.plan_id);
+          if (!plan)
+            throw new AgentError(
+              "NOT_FOUND",
+              "Saved plan not found for this account.",
+              false,
+              404,
+            );
+          const previous = s.plans.find((p) => p.id === plan.previous_plan_id);
+          return result({
+            ...conversationView(
+              plan,
+              preferenceCollection({
+                ...s,
+                preferences: plan.preferences,
+                preference_sources:
+                  plan.preference_sources ?? s.preference_sources,
+                preference_draft: undefined,
+              }),
+              plan.allocations.map((a) => a.trader),
+              !!s.selected_trader_ids?.length,
+              args.detail as Detail,
+              previous,
+            ),
+            plan,
+            compatibility: compatibility(plan),
+            ...(previous ? { plan_change: planChange(previous, plan) } : {}),
+            read_only: true,
+            plan_unchanged: true,
+            plan_status: plan.expires_at > now() ? "ready" : "expired",
+          });
+        }
         const p = findPortfolio(s, args.portfolio_id as string | undefined);
         if (!p) {
           if (args.portfolio_id) return result({ portfolio: null }, "empty");
@@ -1036,6 +1150,8 @@ export class AgentService {
                     preferenceCollection(s),
                     plan.allocations.map((a) => a.trader),
                     !!s.selected_trader_ids?.length,
+                    args.detail as Detail,
+                    s.plans.find((p) => p.id === plan.previous_plan_id),
                   ),
                   recovery: {
                     source: "saved_preview",
