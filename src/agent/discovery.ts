@@ -190,9 +190,29 @@ export function browse(
     limit = args.limit ?? 5,
     page = rows.slice(offset, offset + limit);
   const next = offset + page.length;
+  const availability = page.length
+    ? "available"
+    : !snapshot.candidates.length
+      ? "source_empty"
+      : rows.length
+        ? "end_of_results"
+        : "no_matching_candidates";
   return {
     view_kind: "candidate_browse",
-    conversation_display: candidateDisplay(page, plan, args.detail),
+    conversation_display: candidateDisplay(
+      page,
+      plan,
+      args.detail,
+      availability,
+    ),
+    candidate_availability: {
+      status: availability,
+      source_count: snapshot.candidates.length || null,
+      eligible_count: snapshot.candidates.length ? allowed.length : null,
+      matching_count: snapshot.candidates.length ? rows.length : null,
+      instruction:
+        "来源未返回可用数据时，不将其解释为预算不足或市场没有 trader；保留原方案，稍后只刷新候选。",
+    },
     base_plan_id: plan?.id ?? null,
     base_trader_ids: [...selected],
     excluded_selected_traders: args.exclude_selected ?? false,
