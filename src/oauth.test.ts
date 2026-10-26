@@ -12,6 +12,7 @@ import {
   type PrivyAuthorizationInput,
 } from "./oauth.js";
 import { createRideHttpApp, requestBodyErrorHandler } from "./http_security.js";
+import { AgentError } from "./agent/contracts.js";
 
 const client: OAuthClientInformationFull = {
   client_id: "test-client",
@@ -141,30 +142,75 @@ async function consentHtml(scopes = ["ride:read", "ride:trade"]) {
   );
   return html;
 }
-function consentPage(html: string, store: Map<string, string>, href: string) {
+function consentPage(
+  html: string,
+  store: Map<string, string>,
+  href: string,
+  options: {
+    user?: any;
+    create?: (input: any) => Promise<any>;
+    loadFrame?: boolean;
+    ping?: () => Promise<boolean>;
+  } = {},
+) {
   const elements = new Map<string, any>();
   const generated: any[] = [],
     completed: any[] = [],
     approved: any[] = [],
     redirects: string[] = [];
-  const currentUser = {
+  let currentUser = options.user ?? {
     id: "did:privy:fixture",
     linkedAccounts: [
       {
         type: "wallet",
         chainType: "ethereum",
         walletClientType: "privy",
-        address: "0xfixture",
+        address: "0x1111111111111111111111111111111111111111",
         id: "wallet_fixture",
       },
       { type: "apple_oauth", email: "fixture@privaterelay.appleid.com" },
     ],
   };
+  let token = "fixture-privy-token";
+  const created: any[] = [],
+    posters: any[] = [],
+    frames: any[] = [],
+    walletMessages: any[] = [];
+  const windowListeners = new Map<string, Set<(event: any) => void>>();
   class MockPrivy {
     async initialize() {}
     async getAccessToken() {
-      return "fixture-privy-token";
+      return token;
     }
+    setMessagePoster(poster: any) {
+      posters.push(poster);
+    }
+    embeddedWallet = {
+      getURL: () => "https://auth.privy.test/wallet",
+      ping: options.ping ?? (async () => true),
+      onMessage: (message: any) => walletMessages.push(message),
+      add: async () => {
+        throw Error("SDK add must never be used to create the first wallet");
+      },
+      create: async (input: any) => {
+        created.push(input);
+        if (options.create) return options.create(input);
+        currentUser = {
+          ...currentUser,
+          linkedAccounts: [
+            ...(currentUser.linkedAccounts ?? []),
+            {
+              type: "wallet",
+              chainType: "ethereum",
+              walletClientType: "privy",
+              address: "0x2222222222222222222222222222222222222222",
+              id: "wallet_new_fixture",
+            },
+          ],
+        };
+        return { user: currentUser };
+      },
+    };
     user = { get: async () => ({ user: currentUser }) };
     auth = {
       oauth: {
@@ -181,9 +227,34 @@ function consentPage(html: string, store: Map<string, string>, href: string) {
   }
   const context: any = {
     URL,
+    atob: (value: string) => Buffer.from(value, "base64").toString("utf8"),
+    setTimeout,
+    clearTimeout,
     Privy: MockPrivy,
     LocalStorage: class {},
     document: {
+      createElement(tag: string) {
+        assert.equal(tag, "iframe");
+        const listeners = new Map<string, () => void>();
+        return {
+          contentWindow: { postMessage() {} },
+          listeners,
+          removed: false,
+          addEventListener: (name: string, listener: () => void) =>
+            listeners.set(name, listener),
+          remove() {
+            this.removed = true;
+          },
+        };
+      },
+      body: {
+        append(frame: any) {
+          frames.push(frame);
+          assert.ok(windowListeners.get("message")?.size);
+          if (options.loadFrame !== false)
+            queueMicrotask(() => frame.listeners.get("load")?.());
+        },
+      },
       getElementById(id: string) {
         if (!elements.has(id))
           elements.set(id, {
@@ -200,6 +271,13 @@ function consentPage(html: string, store: Map<string, string>, href: string) {
       },
     },
     window: {
+      addEventListener(name: string, listener: (event: any) => void) {
+        if (!windowListeners.has(name)) windowListeners.set(name, new Set());
+        windowListeners.get(name)!.add(listener);
+      },
+      removeEventListener(name: string, listener: (event: any) => void) {
+        windowListeners.get(name)?.delete(listener);
+      },
       location: {
         href,
         origin: new URL(href).origin,
@@ -231,13 +309,29 @@ function consentPage(html: string, store: Map<string, string>, href: string) {
       "handleOAuthCallback().catch",
       "globalThis.callbackPromise = handleOAuthCallback().catch",
     );
-  runInNewContext(script, context);
+  runInNewContext(
+    script +
+      "\nglobalThis.auth = {initPrivy, ensureEmbeddedEthereumWallet, finishPrivySession, formatAuthError};",
+    context,
+  );
   return {
     elements,
     generated,
     completed,
     approved,
     redirects,
+    created,
+    frames,
+    posters,
+    walletMessages,
+    windowListeners,
+    auth: context.auth,
+    setUser: (user: any) => {
+      currentUser = user;
+    },
+    setToken: (next: string) => {
+      token = next;
+    },
     callback: context.callbackPromise,
   };
 }
@@ -311,6 +405,259 @@ it("keeps old Google callbacks working while rejecting unsupported stored provid
     invalid.elements.get("status").textContent,
     /Choose Google or Apple/,
   );
+});
+
+const newPrivyUser = (id = "did:privy:new-fixture") => ({
+  id,
+  linkedAccounts: [
+    { type: "apple_oauth", email: "new@privaterelay.appleid.com" },
+  ],
+});
+const withEmbeddedWallet = (user: ReturnType<typeof newPrivyUser>) => ({
+  ...user,
+  linkedAccounts: [
+    ...user.linkedAccounts,
+    {
+      type: "wallet",
+      chainType: "ethereum",
+      walletClientType: "privy-v2",
+      address: "0x3333333333333333333333333333333333333333",
+      id: "wallet_recovered_fixture",
+    },
+  ],
+});
+
+it("initializes the first wallet for both social providers before requesting Ride authorization", async () => {
+  const html = await consentHtml();
+  for (const provider of ["GOOGLE", "APPLE"]) {
+    const fresh = newPrivyUser();
+    const page = consentPage(
+      html,
+      new Map([["ride:auth:provider", provider]]),
+      "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+      { user: fresh },
+    );
+    await page.callback;
+    assert.equal(page.frames.length, 1);
+    assert.equal(page.posters.length, 1);
+    assert.equal(page.created.length, 1);
+    assert.equal(
+      page.created[0].idempotencyKey,
+      "ride_embedded_ethereum_" + fresh.id,
+    );
+    assert.equal(page.approved.length, 1);
+    assert.equal(page.approved[0].auth_provider, provider);
+    assert.equal(
+      page.approved[0].wallet_address,
+      "0x2222222222222222222222222222222222222222",
+    );
+    assert.equal(page.approved[0].privy_wallet_id, "wallet_new_fixture");
+  }
+});
+
+it("refreshes and reuses existing wallets, including Privy v2, without creating another", async () => {
+  const fresh = newPrivyUser();
+  const existing = withEmbeddedWallet(fresh);
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize",
+    { user: existing },
+  );
+  await page.callback;
+  const client = await page.auth.initPrivy();
+  const result = await page.auth.ensureEmbeddedEthereumWallet(client, fresh);
+  assert.equal(result.wallet.id, "wallet_recovered_fixture");
+  assert.equal(page.created.length, 0);
+  assert.equal(page.frames.length, 0);
+});
+
+it("blocks malformed linked wallets without creating a replacement or claiming the login expired", async () => {
+  for (const address of ["", "0xinvalid"]) {
+    const user = withEmbeddedWallet(newPrivyUser());
+    Object.assign(user.linkedAccounts[1], { address });
+    const page = consentPage(
+      await consentHtml(),
+      new Map(),
+      "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+      { user },
+    );
+    await page.callback;
+    assert.equal(page.created.length, 0);
+    assert.equal(page.approved.length, 0);
+    assert.match(
+      page.elements.get("status").textContent,
+      /wallet details could not be verified/,
+    );
+    assert.doesNotMatch(page.elements.get("status").textContent, /expired/);
+  }
+});
+
+it("checks for a wallet after an unknown creation response and retries without a second wallet", async () => {
+  const fresh = newPrivyUser();
+  let page: ReturnType<typeof consentPage>;
+  page = consentPage(
+    await consentHtml(),
+    new Map([["ride:auth:provider", "APPLE"]]),
+    "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+    {
+      user: fresh,
+      create: async () => {
+        page.setUser(withEmbeddedWallet(fresh));
+        throw Error("Operation reached timeout");
+      },
+    },
+  );
+  await page.callback;
+  assert.equal(page.created.length, 1);
+  assert.equal(page.approved.length, 0);
+  assert.match(
+    page.elements.get("status").textContent,
+    /wallet setup could not be verified/,
+  );
+  assert.doesNotMatch(
+    page.elements.get("status").textContent,
+    /expired|account has not been changed/,
+  );
+  assert.equal(page.elements.get("wallet-setup-retry").hidden, false);
+  await page.elements.get("wallet-setup-retry").listeners.click();
+  assert.equal(page.created.length, 1);
+  assert.equal(page.completed.length, 1);
+  assert.equal(page.approved.length, 1);
+  assert.equal(
+    page.approved[0].wallet_address,
+    "0x3333333333333333333333333333333333333333",
+  );
+});
+
+it("deduplicates concurrent setup and keeps the idempotency key stable across a renewed session", async () => {
+  const fresh = newPrivyUser();
+  let complete: (value: any) => void = () => {};
+  let first = true;
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize",
+    {
+      user: fresh,
+      create: async () => {
+        if (first)
+          return new Promise((resolve) => {
+            complete = resolve;
+          });
+        return { user: withEmbeddedWallet(fresh) };
+      },
+    },
+  );
+  await page.callback;
+  const client = await page.auth.initPrivy();
+  const one = page.auth.ensureEmbeddedEthereumWallet(client, fresh);
+  const two = page.auth.ensureEmbeddedEthereumWallet(client, fresh);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.created.length, 1);
+  complete({ user: withEmbeddedWallet(fresh) });
+  await Promise.all([one, two]);
+  first = false;
+  page.setToken("renewed-session-fixture-token");
+  await page.auth.ensureEmbeddedEthereumWallet(client, fresh);
+  assert.equal(page.created.length, 2);
+  assert.equal(page.created[0].idempotencyKey, page.created[1].idempotencyKey);
+  assert.equal(page.frames[0].removed, true);
+});
+
+it("discards stale setup results when identity changes and isolates the next user's wallet", async () => {
+  const original = newPrivyUser("did:privy:original-fixture");
+  const other = newPrivyUser("did:privy:other-fixture");
+  let complete: (value: any) => void = () => {};
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize",
+    {
+      user: original,
+      create: async (input) =>
+        input.idempotencyKey.endsWith(original.id)
+          ? new Promise((resolve) => {
+              complete = resolve;
+            })
+          : { user: withEmbeddedWallet(other) },
+    },
+  );
+  await page.callback;
+  const finishing = page.auth.finishPrivySession({ user: original }, "APPLE");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(page.created.length, 1);
+  page.setUser(other);
+  page.setToken("other-session-token");
+  complete({ user: withEmbeddedWallet(original) });
+  await assert.rejects(finishing, /account changed during wallet setup/);
+  assert.equal(page.approved.length, 0);
+  assert.equal(page.frames[0].removed, true);
+  await page.auth.finishPrivySession({ user: other }, "GOOGLE");
+  assert.equal(page.created.length, 2);
+  assert.notEqual(
+    page.created[0].idempotencyKey,
+    page.created[1].idempotencyKey,
+  );
+  assert.equal(page.approved.length, 1);
+  assert.equal(page.approved[0].privy_id, other.id);
+});
+
+it("accepts wallet frame messages only from its exact secure origin and content window", async () => {
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+    { user: newPrivyUser() },
+  );
+  await page.callback;
+  const frame = page.frames[0];
+  const handlers = page.windowListeners.get("message")!;
+  const message = { id: "fixture", event: "privy:iframe:ready", data: {} };
+  for (const handler of handlers) {
+    handler({
+      source: frame.contentWindow,
+      origin: "https://attacker.test",
+      data: message,
+    });
+    handler({ source: {}, origin: "https://auth.privy.test", data: message });
+    handler({
+      source: frame.contentWindow,
+      origin: "https://auth.privy.test",
+      data: "invalid json",
+    });
+  }
+  assert.equal(page.walletMessages.length, 0);
+  for (const handler of handlers)
+    handler({
+      source: frame.contentWindow,
+      origin: "https://auth.privy.test",
+      data: JSON.stringify(message),
+    });
+  assert.deepEqual(JSON.parse(JSON.stringify(page.walletMessages)), [message]);
+});
+
+it("cleans up a failed secure frame and retries setup without restarting OAuth", async () => {
+  let pingCount = 0;
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+    {
+      user: newPrivyUser(),
+      ping: async () => pingCount++ > 0,
+    },
+  );
+  await page.callback;
+  assert.equal(page.created.length, 0);
+  assert.equal(page.approved.length, 0);
+  assert.equal(page.frames[0].removed, true);
+  assert.equal(page.windowListeners.get("message")!.size, 0);
+  await page.elements.get("wallet-setup-retry").listeners.click();
+  assert.equal(page.frames.length, 2);
+  assert.equal(page.created.length, 1);
+  assert.equal(page.completed.length, 1);
+  assert.equal(page.approved.length, 1);
 });
 
 describe("Ride OAuth scope enforcement", () => {
@@ -521,6 +868,48 @@ describe("Ride OAuth approval redirects", () => {
       redirect: "manual",
     });
     assert.equal(formResponse.status, 302);
+  });
+
+  it("preserves typed registration, authentication and service failures on OAuth approval", async () => {
+    for (const error of [
+      new AgentError(
+        "USER_REGISTRATION_DISABLED",
+        "New account registration is temporarily unavailable.",
+        false,
+        403,
+      ),
+      new AgentError(
+        "AUTH_SERVICE_UNAVAILABLE",
+        "Sign-in is temporarily unavailable.",
+        true,
+        503,
+      ),
+      new AgentError("AUTH_REQUIRED", "Sign in again.", false, 401),
+    ]) {
+      const provider = createProvider(() => {
+        throw error;
+      });
+      await provider.clientsStore.registerClient!(client);
+      const baseUrl = await startApprovalServer(provider);
+      const response = await fetch(`${baseUrl}/auth/privy/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_id: client.client_id,
+          redirect_uri: client.redirect_uris[0],
+          code_challenge: "challenge",
+          privy_id: "did:privy:fixture",
+          privy_access_token: "fixture-token",
+        }),
+      });
+      assert.equal(response.status, error.httpStatus);
+      assert.deepEqual(await response.json(), {
+        error: "authorization_failed",
+        code: error.code,
+        retryable: error.retryable,
+        message: error.message,
+      });
+    }
   });
 
   it("accepts only supported providers and defaults existing OAuth clients to Google", async () => {

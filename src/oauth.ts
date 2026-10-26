@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import express from "express";
 import type { Request, Response } from "express";
 import { createClient, type RedisClientType } from "redis";
+import { AgentError } from "./agent/contracts.js";
 
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
@@ -730,7 +731,11 @@ export function createRideOAuthApprovalRouter(provider: RideOAuthProvider): expr
       res.json({ redirectUrl: target.toString() });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Authorization failed.";
-      res.status(400).json({ error: "authorization_failed", message });
+      res.status(error instanceof AgentError ? error.httpStatus : 400).json({
+        error: "authorization_failed",
+        message,
+        ...(error instanceof AgentError ? {code: error.code, retryable: error.retryable} : {}),
+      });
     }
   });
 
@@ -892,6 +897,7 @@ function renderAuthorizePage(
           Continue with Google
         </button>
         <button id="apple-login" class="apple" type="button">Continue with Apple</button>
+        <button id="wallet-setup-retry" class="google" type="button" hidden>Retry wallet setup</button>
       </div>
       <div id="status" class="status" aria-live="polite"></div>
     </form>
@@ -931,9 +937,12 @@ function renderAuthorizePage(
     const statusEl = document.getElementById('status');
     const googleLoginButton = document.getElementById('google-login');
     const appleLoginButton = document.getElementById('apple-login');
+    const walletRetryButton = document.getElementById('wallet-setup-retry');
 
     let privy;
     let privyInitialization;
+    let walletContext;
+    let walletInitialization;
 
     function setStatus(message, isError = false) {
       statusEl.textContent = message;
@@ -942,6 +951,7 @@ function renderAuthorizePage(
 
     function formatAuthError(error) {
       const message = error?.message || String(error);
+      if (error?.code?.startsWith('WALLET_SETUP')) return message;
       if (message.includes('Redirect URL is not allowed')) {
         return 'Redirect URL is not allowed. Add ' + window.location.origin + '/auth/privy/oauth/callback in Privy Advanced -> Allowed OAuth redirect URLs.';
       }
@@ -949,6 +959,11 @@ function renderAuthorizePage(
         return 'The connection to Privy timed out. Check your network or proxy, then retry signing in. Your account has not been changed.';
       }
       return message;
+    }
+
+    function showAuthError(error) {
+      walletRetryButton.hidden = !error?.code?.startsWith('WALLET_SETUP');
+      setStatus(formatAuthError(error), true);
     }
 
     function setBusy(button, busy) {
@@ -1011,9 +1026,8 @@ function renderAuthorizePage(
         return (
           account?.type === 'wallet' &&
           chainType === 'ethereum' &&
-          account?.address &&
           (
-            accountValue(account, 'walletClientType', 'wallet_client_type') === 'privy' ||
+            ['privy', 'privy-v2'].includes(accountValue(account, 'walletClientType', 'wallet_client_type')) ||
             accountValue(account, 'connectorType', 'connector_type') === 'embedded'
           )
         );
@@ -1026,22 +1040,136 @@ function renderAuthorizePage(
       return wallets[0];
     }
 
+    function walletSetupError(message, code = 'WALLET_SETUP_INCOMPLETE') {
+      return Object.assign(new Error(message), {code});
+    }
+
+    async function walletSession(client, expectedId) {
+      const current = (await client.user.get()).user;
+      const token = await client.getAccessToken();
+      if (!current?.id || current.id !== expectedId || !token) {
+        walletContext?.dispose();
+        walletContext = walletInitialization = undefined;
+        throw walletSetupError('Your Ride account changed during wallet setup. Sign in again.', 'ACCOUNT_CHANGED');
+      }
+      // A refreshed access token retains its session ID. Tokens stay in memory.
+      let sessionId = token;
+      try {
+        const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        if (payload.sid) sessionId = payload.sid;
+      } catch { /* Older clients may return an opaque token. */ }
+      const scope = expectedId + ':' + sessionId;
+      if (walletContext && walletContext.scope !== scope) {
+        walletContext.dispose();
+        walletContext = walletInitialization = undefined;
+      }
+      return {user: current, scope, token};
+    }
+
+    async function prepareWalletContext(client, scope) {
+      if (walletContext?.scope === scope) return walletContext.ready;
+      walletContext?.dispose();
+      const iframe = document.createElement('iframe');
+      iframe.hidden = true;
+      iframe.loading = 'eager';
+      iframe.title = 'Privy secure wallet';
+      const url = new URL(client.embeddedWallet.getURL());
+      if (url.protocol !== 'https:') throw new Error('Secure wallet origin unavailable.');
+      let timer;
+      let rejectLoad;
+      const loaded = new Promise((resolve, reject) => {
+        rejectLoad = reject;
+        iframe.addEventListener('load', resolve, {once: true});
+        timer = setTimeout(() => reject(new Error('Secure wallet load timed out.')), 15000);
+      });
+      const onMessage = (event) => {
+        if (event.source !== iframe.contentWindow || event.origin !== url.origin) return;
+        try {
+          Promise.resolve(client.embeddedWallet.onMessage(typeof event.data === 'string' ? JSON.parse(event.data) : event.data)).catch(() => {});
+        } catch { /* Ignore unrelated frame messages. */ }
+      };
+      const context = {
+        scope,
+        dispose() {
+          clearTimeout(timer);
+          rejectLoad(new Error('Secure wallet context closed.'));
+          window.removeEventListener('message', onMessage);
+          iframe.remove();
+        },
+        ready: loaded.then(async () => {
+          clearTimeout(timer);
+          if (!(await client.embeddedWallet.ping(10000))) throw new Error('Secure wallet did not respond.');
+        })
+      };
+      walletContext = context;
+      context.ready.catch(() => {});
+      try {
+        client.setMessagePoster({
+          postMessage: (message, _origin, transfer) => iframe.contentWindow?.postMessage(message, url.origin, transfer),
+          reload: () => { iframe.src = client.embeddedWallet.getURL(); }
+        });
+        window.addEventListener('message', onMessage);
+        iframe.src = url.href;
+        document.body.append(iframe);
+        await context.ready;
+      } catch (error) {
+        context.dispose();
+        if (walletContext === context) walletContext = undefined;
+        throw error;
+      }
+    }
+
     async function ensureEmbeddedEthereumWallet(client, user) {
-      let wallet = getEmbeddedEthereumWallet(user);
-      if (wallet) return {user, wallet};
-
-      if (!client.embeddedWallet?.add) {
-        throw new Error('Privy login did not return an embedded wallet.');
-      }
-
-      setStatus('Creating Ride wallet...');
-      const result = await client.embeddedWallet.add({chainType: 'ethereum'});
-      const refreshedUser = result?.user || (await client.user.get()).user || user;
-      wallet = getEmbeddedEthereumWallet(refreshedUser);
-      if (!wallet?.address) {
-        throw new Error('Privy did not return an embedded wallet address.');
-      }
-      return {user: refreshedUser, wallet};
+      const state = await walletSession(client, user.id);
+      const existing = getEmbeddedEthereumWallet(state.user);
+      const reuse = (currentUser, wallet) => {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(wallet?.address || ''))
+          throw walletSetupError('Your Ride wallet details could not be verified. Retry wallet setup to check this same wallet. Wallet setup does not transfer funds.');
+        return {user: currentUser, wallet, scope: state.scope};
+      };
+      if (existing) return reuse(state.user, existing);
+      if (walletInitialization?.scope === state.scope) return walletInitialization.promise;
+      const setup = {scope: state.scope, promise: undefined};
+      walletInitialization = setup;
+      setup.promise = (async () => {
+        try {
+          setStatus('Creating Ride wallet...');
+          await prepareWalletContext(client, state.scope);
+          const before = await walletSession(client, user.id);
+          if (before.scope !== state.scope) throw walletSetupError('Your Ride sign-in session changed during wallet setup. Sign in again.', 'ACCOUNT_CHANGED');
+          const found = getEmbeddedEthereumWallet(before.user);
+          if (found) return reuse(before.user, found);
+          const solana = linkedAccounts(before.user).find((account) =>
+            account?.type === 'wallet' && accountValue(account, 'chainType', 'chain_type') === 'solana' &&
+            (['privy', 'privy-v2'].includes(accountValue(account, 'walletClientType', 'wallet_client_type')) ||
+              accountValue(account, 'connectorType', 'connector_type') === 'embedded')
+          );
+          // Reuse this key after unknown responses, reloads and renewed sessions.
+          const creation = client.embeddedWallet.create({
+            idempotencyKey: 'ride_embedded_ethereum_' + user.id,
+            ...(solana ? {solanaAccount: solana} : {})
+          });
+          let timer;
+          const result = await Promise.race([
+            creation,
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Wallet setup timed out.')), 45000); })
+          ]).finally(() => clearTimeout(timer));
+          const after = await walletSession(client, user.id);
+          if (after.scope !== state.scope || (result?.user?.id && result.user.id !== user.id))
+            throw walletSetupError('Your Ride account changed during wallet setup. Sign in again.', 'ACCOUNT_CHANGED');
+          const refreshedUser = getEmbeddedEthereumWallet(after.user) ? after.user : result?.user;
+          const wallet = getEmbeddedEthereumWallet(refreshedUser);
+          if (!/^0x[0-9a-fA-F]{40}$/.test(wallet?.address || ''))
+            throw new Error('Privy did not return an embedded Ethereum wallet address.');
+          return {user: refreshedUser, wallet, scope: state.scope};
+        } catch (error) {
+          if (error?.code === 'ACCOUNT_CHANGED') throw error;
+          throw walletSetupError('Ride sign-in succeeded, but wallet setup could not be verified. Retry wallet setup to check the same wallet. Wallet setup does not transfer funds.');
+        } finally {
+          if (walletInitialization === setup) walletInitialization = undefined;
+        }
+      })();
+      return setup.promise;
     }
 
     async function approveWithPrivy(user, privyAccessToken, wallet, authProvider) {
@@ -1072,9 +1200,10 @@ function renderAuthorizePage(
       const walletResult = await ensureEmbeddedEthereumWallet(client, user);
       user = walletResult.user;
       setStatus('Getting Rider authorization...');
-      const privyAccessToken = await client.getAccessToken();
-      if (!privyAccessToken) throw new Error('Could not get Privy access token.');
-      await approveWithPrivy(user, privyAccessToken, walletResult.wallet, authProvider);
+      const authorization = await walletSession(client, user.id);
+      if (authorization.scope !== walletResult.scope)
+        throw walletSetupError('Your Ride sign-in session changed during wallet setup. Sign in again.', 'ACCOUNT_CHANGED');
+      await approveWithPrivy(user, authorization.token, walletResult.wallet, authProvider);
     }
 
     function loginProvider() {
@@ -1119,7 +1248,7 @@ function renderAuthorizePage(
         if (!response?.url) throw new Error(label + ' sign-in URL was not returned.');
         window.location.assign(response.url);
       } catch (error) {
-        setStatus(formatAuthError(error), true);
+        showAuthError(error);
         setBusy(googleLoginButton, false);
         setBusy(appleLoginButton, false);
       }
@@ -1127,9 +1256,19 @@ function renderAuthorizePage(
 
     googleLoginButton.addEventListener('click', () => startOAuthLogin('GOOGLE', googleLoginButton));
     appleLoginButton.addEventListener('click', () => startOAuthLogin('APPLE', appleLoginButton));
+    walletRetryButton.addEventListener('click', async () => {
+      setBusy(walletRetryButton, true);
+      try {
+        await finishPrivySession(undefined, loginProvider());
+      } catch (error) {
+        showAuthError(error);
+      } finally {
+        setBusy(walletRetryButton, false);
+      }
+    });
 
     handleOAuthCallback().catch((error) => {
-      setStatus(formatAuthError(error), true);
+      showAuthError(error);
     });
   </script>
 </body>

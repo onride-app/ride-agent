@@ -264,6 +264,9 @@ main.app-auth {
   gap: 12px;
   margin: 0 auto;
 }
+.app-auth [hidden] {
+  display: none !important;
+}
 .app-auth .auth-providers button,
 .app-auth .auth-actions button,
 .app-auth #sign-in,

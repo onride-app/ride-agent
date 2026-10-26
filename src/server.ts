@@ -30,6 +30,7 @@ import { validateCoreIdentity } from "./agent/backend.js";
 import { AgentError, mutationTools } from "./agent/contracts.js";
 import { VERSION } from "./version.js";
 import { requestDiagnostics } from "./request_diagnostics.js";
+import { exchangePrivyForRide } from "./auth_exchange.js";
 
 async function main(): Promise<void> {
   const required = (key: string) => {
@@ -63,48 +64,8 @@ async function main(): Promise<void> {
       "https://esm.sh/@privy-io/js-sdk-core@0.67.0",
     manualTokenAuthEnabled: false,
   };
-  const exchange = async (input: PrivyAuthorizationInput) => {
-    const response = await fetch(graphql, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query:
-          "mutation AgentLogin($input:SyncPrivyUserInput!){syncPrivyUser(input:$input){accessToken user{id username}}}",
-        variables: {
-          input: {
-            ...input,
-            authProvider: input.authProvider ?? "GOOGLE",
-            appVersion: "1.0.0",
-            platform: "WEB",
-            deviceName: "Rider",
-          },
-        },
-      }),
-      signal: AbortSignal.timeout(15000),
-      redirect: "error",
-    });
-    const data = (await response.json()) as any;
-    const login = data.data?.syncPrivyUser;
-    if (
-      !response.ok ||
-      data.errors?.length ||
-      !login?.accessToken ||
-      !login.user?.id
-    )
-      throw new AgentError(
-        "AUTH_REQUIRED",
-        "Rider sign-in failed.",
-        false,
-        401,
-      );
-    return {
-      rideAuthToken: login.accessToken as string,
-      identity: {
-        subject: login.user.id as string,
-        displayName: login.user.username ?? "Ride user",
-      },
-    };
-  };
+  const exchange = (input: PrivyAuthorizationInput) =>
+    exchangePrivyForRide(input, graphql);
   const provider = new RideOAuthProvider({
     store,
     validateRideToken: async (token) => ({
