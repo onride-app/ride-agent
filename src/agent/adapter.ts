@@ -1,4 +1,4 @@
-import { AgentError, errorDetails, type ErrorDetails } from "./contracts.js";
+import { AgentError, errorDetails } from "./contracts.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -94,6 +94,68 @@ export interface SourceFill {
   realized_usdc: string | null;
   at: number;
 }
+
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function bridgeInput(input: unknown): unknown {
+  if (!record(input) || !record(input.portfolio)) return input;
+  // Decisions are the backend's full audit history. Neither private venue
+  // implementation reads it, and its growth must not block account refreshes
+  // or execution. Omit it on the wire without touching the persisted object.
+  const portfolio = Object.fromEntries(
+    Object.entries(input.portfolio).filter(([key]) => key !== "decisions"),
+  );
+  return { ...input, portfolio };
+}
+
+function invalidBridgeResponse(response: Response): AgentError {
+  if (response.status === 413)
+    return new AgentError(
+      "EXECUTOR_REQUEST_TOO_LARGE",
+      "Execution boundary rejected an oversized request. Existing pending work remains unresolved.",
+      false,
+      413,
+    );
+  if (!response.ok && response.status >= 500)
+    return new AgentError(
+      "EXECUTOR_UNAVAILABLE",
+      "Execution boundary is unavailable. Existing pending work remains unresolved.",
+      true,
+      response.status,
+    );
+  return new AgentError(
+    "EXECUTOR_RESPONSE_INVALID",
+    "Execution boundary returned an invalid response. Existing pending work remains unresolved.",
+    true,
+    502,
+  );
+}
+
+function validBridgeResponse(operation: string, data: unknown): boolean {
+  if (operation === "candidates") return Array.isArray(data);
+  if (!record(data)) return false;
+  if (!["account", "preflight", "bind"].includes(operation)) return true;
+  return (
+    typeof data.account_id === "string" &&
+    data.account_id.length > 0 &&
+    typeof data.observed_at === "number" &&
+    Number.isFinite(data.observed_at) &&
+    typeof data.account_value_usdc === "string" &&
+    typeof data.available_usdc === "string" &&
+    typeof data.eligible === "boolean" &&
+    typeof data.dedicated === "boolean" &&
+    typeof data.coverage_complete === "boolean" &&
+    ["positions", "prices", "max_leverages", "min_notionals"].every((key) =>
+      record(data[key]),
+    ) &&
+    ["orders", "fills", "funding", "flows"].every((key) =>
+      Array.isArray(data[key]),
+    )
+  );
+}
+
 // Private, authenticated execution boundary. It holds Core S2S identity, never
 // signing secrets. Its responses are normalized; machine routes cannot confirm.
 export class BridgeAdapter implements VenueAdapter {
@@ -130,7 +192,7 @@ export class BridgeAdapter implements VenueAdapter {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.token}`,
           },
-          body: JSON.stringify(input),
+          body: JSON.stringify(bridgeInput(input)),
           signal: AbortSignal.timeout(
             operation.startsWith("funding_") ? 90000 : 20000,
           ),
@@ -145,24 +207,34 @@ export class BridgeAdapter implements VenueAdapter {
         503,
       );
     }
-    const data = (await response.json()) as {
-      error?: {
-        code: string;
-        message: string;
-        retryable?: boolean;
-        details?: ErrorDetails;
-      };
-    };
-    if (!response.ok)
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      throw invalidBridgeResponse(response);
+    }
+    if (record(data) && "error" in data) {
+      const error = data.error;
+      if (
+        !record(error) ||
+        typeof error.code !== "string" ||
+        !/^[A-Z][A-Z0-9_]{0,99}$/.test(error.code) ||
+        typeof error.message !== "string"
+      )
+        throw invalidBridgeResponse(response);
+      const details = errorDetails.safeParse(error.details);
       throw new AgentError(
-        data.error?.code ?? "EXECUTOR_ERROR",
-        data.error?.message ?? "Execution boundary rejected the request.",
-        data.error?.retryable ?? response.status >= 500,
-        response.status,
-        errorDetails.safeParse(data.error?.details).success
-          ? data.error?.details
-          : undefined,
+        error.code,
+        error.message,
+        typeof error.retryable === "boolean"
+          ? error.retryable
+          : response.status >= 500,
+        response.ok ? 502 : response.status,
+        details.success ? details.data : undefined,
       );
+    }
+    if (!response.ok || !validBridgeResponse(operation, data))
+      throw invalidBridgeResponse(response);
     return data as T;
   }
   depositOptions() {
