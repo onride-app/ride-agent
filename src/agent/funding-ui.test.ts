@@ -50,10 +50,12 @@ async function fixture(
     lost?: boolean;
     embedded?: boolean;
     signature?: boolean;
+    provider?: string;
+    oauthCallback?: boolean;
   } = {},
 ) {
   const ids = Object.fromEntries(
-    ["status", "content", "login", "sign-in", "access-code"].map((id) => [
+    ["status", "content", "login", "sign-in", "sign-in-apple"].map((id) => [
       id,
       new Element("div"),
     ]),
@@ -72,7 +74,42 @@ async function fixture(
   const calls: string[] = [],
     messages: any[] = [],
     listeners: any[] = [];
-  const source = readFileSync("public/fund-view.js", "utf8");
+  const source = readFileSync("public/fund-view.js", "utf8").replace(
+    "const query = new URL(location.href).searchParams;",
+    "if (globalThis.authClient) client = globalThis.authClient; const query = new URL(location.href).searchParams;",
+  );
+  const stored = new Map<string, string>(
+    options.provider ? [["ride:auth:provider", options.provider]] : [],
+  );
+  const oauthCalls: any[] = [];
+  const user = {
+    id: "did:privy:fixture",
+    linkedAccounts: [
+      {
+        type: "wallet",
+        chainType: "ethereum",
+        walletClientType: "privy",
+        address: "0xfixture",
+        id: "fixture_wallet",
+      },
+    ],
+  };
+  const authClient = {
+    user: { get: async () => ({ user }) },
+    getAccessToken: async () => "fixture-token",
+    auth: {
+      oauth: {
+        generateURL: async (...args: any[]) => {
+          oauthCalls.push(["generateURL", ...args]);
+          return { url: "https://auth.privy.test/start" };
+        },
+        loginWithCode: async (...args: any[]) => {
+          oauthCalls.push(["loginWithCode", ...args]);
+          return { user };
+        },
+      },
+    },
+  };
   const opened: string[] = [],
     bodies: any[] = [],
     intervals: Array<() => void> = [];
@@ -83,9 +120,10 @@ async function fixture(
     },
   };
   const api = await vm.runInNewContext(
-    `(async () => { ${source}\nreturn { display, check, getFunding: () => funding }; })()`,
+    `(async () => { ${source}\nreturn { display, check, getFunding: () => funding, setAuthClient: (c) => { client = c; } }; })()`,
     {
       config: { deposit_id: funding.deposit_id, embedded: options.embedded },
+      authClient: options.oauthCallback ? authClient : undefined,
       document: {
         getElementById: (id: string) =>
           ids[id] ??
@@ -110,20 +148,28 @@ async function fixture(
       clearTimeout() {},
       setInterval: (callback: () => void) => intervals.push(callback),
       clearInterval() {},
+      history: { replaceState() {} },
       location: {
-        href: "https://ride.test/agent/fund/" + funding.deposit_id,
+        href:
+          "https://ride.test/agent/fund/" +
+          funding.deposit_id +
+          (options.oauthCallback
+            ? "?privy_oauth_code=fixture-code&privy_oauth_state=fixture-state"
+            : ""),
         origin: "https://ride.test",
+        assign: (url: string) => opened.push(url),
       },
       sessionStorage: {
-        getItem() {
-          return null;
-        },
-        removeItem() {},
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+        removeItem: (key: string) => stored.delete(key),
       },
       fetch: async (path: string, request: any) => {
         const operation = path.split("/").at(-1)!;
         bodies.push({ operation, ...JSON.parse(request.body) });
         calls.push(operation);
+        if (operation === "login")
+          return { ok: true, json: async () => ({ csrf: "fixture-csrf" }) };
         if (operation === "session")
           return { ok: true, json: async () => ({ csrf: "fixture-csrf" }) };
         if (operation === "funding_confirm") {
@@ -179,6 +225,9 @@ async function fixture(
     action,
     opened,
     bodies,
+    stored,
+    oauthCalls,
+    authClient,
     closeWallet() {
       popup.close();
       intervals.at(-1)?.();
@@ -248,4 +297,37 @@ it("a lost submission response locks both approval and renewal; a read of the un
     1,
   );
   assert.match(f.ids.status.textContent, /unverified/);
+});
+
+it("starts Apple and Google funding sign-in and preserves the chosen provider on callback without submitting funds", async () => {
+  for (const provider of ["GOOGLE", "APPLE"]) {
+    const f = await fixture();
+    f.setAuthClient(f.authClient);
+    await f.ids[provider === "APPLE" ? "sign-in-apple" : "sign-in"].onclick!();
+    assert.equal(f.stored.get("ride:auth:provider"), provider);
+    assert.deepEqual(f.oauthCalls[0], [
+      "generateURL",
+      provider.toLowerCase(),
+      "https://ride.test/auth/privy/oauth/callback",
+    ]);
+    const callback = await fixture({ provider, oauthCallback: true });
+    assert.deepEqual(callback.oauthCalls[0], [
+      "loginWithCode",
+      "fixture-code",
+      "fixture-state",
+      provider.toLowerCase(),
+    ]);
+    assert.equal(
+      callback.bodies.find((b: any) => b.operation === "login").authProvider,
+      provider,
+    );
+    assert(!callback.calls.includes("funding_confirm"));
+    assert(!callback.calls.includes("funding_activate"));
+  }
+  const html = readFileSync("public/fund.html", "utf8");
+  assert.doesNotMatch(
+    html.split('<script type="module">')[0],
+    /access-code|Access code/,
+  );
+  assert.match(html.split('<script type="module">')[0], /sign-in-apple/);
 });

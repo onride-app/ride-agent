@@ -13,7 +13,9 @@ import {
 } from "node:crypto";
 import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
-import { AgentError, failure } from "./contracts.js";
+import { AgentError, failure, errorDetails } from "./contracts.js";
+import { VenueReads } from "./venue-reads.js";
+import { SourceFeed } from "./source-feed.js";
 import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
 import {
   checkPerpsOrder,
@@ -39,6 +41,8 @@ const required = (key: string) => {
   return v;
 };
 export class CoreBridge {
+  private venueReads = new VenueReads();
+  private sourceFeed = new SourceFeed((id) => this.readSource(id));
   private pool: pg.Pool;
   private prediction: PredictionVenue;
   private taxonomyCache: { at: number; values: Map<string, string> } | null =
@@ -76,6 +80,7 @@ export class CoreBridge {
     );
   }
   async close() {
+    this.sourceFeed.close();
     await this.pool.end();
   }
   private async control(operation: string, payload: any): Promise<any> {
@@ -129,13 +134,23 @@ export class CoreBridge {
       },
     );
     const body = (await r.json()) as any;
-    if (!r.ok)
+    if (!r.ok) {
+      const context = errorDetails.safeParse({
+        operation: body.error?.operation,
+        grpc_code: body.error?.grpc_code ?? undefined,
+        reason_code: body.error?.reason_code,
+        retry_after_ms: body.error?.retry_after_ms,
+      });
       throw new AgentError(
         body.error?.code ?? "CORE_UNAVAILABLE",
         body.error?.message ?? "Core operation failed",
-        r.status >= 500,
+        typeof body.error?.retryable === "boolean"
+          ? body.error.retryable
+          : r.status >= 500,
         r.status,
+        context.success ? context.data : undefined,
       );
+    }
     return body;
   }
   private async info(payload: unknown, source = false): Promise<any> {
@@ -143,25 +158,18 @@ export class CoreBridge {
       source || this.network === "mainnet"
         ? "https://api.hyperliquid.xyz/info"
         : "https://api.hyperliquid-testnet.xyz/info";
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(12000),
-      redirect: "error",
-    });
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => {});
-      throw new AgentError(
-        response.status === 429 ? "VENUE_RATE_LIMITED" : "VENUE_UNAVAILABLE",
-        response.status === 429
-          ? "Hyperliquid reads are temporarily rate limited."
-          : "Hyperliquid read failed.",
-        response.status === 429 || response.status >= 500,
-        503,
-      );
-    }
-    return response.json();
+    const type = (payload as { type?: string })?.type;
+    const ttl = ["meta", "perpDexs", "perpCategories"].includes(type ?? "")
+      ? 30_000
+      : type === "allMids"
+        ? 1000
+        : 0;
+    return this.venueReads.read(
+      url,
+      payload,
+      ttl,
+      source ? "source" : "account",
+    );
   }
   private traderId(address: string) {
     return `trader_${createHash("sha256").update(`${this.salt}:perps:${address.toLowerCase()}`).digest("hex").slice(0, 32)}`;
@@ -229,6 +237,9 @@ export class CoreBridge {
       );
   }
   async source(id: string) {
+    return this.sourceFeed.read(id);
+  }
+  private async readSource(id: string) {
     if (
       process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
       (await this.prediction.recognizes(id))
@@ -792,6 +803,46 @@ export class CoreBridge {
       cursor = next;
     }
     return { events: [...result.values()], complete: false };
+  }
+  private async activationCheck(user: string, portfolio: Portfolio) {
+    if (!portfolio.sleeves.some((s) => s.trader.market === "perps"))
+      return { eligible: true, blockers: [], idempotent_existing: false };
+    const check = await this.core("perps_registration_check", {
+      user_id: user,
+      portfolio_id: portfolio.id,
+    });
+    const allowed = new Set([
+      "AGENT_WALLET_INACTIVE",
+      "EXECUTION_OWNER_CONFLICT",
+      "MANUAL_WRITER_ACTIVE",
+      "APP_COPY_ACTIVE",
+      "COPY_EVENTS_PROCESSING",
+      "APP_POSITIONS_OPEN",
+      "BALANCE_TRANSFER_PENDING",
+      "WITHDRAWAL_PENDING",
+      "DEDICATED_ACCOUNT_REQUIRED",
+      "REGISTRATION_IDEMPOTENCY_CONFLICT",
+    ]);
+    if (
+      typeof check?.eligible !== "boolean" ||
+      typeof check.idempotent_existing !== "boolean" ||
+      !Array.isArray(check.blockers) ||
+      check.blockers.some(
+        (x: unknown) => typeof x !== "string" || !allowed.has(x),
+      ) ||
+      check.eligible !== (check.blockers.length === 0)
+    )
+      throw new AgentError(
+        "ACTIVATION_CHECK_UNAVAILABLE",
+        "Account registration readiness could not be verified. Existing account ownership and settings are preserved.",
+        true,
+        503,
+      );
+    return {
+      eligible: check.eligible as boolean,
+      blockers: [...new Set(check.blockers as string[])],
+      idempotent_existing: check.idempotent_existing as boolean,
+    };
   }
   async perpsAccount(
     user: string,
@@ -1741,7 +1792,30 @@ export class CoreBridge {
         };
       }
       case "preflight":
+        if (
+          input.portfolio &&
+          !input.portfolio.account_id &&
+          input.portfolio.sleeves.some((s: any) => s.trader.market === "perps")
+        ) {
+          const check = await this.activationCheck(
+            input.user_id,
+            input.portfolio,
+          );
+          if (!check.eligible)
+            throw new AgentError(
+              "ACTIVATION_BLOCKED",
+              "Account activation is blocked by unfinished account activity. Review the reported blockers; do not add funds or clear ownership to bypass them.",
+              false,
+              409,
+              {
+                operation: "perps_registration_check",
+                blockers: check.blockers,
+              },
+            );
+        }
         return this.account(input.user_id, input.portfolio);
+      case "activation_check":
+        return this.activationCheck(input.user_id, input.portfolio);
       case "bind":
         return this.account(input.user_id, input.portfolio, true);
       case "account":

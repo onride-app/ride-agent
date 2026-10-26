@@ -255,6 +255,25 @@ export interface Execution {
   error: string | null;
 }
 export interface Portfolio {
+  last_error?: {
+    at: number;
+    code: string;
+    message: string;
+    retryable: boolean;
+    details?: import("./contracts.js").ErrorDetails;
+  };
+  activation_check?: {
+    at: number;
+    eligible: boolean | null;
+    blockers: string[];
+    idempotent_existing?: boolean;
+    error?: {
+      code: string;
+      message: string;
+      retryable: boolean;
+      details?: import("./contracts.js").ErrorDetails;
+    };
+  };
   asset_filter_version?: 2;
   id: string;
   account_id: string | null;

@@ -1266,6 +1266,33 @@ export class AgentService {
                 "empty",
               );
         }
+        if (!p.account_id && this.adapter.activationCheck) {
+          try {
+            const check = await this.adapter.activationCheck(user, p);
+            p.activation_check = { at: now(), ...check };
+          } catch (error) {
+            const e =
+              error instanceof AgentError
+                ? error
+                : new AgentError(
+                    "ACTIVATION_CHECK_UNAVAILABLE",
+                    "Account activation readiness could not be verified.",
+                    true,
+                    503,
+                  );
+            p.activation_check = {
+              at: now(),
+              eligible: null,
+              blockers: [],
+              error: {
+                code: e.code,
+                message: e.message,
+                retryable: e.retryable,
+                ...(e.details ? { details: e.details } : {}),
+              },
+            };
+          }
+        }
         try {
           p.snapshot = await this.adapter.account(user, p);
         } catch {
@@ -2230,12 +2257,44 @@ export function portfolioView(p: Portfolio): Result {
   const pending = p.executions.filter(
     (e) => !["completed", "failed", "superseded"].includes(e.status),
   );
+  const bound = !!p.account_id;
+  const accountHealthy =
+    !stale &&
+    snap?.eligible === true &&
+    snap?.dedicated === true &&
+    snap?.coverage_complete === true;
+  const operational =
+    bound &&
+    p.state === "active" &&
+    accountHealthy &&
+    p.reconciliation === "complete" &&
+    p.sleeves.every(
+      (s) =>
+        s.state === "closed" ||
+        (s.initialized && s.last_source_at != null && fresh(s.last_source_at)),
+    );
   return result(
     {
       portfolio: {
         id: p.id,
         revision: p.revision,
         state: p.state,
+        account_bound: bound,
+        operational,
+        activation: {
+          status: !bound
+            ? p.state === "attention" || p.activation_check?.eligible === false
+              ? "blocked"
+              : "pending"
+            : p.state === "attention" || !accountHealthy
+              ? "needs_attention"
+              : "activated",
+          account_bound: bound,
+          readiness: p.activation_check ?? null,
+          last_error: p.last_error ?? null,
+          meaning:
+            "Confirmed configuration is separate from account activation and executed trades. Active copying requires a bound account and fresh source/account evidence.",
+        },
         preferences: p.preferences,
         created_at: p.created_at,
         ledger_started_at: p.ledger_started_at,
@@ -2264,7 +2323,21 @@ export function portfolioView(p: Portfolio): Result {
           stop_loss_pct: s.stop_loss_pct,
           loss_policy: s.loss_policy,
           emergency_exit_pct: s.emergency_exit_pct,
-          state: s.state,
+          state:
+            s.state === "active" && !bound
+              ? "awaiting_activation"
+              : s.state === "active" && p.state === "attention"
+                ? "needs_attention"
+                : s.state,
+          configuration_state: s.state,
+          initialized: s.initialized,
+          last_source_at: s.last_source_at,
+          source_observation_status:
+            s.last_source_at == null
+              ? "not_observed"
+              : fresh(s.last_source_at)
+                ? "fresh"
+                : "stale",
           net_profit_usdc:
             stats.sleeves.find((x) => x.copy_id === s.copy_id)?.net_usdc ??
             null,
@@ -2281,19 +2354,23 @@ export function portfolioView(p: Portfolio): Result {
     },
     stale
       ? "stale"
-      : p.executions.some((e) => e.status === "uncertain")
-        ? "uncertain"
-        : pending.some((e) => e.status === "partially_filled")
-          ? "partially_filled"
-          : pending.length
-            ? "executing"
-            : "ok",
+      : p.state === "attention"
+        ? "failed"
+        : !bound
+          ? "queued"
+          : p.executions.some((e) => e.status === "uncertain")
+            ? "uncertain"
+            : pending.some((e) => e.status === "partially_filled")
+              ? "partially_filled"
+              : pending.length
+                ? "executing"
+                : "ok",
   );
 }
 export function review(p: Portfolio): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   for (const s of p.sleeves) {
-    if (s.last_source_at == null || !fresh(s.last_source_at, 60_000))
+    if (s.last_source_at == null || !fresh(s.last_source_at))
       out.push({ kind: "source_stale", copy_id: s.copy_id });
     const inactive =
       s.trader.last_trade_at == null ? null : now() - s.trader.last_trade_at;

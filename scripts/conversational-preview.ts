@@ -256,7 +256,8 @@ app.get("/fixture/sdk.js", (_req, res) =>
   res.type("application/javascript").send(`
 export class LocalStorage {};
 export default class Privy {
- constructor(){this.embeddedWallet={getURL:()=>"https://auth.privy.io/",onMessage:()=>{}};this.user={get:async()=>({user:{id:"fixture-user",linked_accounts:[]}})};}
+ constructor(){this.embeddedWallet={getURL:()=>"https://auth.privy.io/",onMessage:()=>{}};}
+ user={get:async()=>({user:null})};
  async initialize(){const p=document.createElement("p");p.textContent="Local acceptance · simulated funding · no funds move";document.body.prepend(p);} async getAccessToken(){return "fixture-only";}
 }`),
 );

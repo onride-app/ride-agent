@@ -258,3 +258,60 @@ summary {
   border-radius: 16px;
   background: #fcfbf8;
 }
+.auth-providers {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px;
+}
+.auth-providers button,
+#login > button {
+  width: 100%;
+  min-height: 52px;
+  font-size: 15px;
+  font-weight: 650;
+  border-radius: 12px;
+}
+button.google,
+#sign-in {
+  background: #fff;
+  color: #171717;
+  border: 1px solid #d6d6d2;
+}
+button.apple,
+#sign-in-apple {
+  background: #171717;
+  color: white;
+  border: 1px solid #171717;
+}
+#login {
+  max-width: 520px;
+  margin: 36px auto;
+  padding: 32px;
+}
+#login h1 {
+  line-height: 1.2;
+}
+#login > p {
+  line-height: 1.6;
+  color: #666;
+}
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid #e7bd00;
+  outline-offset: 3px;
+}
+@media (max-width: 540px) {
+  body {
+    padding: 16px;
+  }
+  #login {
+    margin-top: 24px;
+    padding: 24px;
+  }
+  .brand {
+    font-size: 21px;
+  }
+  header {
+    gap: 12px;
+  }
+}

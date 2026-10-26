@@ -1,4 +1,4 @@
-import { AgentError } from "./contracts.js";
+import { AgentError, errorDetails, type ErrorDetails } from "./contracts.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -14,7 +14,16 @@ export interface SourceSnapshot {
   positions: PositionIntent[];
   complete: boolean;
 }
+export interface ActivationCheck {
+  eligible: boolean;
+  blockers: string[];
+  idempotent_existing: boolean;
+}
 export interface VenueAdapter {
+  activationCheck?(
+    user: string,
+    portfolio: Portfolio,
+  ): Promise<ActivationCheck>;
   depositOptions?(): Promise<{ routes: any[]; notes?: string[] }>;
   depositAddress?(
     user: string,
@@ -137,14 +146,22 @@ export class BridgeAdapter implements VenueAdapter {
       );
     }
     const data = (await response.json()) as {
-      error?: { code: string; message: string };
+      error?: {
+        code: string;
+        message: string;
+        retryable?: boolean;
+        details?: ErrorDetails;
+      };
     };
     if (!response.ok)
       throw new AgentError(
         data.error?.code ?? "EXECUTOR_ERROR",
         data.error?.message ?? "Execution boundary rejected the request.",
-        response.status >= 500,
+        data.error?.retryable ?? response.status >= 500,
         response.status,
+        errorDetails.safeParse(data.error?.details).success
+          ? data.error?.details
+          : undefined,
       );
     return data as T;
   }
@@ -153,6 +170,12 @@ export class BridgeAdapter implements VenueAdapter {
       "deposit_options",
       {},
     );
+  }
+  activationCheck(user: string, portfolio: Portfolio) {
+    return this.call<ActivationCheck>("activation_check", {
+      user_id: user,
+      portfolio,
+    });
   }
   depositAddress(user: string, input: any, portfolioId?: string) {
     return this.call<import("./deposits.js").Deposit>("deposit_address", {

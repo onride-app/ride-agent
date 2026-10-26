@@ -1,6 +1,9 @@
 import { readFile, writeFile, rm } from "node:fs/promises";
 await rm("dist", { recursive: true, force: true });
-const css = await readFile("public/agent.css", "utf8"),
+const css =
+    (await readFile("public/agent.css", "utf8")) +
+    "\n" +
+    (await readFile("public/app-auth.css", "utf8")),
   host = await readFile("public/agent-host.js", "utf8"),
   view = (await readFile("public/agent-view.js", "utf8")).replaceAll(
     "export ",

@@ -63,6 +63,8 @@
   "files": [
     "dist",
     "public/agent.html",
+    "public/app-auth.css",
+    "public/OFL-Poppins.txt",
     "public/confirm.html",
     "public/fund.html",
     "public/fund-demo.html",

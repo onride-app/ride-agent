@@ -10,7 +10,11 @@ import { fileURLToPath } from "node:url";
 import type { Express } from "express";
 import { z } from "zod";
 import { AgentError, failure, publicResult, output } from "./contracts.js";
-import type { PrivyAuthorizationInput, RideAuthPageConfig } from "../oauth.js";
+import {
+  RIDE_PRIVY_AUTH_PROVIDERS,
+  type PrivyAuthorizationInput,
+  type RideAuthPageConfig,
+} from "../oauth.js";
 import { MemoryHumanHandoffs, type HumanHandoffs } from "./human_handoffs.js";
 import { claudeCardDomain } from "./card_hosts.js";
 
@@ -342,7 +346,7 @@ export function mountHumanConfirmation(
           email: z.string().optional(),
           walletAddress: z.string().optional(),
           privyWalletId: z.string().optional(),
-          authProvider: z.string().optional(),
+          authProvider: z.enum(RIDE_PRIVY_AUTH_PROVIDERS).default("GOOGLE"),
           accessCode: z.string().optional(),
         })
         .strict()
@@ -381,7 +385,7 @@ export function mountHumanConfirmation(
           privyAccessToken: z.string().min(1),
           walletAddress: z.string().optional(),
           privyWalletId: z.string().optional(),
-          authProvider: z.literal("GOOGLE"),
+          authProvider: z.enum(RIDE_PRIVY_AUTH_PROVIDERS).default("GOOGLE"),
         })
         .strict()
         .parse(req.body);
@@ -435,7 +439,15 @@ export function mountHumanConfirmation(
       );
       res.set("Cache-Control", "no-store").json({ csrf, expires_at });
     } catch (e) {
-      res.status(e instanceof AgentError ? e.httpStatus : 503).json(failure(e));
+      res
+        .status(
+          e instanceof AgentError
+            ? e.httpStatus
+            : e instanceof z.ZodError
+              ? 400
+              : 503,
+        )
+        .json(failure(e));
     }
   });
   const allowed = new Set([
@@ -528,7 +540,15 @@ export function mountHumanConfirmation(
         : publicResult(body);
       res.status(response.status).set("Cache-Control", "no-store").json(value);
     } catch (e) {
-      res.status(e instanceof AgentError ? e.httpStatus : 503).json(failure(e));
+      res
+        .status(
+          e instanceof AgentError
+            ? e.httpStatus
+            : e instanceof z.ZodError
+              ? 400
+              : 503,
+        )
+        .json(failure(e));
     }
   });
 }

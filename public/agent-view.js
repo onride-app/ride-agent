@@ -5,6 +5,19 @@ export const el = (tag, text, cls) => {
   return node;
 };
 const val = (v) => (v === null || v === undefined ? "Unavailable" : String(v));
+const displayState = (value) => {
+  if (value == null) return "Unavailable";
+  const labels = {
+    start_copy: "Start copying",
+    requires_confirmation: "Awaiting your confirmation",
+    needs_attention: "Needs attention",
+    not_submitted: "Not submitted",
+    awaiting_activation: "Awaiting account activation",
+    activation_pending: "Account activation pending",
+  };
+  const text = labels[value] ?? String(value).replaceAll("_", " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+};
 const row = (label, value) => {
   const r = el("div", null, "row");
   r.append(el("span", label, "muted"), el("strong", val(value)));
@@ -54,7 +67,7 @@ function sleeveCards(
         ? [
             el(
               "p",
-              `继承旧设置：${s.leverage_cap == null ? "无额外上限" : `${s.leverage_cap}x`}。清空杠杆上限并重新计算，可改为跟随源杠杆；交易所限制仍适用。`,
+              `Inherited setting: ${s.leverage_cap == null ? "no extra cap" : `${s.leverage_cap}x`}. Clear the cap and recalculate to follow source leverage. Exchange limits still apply.`,
               "muted",
             ),
           ]
@@ -75,11 +88,16 @@ function sleeveCards(
     );
     if (s.state)
       c.append(
-        row("State", s.state),
+        row("State", displayState(s.state)),
         row("Net contribution", usdc(s.net_profit_usdc)),
       );
     if (s.projected_state)
-      c.append(row("预计状态（确认后）", s.projected_state));
+      c.append(
+        row(
+          "Expected status after confirmation",
+          displayState(s.projected_state),
+        ),
+      );
     if (callTool) {
       const b = el("button", "Trader details", "secondary");
       b.addEventListener("click", () =>
@@ -109,12 +127,12 @@ export function render(
     return;
   }
   if (value.data?.funding && confirmationCard) {
-    root.append(el("h1", "确认入金"));
+    root.append(el("h1", "Confirm funding"));
     confirmationCard(root, value.data.funding, false, "funding");
     return;
   }
   if (value.data?.funding_demo && confirmationCard) {
-    root.append(el("h1", "对话内入金确认测试"));
+    root.append(el("h1", "In-chat funding confirmation demo"));
     confirmationCard(
       root,
       { amount_usdc: "0", network: "Arbitrum" },
@@ -152,10 +170,10 @@ export function render(
       el(
         "h1",
         d.confirmation_demo
-          ? "确认卡片测试"
+          ? "Confirmation card demo"
           : d.proposal.status === "requires_confirmation"
-            ? "确认本次操作"
-            : "操作状态记录",
+            ? "Review and confirm"
+            : "Operation status",
       ),
     );
     confirmationCard(root, d.proposal, d.confirmation_demo === true);
@@ -396,6 +414,51 @@ export function render(
       el("h1", "Your portfolio"),
       el("p", `${p.state} · ${p.id}`, "muted"),
     );
+    if (p.activation && p.operational !== true) {
+      const activation = card("Copying is not operational yet");
+      activation.append(
+        row("Account activated", p.account_bound ? "Yes" : "No"),
+        row("Activation status", p.activation.status),
+        el(
+          "p",
+          "Your configuration and funds are preserved. Confirmation alone does not mean copying has started.",
+          "muted",
+        ),
+      );
+      const reasons = {
+        AGENT_WALLET_INACTIVE: "Set up the trading wallet in Rider.",
+        EXECUTION_OWNER_CONFLICT: "Another strategy owns this trading account.",
+        MANUAL_WRITER_ACTIVE:
+          "Another operation currently controls the account.",
+        APP_COPY_ACTIVE: "An existing Rider App copy is still enabled.",
+        COPY_EVENTS_PROCESSING:
+          "Existing copy operations are still processing.",
+        APP_POSITIONS_OPEN: "Existing App positions must be reconciled first.",
+        BALANCE_TRANSFER_PENDING:
+          "An earlier account transfer has not reached a verified final state.",
+        WITHDRAWAL_PENDING:
+          "An earlier withdrawal has not reached a verified final state.",
+      };
+      for (const reason of p.activation.readiness?.blockers ?? [])
+        activation.append(
+          el(
+            "p",
+            reasons[reason] ?? "Account registration requires review.",
+            "warning",
+          ),
+        );
+      const error = p.activation.readiness?.error ?? p.activation.last_error;
+      if (error) activation.append(el("p", error.message, "warning error"));
+      if (p.activation.readiness?.eligible == null && !p.account_bound)
+        activation.append(
+          el(
+            "p",
+            "Account registration readiness has not been verified.",
+            "warning",
+          ),
+        );
+      root.append(activation);
+    }
     const overview = card("Agent trading account snapshot");
     overview.append(
       row("Account value", usdc(p.account_value_usdc)),
@@ -660,15 +723,19 @@ export function render(
     const q = d.proposal;
     root.append(
       el("h1", "Review before confirming"),
-      el("p", `${q.action} · ${q.status}`, "muted"),
+      el("p", `${displayState(q.action)} · ${displayState(q.status)}`, "muted"),
     );
     if (q.preview?.portfolio?.portfolio)
       renderNestedPortfolio(root, q.preview.portfolio.portfolio);
     const params = card("Frozen parameters");
     params.append(
       row(
-        "真实组合状态",
-        q.actual_portfolio_state ?? q.portfolio_state ?? "尚未建立组合",
+        "Actual portfolio status",
+        displayState(
+          q.actual_portfolio_state ??
+            q.portfolio_state ??
+            "No portfolio created",
+        ),
       ),
       row("Loss trigger amount", usdc(q.preview?.loss_trigger_amount_usdc)),
       row("Existing entry deviation", "≤ 0.2%"),
@@ -683,7 +750,8 @@ export function render(
         "Execution state",
         q.status === "requires_confirmation"
           ? "Not submitted"
-          : q.execution_tasks?.map((e) => e.status).join(", ") || q.status,
+          : q.execution_tasks?.map((e) => displayState(e.status)).join(", ") ||
+              displayState(q.status),
       ),
     );
     const details = el("details");
@@ -1079,7 +1147,7 @@ function planEditor(plan, data, callTool, start) {
       r.append(
         el(
           "p",
-          `继承旧设置：${a.leverage_cap == null ? "无额外上限" : `${a.leverage_cap}x`}。清空此项并重新计算可取消额外上限；交易所限制仍适用。`,
+          `Inherited setting: ${a.leverage_cap == null ? "no extra cap" : `${a.leverage_cap}x`}. Clear this field and recalculate to remove the extra cap. Exchange limits still apply.`,
           "muted",
         ),
       );
@@ -1800,10 +1868,13 @@ function renderNestedPortfolio(root, p) {
   root.append(
     el(
       "p",
-      "以下为确认后的预计状态；实际提交、成交与运行状态以处理结果为准。",
+      "This is the expected configuration after confirmation. Account activation, orders and fills are verified separately.",
       "muted",
     ),
-    row("预计组合状态（确认后）", p.projected_state ?? p.state),
+    row(
+      "Expected portfolio status after confirmation",
+      displayState(p.projected_state ?? p.state),
+    ),
     sleeveCards(
       (p.sleeves ?? []).map(({ state, ...s }) => ({
         ...s,
@@ -1819,32 +1890,32 @@ function historyRows(t) {
     t.metric_window
       ? `${new Date(t.metric_window.start_at).toISOString()} – ${new Date(t.metric_window.end_at).toISOString()}`
       : periods?.[key]?.period === "source_all_time"
-        ? "源账户全部可用历史（起止日期未知）"
+        ? "All available source history (dates unverified)"
         : periods?.[key]?.period === "source_month"
-          ? "源账户月度窗口（起止日期未知）"
-          : "统计周期未知";
+          ? "Source monthly window (dates unverified)"
+          : "Historical period unavailable";
   const score = t.score_explanation;
   return [
-    row("ROI 统计周期", period("roi")),
-    row("回撤统计周期", period("drawdown")),
+    row("ROI period", period("roi")),
+    row("Drawdown period", period("drawdown")),
     row(
-      "最近交易",
+      "Last source trade",
       t.last_trade_at == null
         ? "Unavailable"
         : new Date(t.last_trade_at).toISOString(),
     ),
-    row("评分版本", t.score_version),
+    row("Score version", t.score_version),
     ...(score
       ? [
           row(
-            "评级 / 原始质量分",
+            "Tier / raw quality score",
             `${score.tier ?? "Unavailable"} / ${score.raw_quality_score ?? "Unavailable"}`,
           ),
-          row("评级分数上限", score.display_cap ?? "Unavailable"),
+          row("Tier display cap", score.display_cap ?? "Unavailable"),
           el(
             "p",
             score.cap_applied
-              ? "展示分已触及评级上限；同分不代表原始质量或收益相同。同分时按公开交易员 ID 排序。"
+              ? "The displayed score reached its tier cap. Equal scores do not imply equal quality or returns; public trader IDs break ties."
               : score.note,
             "muted",
           ),

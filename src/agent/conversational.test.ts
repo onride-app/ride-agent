@@ -84,7 +84,8 @@ it("previews with zero funds and refreshes an expired plan into a new immutable 
   assert.equal(projected.projected_state, "activating");
   assert.ok(
     projected.sleeves.every(
-      (s: any) => s.state == null && s.projected_state === "active",
+      (s: any) =>
+        s.state == null && s.projected_state === "awaiting_activation",
     ),
   );
   assert.equal(projected.reserved_usdc, "0.000000");

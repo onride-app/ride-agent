@@ -22,7 +22,7 @@ try {
       `Unwanted package file: ${f.path}`,
     );
     assert(
-      /^(dist\/|public\/(agent|confirm|fund|fund-demo)\.html|skills\/|docs\/|README\.md|LICENSE|package\.json|\.env\.example)/.test(
+      /^(dist\/|public\/(agent|confirm|fund|fund-demo)\.html|public\/(app-auth\.css|OFL-Poppins\.txt)$|skills\/|docs\/|README\.md|LICENSE|package\.json|\.env\.example)/.test(
         f.path,
       ),
       `Unexpected file: ${f.path}`,
@@ -142,7 +142,7 @@ try {
       }),
     );
     assert.deepEqual(mcp.getServerVersion(), {
-      name: "ride",
+      name: "Rider",
       title: "Rider",
       version: metadata.version,
     });

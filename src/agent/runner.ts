@@ -23,6 +23,7 @@ import {
 import { event, AgentService } from "./service.js";
 import type { State } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
+import { observeSources } from "./source-observations.js";
 import {
   recordPerformance,
   recordReceipt,
@@ -32,6 +33,7 @@ import {
 } from "./analytics.js";
 
 export class AgentRunner {
+  private sourceTimes = new Map<string, number>();
   constructor(private service: AgentService) {}
   async tick(user: string): Promise<void> {
     const { repository, adapter } = this.service;
@@ -39,6 +41,30 @@ export class AgentRunner {
     // erase a possibly submitted execution identifier or its frozen payload.
     await repository.transact(user, async (state) => {
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
+        const sources = observeSources(
+          adapter,
+          p.sleeves.filter((s) => s.state !== "closed").map((s) => s.trader),
+          (id, observation) => {
+            // Late public reads may update this bounded cache, never a state
+            // transaction that already committed or any execution cursor.
+            try {
+              if (
+                observation.ok &&
+                observation.value.complete &&
+                fresh(observation.value.observed_at) &&
+                D(observation.value.account_value_usdc).gt(0)
+              ) {
+                if (this.sourceTimes.size >= 2000)
+                  this.sourceTimes.delete(
+                    this.sourceTimes.keys().next().value!,
+                  );
+                this.sourceTimes.set(id, observation.value.observed_at);
+              }
+            } catch {
+              /* Malformed evidence cannot refresh a timestamp. */
+            }
+          },
+        );
         try {
           if (!p.account_id) {
             const snap = await adapter.bind(user, p);
@@ -79,6 +105,7 @@ export class AgentRunner {
               true,
             );
           p.snapshot = snap;
+          p.last_error = undefined;
           p.audit_started_at ??= snap.observed_at;
           if (p.state === "attention")
             p.state = p.loss_latched ? "loss_triggered" : "active";
@@ -276,7 +303,9 @@ export class AgentRunner {
               }
             }
             if (p.reconciliation !== "complete" && s.initialized) continue;
-            const source = await adapter.source(s.trader);
+            const observation = await sources.get(s.trader.id);
+            if (!observation.ok) throw observation.error;
+            const source = observation.value;
             if (
               !source.complete ||
               !fresh(source.observed_at) ||
@@ -832,7 +861,27 @@ export class AgentRunner {
                   true,
                 );
           p.state = p.loss_latched ? "loss_triggered" : "attention";
-          eventOnce(state, err.code, p.id, err.message);
+          p.last_error = {
+            at: now(),
+            code: err.code,
+            message: err.message,
+            retryable: err.retryable,
+            ...(err.details ? { details: err.details } : {}),
+          };
+          eventOnce(
+            state,
+            err.code,
+            p.id,
+            err.message,
+            err.details ? { diagnostics: err.details } : {},
+          );
+        } finally {
+          // Public collection must not keep a failed account transaction open
+          // beyond the database idle timeout. SourceFeed keeps sampling.
+          for (const sleeve of p.sleeves) {
+            const at = this.sourceTimes.get(sleeve.trader.id);
+            if (at != null && fresh(at)) sleeve.last_source_at = at;
+          }
         }
         recordPerformance(state, p);
       }
@@ -966,9 +1015,7 @@ export class AgentRunner {
         try {
           await this.tick(user);
         } catch {
-          console.error(
-            "Rider monitoring cycle failed; retained for retry.",
-          );
+          console.error("Rider monitoring cycle failed; retained for retry.");
         }
       }
       await new Promise<void>((resolve) => {

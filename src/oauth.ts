@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import express from "express";
 import type { Request, Response } from "express";
 import { createClient, type RedisClientType } from "redis";
@@ -23,6 +24,14 @@ import type {
 
 export const RIDE_OAUTH_SCOPES = ["ride:read", "ride:trade"] as const;
 export const DEFAULT_RIDE_OAUTH_SCOPES = ["ride:read"] as const;
+export const RIDE_PRIVY_AUTH_PROVIDERS = ["GOOGLE", "APPLE"] as const;
+export type RidePrivyAuthProvider = (typeof RIDE_PRIVY_AUTH_PROVIDERS)[number];
+
+export function normalizePrivyAuthProvider(value: unknown): RidePrivyAuthProvider {
+  if (value === undefined) return "GOOGLE";
+  if (value === "GOOGLE" || value === "APPLE") return value;
+  throw new InvalidRequestError("Choose Google or Apple to sign in to Rider.");
+}
 
 function validateSupportedScopes(scopes: string[]): string[] {
   const normalized = [...new Set(scopes)];
@@ -517,7 +526,10 @@ export class RideOAuthProvider implements OAuthServerProvider {
     await this.validateAuthorizationRedirect(input.clientId, input.redirectUri);
     const scopes = normalizeRequestedScopes(input.scope);
 
-    const exchanged = await this.options.exchangePrivyToken(input.privy);
+    const exchanged = await this.options.exchangePrivyToken({
+      ...input.privy,
+      authProvider: normalizePrivyAuthProvider(input.privy.authProvider),
+    });
     const code = randomUUID();
     await this.store.setAuthorizationCode(code, {
       client,
@@ -706,7 +718,7 @@ export function createRideOAuthApprovalRouter(provider: RideOAuthProvider): expr
           email: stringField(req.body.email),
           walletAddress: stringField(req.body.wallet_address),
           privyWalletId: stringField(req.body.privy_wallet_id),
-          authProvider: stringField(req.body.auth_provider),
+          authProvider: normalizePrivyAuthProvider(req.body.auth_provider),
           accessCode: stringField(req.body.access_code),
         },
       });
@@ -828,13 +840,21 @@ function redirectUriAllowed(redirectUri: string, registeredUris: string[]): bool
   });
 }
 
+const appAuthCss = readFileSync(new URL("../public/app-auth.css", import.meta.url), "utf8");
+
 function renderAuthorizePage(
   client: OAuthClientInformationFull,
   params: AuthorizationParams,
   config: RideAuthPageConfig,
 ): string {
   const clientName = client.client_name || "MCP Client";
-  const scope = (params.scopes || [...DEFAULT_RIDE_OAUTH_SCOPES]).join(" ");
+  const scopes = params.scopes || [...DEFAULT_RIDE_OAUTH_SCOPES];
+  const scope = scopes.join(" ");
+  const permissions = scopes.map((scope) =>
+    scope === "ride:trade"
+      ? "Prepare and manage copy-trading. Orders require Ride confirmation or an existing bounded grant."
+      : "View your Ride account, portfolios and trader information.",
+  );
   const fields = {
     client_id: client.client_id,
     redirect_uri: params.redirectUri,
@@ -845,7 +865,9 @@ function renderAuthorizePage(
   };
   const hiddenInputs = Object.entries(fields)
     .map(([name, value]) =>
-      value ? `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">` : "",
+      value
+        ? `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`
+        : "",
     )
     .join("\n      ");
   const oauthPayload = JSON.stringify(fields).replaceAll("<", "\\u003c");
@@ -856,164 +878,26 @@ function renderAuthorizePage(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Authorize Rider</title>
-  <style>
-    :root {
-      color-scheme: light;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #1f2933;
-      background: #f6f7f9;
-    }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-    }
-    main {
-      width: min(100%, 460px);
-      background: #ffffff;
-      border: 1px solid #dde3ea;
-      border-radius: 8px;
-      box-shadow: 0 18px 50px rgba(15, 23, 42, 0.12);
-      padding: 28px;
-    }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 24px;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-    p {
-      margin: 0 0 18px;
-      color: #52616f;
-      line-height: 1.55;
-    }
-    .scope {
-      margin: 18px 0;
-      padding: 12px;
-      border: 1px solid #dde3ea;
-      border-radius: 6px;
-      background: #f9fafb;
-      font-size: 13px;
-      color: #394b59;
-    }
-    label {
-      display: block;
-      font-size: 13px;
-      font-weight: 650;
-      margin-bottom: 8px;
-    }
-    input, textarea {
-      width: 100%;
-      box-sizing: border-box;
-      border: 1px solid #c7d0d9;
-      border-radius: 6px;
-      padding: 10px 12px;
-      font: 14px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: #1f2933;
-      min-height: 42px;
-    }
-    textarea {
-      min-height: 96px;
-      resize: vertical;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 13px;
-    }
-    .actions {
-      display: flex;
-      gap: 10px;
-      margin-top: 18px;
-    }
-    button {
-      appearance: none;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      padding: 10px 14px;
-      font-weight: 700;
-      cursor: pointer;
-      min-height: 42px;
-    }
-    button[type="submit"], button.primary {
-      flex: 1;
-      background: #1677ff;
-      color: #ffffff;
-    }
-    button.secondary, button[name="action"][value="deny"] {
-      background: #ffffff;
-      border-color: #c7d0d9;
-      color: #394b59;
-    }
-    button.google {
-      width: 100%;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      background: #ffffff;
-      border-color: #c7d0d9;
-      color: #1f2933;
-      font-weight: 700;
-    }
-    .google-mark {
-      display: inline-grid;
-      place-items: center;
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      border: 1px solid #dde3ea;
-      font-weight: 800;
-      font-size: 13px;
-      color: #1677ff;
-    }
-    .field {
-      margin-top: 14px;
-    }
-    .status {
-      min-height: 20px;
-      margin-top: 14px;
-      font-size: 13px;
-      color: #52616f;
-      line-height: 1.45;
-    }
-    .status.error {
-      color: #b42318;
-    }
-    .hidden {
-      display: none;
-    }
-    .fallback {
-      margin-top: 24px;
-      padding-top: 18px;
-      border-top: 1px solid #dde3ea;
-    }
-    .fallback summary {
-      cursor: pointer;
-      color: #52616f;
-      font-size: 13px;
-      font-weight: 650;
-    }
-  </style>
+  <style>${appAuthCss}</style>
 </head>
-<body>
-  <main>
-    <h1>Authorize Rider</h1>
-    <p>${escapeHtml(clientName)} wants access to your Ride account for Auto-Ride tools.</p>
-    <div class="scope">Scopes: ${escapeHtml(scope)}</div>
+<body class="app-auth-page">
+  <main class="app-auth oauth-auth">
+    <div class="app-auth-visual" aria-hidden="true"></div>
+    <div class="app-auth-brand"><div class="app-auth-wordmark">Rider</div><div class="app-auth-tagline">Follow top traders' bets.<br>Make smarter predictions.</div></div>
+    <div class="app-auth-intro"><h1>Connect your Ride account</h1><p>${escapeHtml(clientName)} wants to connect to your Ride account.</p></div>
 
-    <form id="google-form">
-      <div class="field">
-        <label for="access-code">Access code, if this is a new Ride account</label>
-        <input id="access-code" name="access-code" type="text" autocomplete="off">
-      </div>
-      <div class="actions">
+    <form id="sign-in-form">
+      <div class="auth-actions">
         <button id="google-login" class="google" type="button">
-          <span class="google-mark">G</span>
           Continue with Google
         </button>
+        <button id="apple-login" class="apple" type="button">Continue with Apple</button>
       </div>
-      <div id="status" class="status">Continue with Google to connect your Ride account.</div>
+      <div id="status" class="status" aria-live="polite"></div>
     </form>
+
+    <details class="connection-permissions"><summary>Connection permissions</summary><ul>${permissions.map((permission) => `<li>${escapeHtml(permission)}</li>`).join("")}</ul></details>
+    <p class="app-auth-policy">By continuing, you agree to the <a href="https://docs.fiammalabs.io/terms-and-privacy-policy-ride/terms-of-service-ride" target="_blank" rel="noreferrer">Terms</a> and <a href="https://docs.fiammalabs.io/terms-and-privacy-policy-ride/privacy-policy-ride" target="_blank" rel="noreferrer">Privacy Policy</a>.</p>
 
     ${
       config.manualTokenAuthEnabled
@@ -1043,10 +927,10 @@ function renderAuthorizePage(
       oauth: ${oauthPayload}
     };
 
-    const ACCESS_CODE_KEY = 'ride:mcp:oauth_access_code';
+    const AUTH_PROVIDER_KEY = 'ride:auth:provider';
     const statusEl = document.getElementById('status');
     const googleLoginButton = document.getElementById('google-login');
-    const accessCodeInput = document.getElementById('access-code');
+    const appleLoginButton = document.getElementById('apple-login');
 
     let privy;
     let privyInitialization;
@@ -1062,7 +946,7 @@ function renderAuthorizePage(
         return 'Redirect URL is not allowed. Add ' + window.location.origin + '/auth/privy/oauth/callback in Privy Advanced -> Allowed OAuth redirect URLs.';
       }
       if (error?.name === 'AbortError' || error?.name === 'TimeoutError' || /aborted|timed? ?out/i.test(message)) {
-        return 'The connection to Privy timed out. Check your network or proxy, then retry Continue with Google. Your account has not been changed.';
+        return 'The connection to Privy timed out. Check your network or proxy, then retry signing in. Your account has not been changed.';
       }
       return message;
     }
@@ -1113,9 +997,11 @@ function renderAuthorizePage(
       if (typeof user?.emailAddress === 'string') return user.emailAddress;
       const accounts = linkedAccounts(user);
       const emailAccount = accounts.find((account) =>
-        account?.email || account?.address || account?.emailAddress || account?.email_address
+        account?.email || account?.emailAddress || account?.email_address ||
+        (account?.type === 'email' && account?.address)
       );
-      return emailAccount?.email || emailAccount?.address || emailAccount?.emailAddress || emailAccount?.email_address || undefined;
+      return emailAccount?.email || emailAccount?.emailAddress || emailAccount?.email_address ||
+        (emailAccount?.type === 'email' ? emailAccount.address : undefined);
     }
 
     function getEmbeddedEthereumWallet(user) {
@@ -1158,10 +1044,6 @@ function renderAuthorizePage(
       return {user: refreshedUser, wallet};
     }
 
-    function getStoredAccessCode() {
-      return accessCodeInput.value.trim() || sessionStorage.getItem(ACCESS_CODE_KEY) || undefined;
-    }
-
     async function approveWithPrivy(user, privyAccessToken, wallet, authProvider) {
       const response = await fetch('/auth/privy/approve', {
         method: 'POST',
@@ -1173,15 +1055,13 @@ function renderAuthorizePage(
           email: getEmailFromUser(user),
           wallet_address: wallet?.address,
           privy_wallet_id: wallet?.id,
-          auth_provider: authProvider,
-          access_code: getStoredAccessCode()
+          auth_provider: authProvider
         })
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(payload.message || 'Rider authorization failed.');
       }
-      sessionStorage.removeItem(ACCESS_CODE_KEY);
       window.location.assign(payload.redirectUrl);
     }
 
@@ -1197,46 +1077,58 @@ function renderAuthorizePage(
       await approveWithPrivy(user, privyAccessToken, walletResult.wallet, authProvider);
     }
 
-    function googleRedirectUrl() {
-      return window.location.origin + '/auth/privy/oauth/callback';
+    function loginProvider() {
+      const stored = sessionStorage.getItem(AUTH_PROVIDER_KEY);
+      if (stored == null || stored === 'GOOGLE') return 'GOOGLE';
+      if (stored === 'APPLE') return 'APPLE';
+      throw new Error('Choose Google or Apple to restart sign-in.');
     }
 
-    async function handleGoogleCallback() {
+    async function handleOAuthCallback() {
       const url = new URL(window.location.href);
       const authorizationCode = url.searchParams.get('privy_oauth_code');
       const stateCode = url.searchParams.get('privy_oauth_state');
       if (!authorizationCode && !stateCode) return;
       if (!authorizationCode || !stateCode) {
-        throw new Error('Google login returned incomplete OAuth credentials.');
+        throw new Error('Sign-in returned incomplete OAuth credentials.');
       }
-      setStatus('Completing Google login...');
+      const provider = loginProvider();
+      setStatus('Completing ' + (provider === 'APPLE' ? 'Apple' : 'Google') + ' sign-in...');
       const client = await initPrivy();
       const session = await client.auth.oauth.loginWithCode(
         authorizationCode,
         stateCode,
-        'google'
+        provider.toLowerCase()
       );
-      await finishPrivySession(session, 'GOOGLE');
+      await finishPrivySession(session, provider);
     }
 
-    googleLoginButton.addEventListener('click', async () => {
+    async function startOAuthLogin(provider, button) {
       try {
         setBusy(googleLoginButton, true);
-        setStatus('Starting Google login...');
-        const accessCode = accessCodeInput.value.trim();
-        if (accessCode) sessionStorage.setItem(ACCESS_CODE_KEY, accessCode);
+        setBusy(appleLoginButton, true);
+        const label = provider === 'APPLE' ? 'Apple' : 'Google';
+        setStatus('Starting ' + label + ' sign-in...');
+        sessionStorage.setItem(AUTH_PROVIDER_KEY, provider);
         sessionStorage.setItem('ride:mcp:oauth_authorize_url', window.location.href);
         const client = await initPrivy();
-        const response = await client.auth.oauth.generateURL('google', googleRedirectUrl());
-        if (!response?.url) throw new Error('Google login URL was not returned.');
+        const response = await client.auth.oauth.generateURL(
+          provider.toLowerCase(),
+          window.location.origin + '/auth/privy/oauth/callback'
+        );
+        if (!response?.url) throw new Error(label + ' sign-in URL was not returned.');
         window.location.assign(response.url);
       } catch (error) {
         setStatus(formatAuthError(error), true);
         setBusy(googleLoginButton, false);
+        setBusy(appleLoginButton, false);
       }
-    });
+    }
 
-    handleGoogleCallback().catch((error) => {
+    googleLoginButton.addEventListener('click', () => startOAuthLogin('GOOGLE', googleLoginButton));
+    appleLoginButton.addEventListener('click', () => startOAuthLogin('APPLE', appleLoginButton));
+
+    handleOAuthCallback().catch((error) => {
       setStatus(formatAuthError(error), true);
     });
   </script>
@@ -1252,11 +1144,12 @@ function renderPrivyOAuthCallbackPage(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Completing Rider Login</title>
   <style>
+    * { box-sizing: border-box; }
     :root {
       color-scheme: light;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #1f2933;
-      background: #f6f7f9;
+      background: #fcfbf8;
     }
     body {
       margin: 0;
@@ -1269,7 +1162,7 @@ function renderPrivyOAuthCallbackPage(): string {
       width: min(100%, 440px);
       background: #ffffff;
       border: 1px solid #dde3ea;
-      border-radius: 8px;
+      border-radius: 20px;
       box-shadow: 0 18px 50px rgba(15, 23, 42, 0.12);
       padding: 28px;
     }
@@ -1324,5 +1217,8 @@ function escapeHtml(value: string): string {
 }
 
 function escapeJs(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll("'", "\\'").replaceAll("\n", "\\n");
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("'", "\\'")
+    .replaceAll("\n", "\\n");
 }

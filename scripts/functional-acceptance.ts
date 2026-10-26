@@ -1,4 +1,5 @@
 import { compatibility } from "../src/agent/conversational.js";
+import { AgentError } from "../src/agent/contracts.js";
 // Functional acceptance: real MCP gateway + CLI + HTTP + PostgreSQL;
 // only authentication identity and exchange reads/fills are simulated.
 import assert from "node:assert/strict";
@@ -2426,6 +2427,84 @@ try {
       canonical_analysis_order: true,
       real_execution: false,
     };
+  });
+  await check("52 确认后的绑定阻塞保持原配置并如实显示未激活", async () => {
+    venue.reset();
+    const c = { client: widgetClient };
+    const plan = (
+      await ok(c.client, "recommend_traders", {
+        preferences: { ...pref, basket_size: 4, budget_usdc: "40" },
+      })
+    ).data.plan as any;
+    const proposal = (
+      await ok(c.client, "start_copy", {
+        plan_id: plan.id,
+        compatibility_ack: compatibility(plan).fingerprint,
+      })
+    ).data.proposal as any;
+    await approve("widget", proposal);
+    const originalBind = venue.bind,
+      originalSource = venue.source;
+    const observed = new Set<string>();
+    const submitted = venue.submits.length;
+    try {
+      venue.bind = async () => {
+        throw new AgentError(
+          "CORE_REJECTED",
+          "Account activation is blocked by pending transfers.",
+          false,
+          409,
+          {
+            operation: "perps_bind",
+            grpc_code: "FAILED_PRECONDITION",
+            reason_code: "BALANCE_TRANSFER_PENDING",
+          },
+        );
+      };
+      venue.source = async (t) => {
+        observed.add(t.id);
+        return originalSource.call(venue, t);
+      };
+      (venue as any).activationCheck = async () => ({
+        eligible: false,
+        blockers: ["BALANCE_TRANSFER_PENDING", "WITHDRAWAL_PENDING"],
+        idempotent_existing: false,
+      });
+      await runner.tick(users.widget);
+      const view = (await ok(c.client, "get_portfolio", {})).data
+        .portfolio as any;
+      assert.equal(view.account_bound, false);
+      assert.equal(view.operational, false);
+      assert.equal(view.activation.status, "blocked");
+      assert.deepEqual(view.activation.readiness.blockers, [
+        "BALANCE_TRANSFER_PENDING",
+        "WITHDRAWAL_PENDING",
+      ]);
+      assert.equal(view.sleeves.length, 4);
+      assert(
+        view.sleeves.every(
+          (s: any) =>
+            s.amount_usdc === "10.000000" &&
+            s.state === "awaiting_activation" &&
+            !s.initialized &&
+            s.last_source_at != null,
+        ),
+      );
+      assert.equal(observed.size, 4);
+      assert.equal(view.executions.length, 0);
+      assert.equal(venue.submits.length, submitted);
+      return {
+        confirmed: true,
+        activated: false,
+        source_collection_independent_of_bind: true,
+        configuration_preserved: true,
+        financial_submissions: 0,
+      };
+    } finally {
+      venue.bind = originalBind;
+      venue.source = originalSource;
+      delete (venue as any).activationCheck;
+    }
   });
 } catch (e) {
   results.push({

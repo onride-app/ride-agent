@@ -201,7 +201,7 @@ export async function runCli(
   }
   if (command === "mcp") {
     const server = new McpServer(
-      { name: "ride", title: "Rider", version: VERSION },
+      { name: "Rider", title: "Rider", version: VERSION },
       { instructions: GUIDE_INSTRUCTIONS },
     );
     registerGuide(server, async () => {

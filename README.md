@@ -48,6 +48,10 @@ The Skill-only command does not register an MCP server. For standalone CLI comma
 
 ## Preview edits and analysis
 
+Review pages support Google and Apple sign-in, preserve the exact proposal through browser recovery, and use a concise English interface. An uncertain confirmation is reconciled by reading the same proposal, without automatic resubmission. Older API requests still default to Google and retain their existing scopes.
+
+Portfolio reads distinguish confirmed configuration, account activation, operational copying, and actual executions. Registration readiness exposes safe blocker codes for the current primary trading wallet and network. Public source snapshots have independent five-second sampling and reserved read capacity; fresh account evidence and verified fill history remain required for execution. Historic funding records are never marked complete merely to unblock a new copy.
+
 A saved preview is immutable. `recommend_traders` with `base_plan_id`, `selection: "system"`, and a risk-preference patch generates a new system preview while preserving the original trader count, slot amounts and copy/risk controls. Risk selection uses a versioned product policy over comparable Perps model components; it does not change Copy Score or prove an improvement in realized portfolio risk. Missing or unsupported evidence blocks this explicit reselect. Manual selections and legacy pinned IDs stay protected until system reselection is explicitly requested.
 
 Analysis reads the exact plan with `get_portfolio`: `detail: "detailed"` gives a concise summary; `analysis_depth: "extended"` gives more evidence. Formulas appear only with explicitly requested `include_calculations: true`. These reads do not create a new preview.
@@ -176,7 +180,7 @@ To test the actual feature journey locally, use an isolated disposable PostgreSQ
 RIDE_AGENT_FUNCTIONAL_DATABASE_URL='postgresql://USER@127.0.0.1:5432/ride_functional_acceptance' npm run test:functional
 ```
 
-This starts the real MCP gateway, HTTP backend, OAuth PKCE flow and CLI, and runs 51 scenarios through the Agent tools, live guide and account reads with persisted PostgreSQL state. It covers recommendation risk filters, slot-preserving risk reselection, read-only analysis and candidate filters, frozen human proposals, partial fills, fees/funding, position closes, wind-down, delegated limits, both loss triggers, replacement limits, stale proposals and monitor recovery. Only Core identities and venue reads/fills are simulated; this does not verify a real login, wallet signing or exchange settlement. The script removes its own fixture states and writes `output/deployment/functional-acceptance.json` with every scenario and tool response.
+This starts the real MCP gateway, HTTP backend, OAuth PKCE flow and CLI, and runs 52 scenarios through the Agent tools, live guide and account reads with persisted PostgreSQL state. It covers recommendation risk filters, slot-preserving risk reselection, read-only analysis and candidate filters, frozen human proposals, partial fills, fees/funding, position closes, wind-down, delegated limits, both loss triggers, replacement limits, stale proposals and monitor recovery. Only Core identities and venue reads/fills are simulated; this does not verify a real login, wallet signing or exchange settlement. The script removes its own fixture states and writes `output/deployment/functional-acceptance.json` with every scenario and tool response.
 
 MIT. The open repository is created from a clean history and contains no private Ride repository history, credentials, or user account data.
 

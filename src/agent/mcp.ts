@@ -448,7 +448,7 @@ function description(name: ToolName): string {
     start_copy:
       "Create an expiring start proposal. Human confirmation in Ride is required unless bounded Ride authority applies.",
     get_portfolio:
-      "Read an owned saved preview by plan_id, optionally detail:detailed with analysis_depth:summary for a concise first conclusion, analysis_depth:extended for further evidence, or detail:brief to collapse. Formulas are omitted unless include_calculations:true is explicitly requested; never regenerates that plan or changes preferences. Without plan_id, read current owned portfolio/last saved preview. Show conversation_display.markdown concisely and distinguish preview from actual execution.",
+      "Read an owned saved preview by plan_id, optionally detail:detailed with analysis_depth:summary for a concise first conclusion, analysis_depth:extended for further evidence, or detail:brief to collapse. Formulas are omitted unless include_calculations:true is explicitly requested; never regenerates that plan or changes preferences. Without plan_id, read current owned portfolio/last saved preview. Show conversation_display.markdown concisely and distinguish preview from actual execution. For an owned portfolio, account_bound and operational must be verified before describing copying as started; explain activation.readiness.blockers and actual executions separately. A queued confirmation or active configuration alone is insufficient.",
     update_copy:
       "Propose amount, leverage cap, sleeve loss trigger or an explicit eligible replacement. Released funds must be verified.",
     stop_copy:

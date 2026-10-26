@@ -89,7 +89,9 @@ function fixture(funding = false, wrongUrl = false) {
     },
   );
   const frame = nodes.find((n) => n.tag === "iframe");
-  const state = nodes.find((n) => n.textContent === "正在连接 Ride 确认卡片…");
+  const state = nodes.find(
+    (n) => n.textContent === "Connecting your Rider confirmation…",
+  );
   return {
     frame,
     state,
@@ -123,7 +125,7 @@ it("unresponsive confirmation frames show a usable fallback without calling an a
   const f = fixture();
   f.expire();
   assert.equal(f.frame.hidden, true);
-  assert.match(f.state.textContent, /在 Ride 页面中打开/);
+  assert.match(f.state.textContent, /Open the Rider page/);
   assert.equal(f.toolCalls(), 0);
 });
 
@@ -141,8 +143,8 @@ it("funding cards validate their own URL/frame/deposit and send only public fund
     /allow-storage-access-by-user-activation/,
   );
   f.expire();
-  assert.match(f.state.textContent, /刷新 Rider 连接/);
-  assert.doesNotMatch(f.state.textContent, /页面中打开/);
+  assert.match(f.state.textContent, /Refresh your Rider connection/);
+  assert.doesNotMatch(f.state.textContent, /Open the Rider page/);
   f.message({ origin: "https://evil.test" });
   f.message({ source: {} });
   f.message({
@@ -154,7 +156,7 @@ it("funding cards validate their own URL/frame/deposit and send only public fund
   });
   assert.equal(f.contexts.length, 0);
   f.message();
-  assert.equal(f.state.textContent, "入金已到账");
+  assert.equal(f.state.textContent, "Funding credited");
   assert.deepEqual(JSON.parse(JSON.stringify(f.contexts)), [
     { deposit_id: "deposit_" + "a".repeat(32), funding_status: "credited" },
   ]);
@@ -180,7 +182,7 @@ it("only a message from the owned Ride frame can cancel fallback or restore a la
     assert.equal(f.frame.hidden, true);
     f.message();
     assert.equal(f.frame.hidden, false);
-    assert.doesNotMatch(f.state.textContent, /未能加载/);
+    assert.doesNotMatch(f.state.textContent, /could not load/);
     assert.equal(f.toolCalls(), 0);
   }
   const f = fixture();

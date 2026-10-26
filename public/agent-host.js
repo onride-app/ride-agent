@@ -79,10 +79,10 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
       );
     const frame = document.createElement("iframe");
     frame.title = funding
-      ? "Rider 入金确认"
+      ? "Rider funding confirmation"
       : demo
-        ? "Rider 模拟确认卡片"
-        : "Rider 操作确认";
+        ? "Rider confirmation demo"
+        : "Rider confirmation";
     frame.className = "confirmation-frame";
     frame.referrerPolicy = "no-referrer";
     frame.setAttribute(
@@ -103,7 +103,7 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
       base,
     ).href;
     container.append(frame);
-    const state = el("p", "正在连接 Ride 确认卡片…", "muted");
+    const state = el("p", "Connecting your Rider confirmation…", "muted");
     state.setAttribute("aria-live", "polite");
     container.append(state);
     const readyTimeout = setTimeout(() => {
@@ -113,8 +113,8 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
       }
       frame.hidden = true;
       state.textContent = funding
-        ? "当前客户端未能加载对话内入金卡片。请刷新 Rider 连接后重试；尚未提交入金。"
-        : "当前客户端未能加载内嵌确认。请在 Ride 页面中打开；有效登录会自动复用。";
+        ? "This client could not load the funding card. Refresh your Rider connection and try again. No funding has been submitted."
+        : "This client could not load the confirmation card. Open the Rider page to review the same proposal; an existing sign-in will be reused.";
     }, 8000);
     const onMessage = (event) => {
       if (!frame.isConnected) {
@@ -131,26 +131,28 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
       clearTimeout(readyTimeout);
       frame.hidden = false;
       const names = {
-        demo_ready: "模拟卡片已就绪 · 不会交易",
-        demo_confirmed: "模拟确认成功 · 未提交交易",
-        demo_rejected: "模拟已取消 · 未提交交易",
-        sign_in_required: "请在卡片中连接 Ride",
-        requires_confirmation: "请核对方案并确认",
-        queued: "已确认，等待处理",
-        rejected: "方案已取消",
-        confirmed: "已确认",
-        expired: "方案已过期",
-        quote_expired: "入金报价已过期，请在卡片内刷新后重新确认",
-        submitting: "入金正在提交，请勿重复确认",
-        submitted: "入金交易已提交，等待交易账户到账",
-        credited: "入金已到账",
-        uncertain: "入金结果待核实，请在卡片内查询状态",
-        failed: "入金失败，请核对交易记录",
+        demo_ready: "Demo ready · no trading",
+        demo_confirmed: "Demo confirmed · no transaction submitted",
+        demo_rejected: "Demo cancelled · no transaction submitted",
+        sign_in_required: "Connect Rider in the card",
+        requires_confirmation: "Review the proposal before confirming",
+        queued: "Confirmed and queued for processing",
+        rejected: "Proposal cancelled",
+        confirmed: "Confirmed",
+        expired: "Proposal expired",
+        quote_expired:
+          "Funding quote expired. Refresh it in the card before confirming.",
+        submitting: "Funding submission in progress. Do not submit again.",
+        submitted: "Funding submitted. Waiting for the trading account credit.",
+        credited: "Funding credited",
+        uncertain:
+          "Funding outcome needs verification. Check its status in the card.",
+        failed: "Funding failed. Review the transaction record.",
       };
       state.textContent =
         funding && event.data.status === "requires_confirmation"
-          ? "请在卡片内核对金额并确认入金"
-          : (names[event.data.status] ?? "Rider 状态已更新");
+          ? "Review the exact amount and confirm funding in the card"
+          : (names[event.data.status] ?? "Rider status updated");
       if (
         funding &&
         [
@@ -187,15 +189,15 @@ function confirmationCard(container, proposal, demo, kind = "proposal") {
       el(
         "p",
         demo
-          ? "0 USDC 界面测试 · 不连接账户或执行服务"
+          ? "0 USDC interface demo · no account or execution service"
           : funding
-            ? `${proposal.amount_usdc} USDC · ${proposal.network} · 入金结果以上方卡片状态为准`
-            : `操作 ${proposal.action} · 状态 ${proposal.status} · 请在 Ride 中核对完整方案`,
+            ? `${proposal.amount_usdc} USDC · ${proposal.network} · check the card above for the funding outcome`
+            : `Action ${proposal.action} · Status ${proposal.status} · Review the full proposal in Rider`,
         "muted",
       ),
     );
     if (proposal.confirmation_url && !funding) {
-      const fallback = el("button", "在 Ride 页面中打开", "secondary");
+      const fallback = el("button", "Open in Rider", "secondary");
       const fallbackUrl = demo
         ? new URL("/agent/card-demo", base).href
         : proposal.confirmation_url;

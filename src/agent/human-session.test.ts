@@ -11,6 +11,7 @@ const proposal = "proposal_fixture_12345678";
 async function fixture() {
   let exchanges = 0,
     writes = 0;
+  const providers: Array<string | undefined> = [];
   const downstream = express();
   downstream.use(express.json());
   downstream.post("/agent/human/:operation", (req, res) => {
@@ -57,8 +58,9 @@ async function fixture() {
       jsSdkUrl: `${base}/fixture-sdk.js`,
       manualTokenAuthEnabled: false,
     },
-    exchange: async () => {
+    exchange: async (input) => {
       exchanges++;
+      providers.push(input.authProvider);
       return { rideAuthToken: "fixture-core" };
     },
   });
@@ -89,6 +91,7 @@ async function fixture() {
     login,
     handoffs,
     counts: () => ({ exchanges, writes }),
+    providers: () => [...providers],
     close: () => {
       listener.close();
       listener.closeAllConnections();
@@ -461,6 +464,46 @@ it("funding handoffs are single-use, deposit-bound and cannot confirm proposals 
       403,
     );
     assert.deepEqual(f.counts(), { exchanges: 1, writes: 0 });
+  } finally {
+    f.close();
+  }
+});
+
+it("accepts Apple and Google human sessions while preserving legacy defaults and rejecting unknown providers", async () => {
+  const f = await fixture();
+  try {
+    for (const operation of ["login", "embedded-login"]) {
+      const payload = {
+        privyId: "fixture",
+        privyAccessToken: "fixture-token",
+        ...(operation === "embedded-login"
+          ? { deposit_id: "deposit_" + "a".repeat(32) }
+          : {}),
+      };
+      const headers: Record<string, string> =
+        operation === "embedded-login" ? { "X-Ride-Embedded": "1" } : {};
+      for (const provider of [undefined, "GOOGLE", "APPLE"]) {
+        const response = await f.post(
+          operation,
+          { ...payload, authProvider: provider },
+          headers,
+        );
+        assert.equal(response.status, 200);
+        assert.equal(f.providers().at(-1), provider ?? "GOOGLE");
+      }
+      for (const provider of ["GITHUB", "apple", null, 1]) {
+        const before = f.counts().exchanges;
+        const response = await f.post(
+          operation,
+          { ...payload, authProvider: provider },
+          headers,
+        );
+        assert.equal(response.status, 400);
+        assert.equal(f.counts().exchanges, before);
+        assert.equal(response.headers.get("set-cookie"), null);
+      }
+    }
+    assert.equal(f.counts().writes, 0);
   } finally {
     f.close();
   }

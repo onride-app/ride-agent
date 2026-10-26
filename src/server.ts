@@ -166,7 +166,7 @@ async function main(): Promise<void> {
   );
   app.post("/mcp", auth, async (req, res) => {
     const server = new McpServer(
-      { name: "ride", title: "Rider", version: VERSION },
+      { name: "Rider", title: "Rider", version: VERSION },
       { instructions: GUIDE_INSTRUCTIONS },
     );
     registerGuide(server);

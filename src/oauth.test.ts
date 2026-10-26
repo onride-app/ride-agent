@@ -6,7 +6,11 @@ import { afterEach, describe, it } from "node:test";
 import { runInNewContext } from "node:vm";
 
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { createRideOAuthApprovalRouter, RideOAuthProvider } from "./oauth.js";
+import {
+  createRideOAuthApprovalRouter,
+  RideOAuthProvider,
+  type PrivyAuthorizationInput,
+} from "./oauth.js";
 import { createRideHttpApp, requestBodyErrorHandler } from "./http_security.js";
 
 const client: OAuthClientInformationFull = {
@@ -18,13 +22,16 @@ const client: OAuthClientInformationFull = {
   response_types: ["code"],
 };
 
-function createProvider() {
+function createProvider(onExchange?: (input: PrivyAuthorizationInput) => void) {
   return new RideOAuthProvider({
     validateRideToken: async (token) => ({ subject: token }),
-    exchangePrivyToken: async (input) => ({
-      rideAuthToken: input.privyAccessToken,
-      identity: { subject: input.privyId },
-    }),
+    exchangePrivyToken: async (input) => {
+      onExchange?.(input);
+      return {
+        rideAuthToken: input.privyAccessToken,
+        identity: { subject: input.privyId },
+      };
+    },
     authPage: {
       privyAppId: "public-app-id",
       privyClientId: "public-client-id",
@@ -108,6 +115,201 @@ it("retries a failed Privy initialization with a fresh client and deduplicates c
       message: "signal is aborted without reason",
     }),
     /Privy timed out/,
+  );
+});
+
+async function consentHtml(scopes = ["ride:read", "ride:trade"]) {
+  let html = "";
+  await createProvider().authorize(
+    client,
+    {
+      redirectUri: client.redirect_uris[0],
+      codeChallenge: "challenge",
+      scopes,
+    },
+    {
+      status() {
+        return this;
+      },
+      type() {
+        return this;
+      },
+      send(value: string) {
+        html = value;
+      },
+    } as unknown as Response,
+  );
+  return html;
+}
+function consentPage(html: string, store: Map<string, string>, href: string) {
+  const elements = new Map<string, any>();
+  const generated: any[] = [],
+    completed: any[] = [],
+    approved: any[] = [],
+    redirects: string[] = [];
+  const currentUser = {
+    id: "did:privy:fixture",
+    linkedAccounts: [
+      {
+        type: "wallet",
+        chainType: "ethereum",
+        walletClientType: "privy",
+        address: "0xfixture",
+        id: "wallet_fixture",
+      },
+      { type: "apple_oauth", email: "fixture@privaterelay.appleid.com" },
+    ],
+  };
+  class MockPrivy {
+    async initialize() {}
+    async getAccessToken() {
+      return "fixture-privy-token";
+    }
+    user = { get: async () => ({ user: currentUser }) };
+    auth = {
+      oauth: {
+        generateURL: async (...args: any[]) => {
+          generated.push(args);
+          return { url: "https://auth.privy.test/start" };
+        },
+        loginWithCode: async (...args: any[]) => {
+          completed.push(args);
+          return { user: currentUser };
+        },
+      },
+    };
+  }
+  const context: any = {
+    URL,
+    Privy: MockPrivy,
+    LocalStorage: class {},
+    document: {
+      getElementById(id: string) {
+        if (!elements.has(id))
+          elements.set(id, {
+            textContent: "",
+            disabled: false,
+            style: {},
+            classList: { toggle() {} },
+            listeners: {} as any,
+            addEventListener(name: string, handler: any) {
+              this.listeners[name] = handler;
+            },
+          });
+        return elements.get(id);
+      },
+    },
+    window: {
+      location: {
+        href,
+        origin: new URL(href).origin,
+        assign(url: string) {
+          redirects.push(url);
+        },
+      },
+    },
+    sessionStorage: {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => store.set(key, value),
+      removeItem: (key: string) => store.delete(key),
+    },
+    fetch: async (url: string, request: any) => {
+      assert.equal(url, "/auth/privy/approve");
+      approved.push(JSON.parse(request.body));
+      return {
+        ok: true,
+        json: async () => ({
+          redirectUrl: "https://client.example/callback?code=fixture",
+        }),
+      };
+    },
+  };
+  const script = html
+    .match(/<script type="module">([\s\S]*?)<\/script>/)![1]
+    .replace(/^\s*import Privy[^\n]*\n/m, "")
+    .replace(
+      "handleOAuthCallback().catch",
+      "globalThis.callbackPromise = handleOAuthCallback().catch",
+    );
+  runInNewContext(script, context);
+  return {
+    elements,
+    generated,
+    completed,
+    approved,
+    redirects,
+    callback: context.callbackPromise,
+  };
+}
+it("keeps Google and Apple provider choices through authorization redirects without exposing developer fields", async () => {
+  const html = await consentHtml();
+  assert.doesNotMatch(html, /id="access-code"|name="access-code"|Scopes:/);
+  assert.match(html, /View your Ride account/);
+  assert.match(html, /Orders require Ride confirmation/);
+  for (const provider of ["GOOGLE", "APPLE"]) {
+    const store = new Map<string, string>();
+    const start = consentPage(
+      html,
+      store,
+      "https://ride.test/authorize?client_id=test-client",
+    );
+    await start.callback;
+    await start.elements
+      .get(provider === "APPLE" ? "apple-login" : "google-login")
+      .listeners.click();
+    assert.equal(start.generated.length, 1);
+    assert.equal(start.generated[0][0], provider.toLowerCase());
+    assert.equal(
+      start.generated[0][1],
+      "https://ride.test/auth/privy/oauth/callback",
+    );
+    assert.equal(store.get("ride:auth:provider"), provider);
+    assert.equal(start.redirects[0], "https://auth.privy.test/start");
+    const returned = consentPage(
+      html,
+      store,
+      "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+    );
+    await returned.callback;
+    assert.equal(returned.completed.length, 1);
+    assert.deepEqual(
+      [...returned.completed[0]],
+      ["code", "state", provider.toLowerCase()],
+    );
+    assert.equal(returned.approved.length, 1);
+    assert.equal(returned.approved[0].auth_provider, provider);
+    assert.equal(
+      returned.approved[0].email,
+      "fixture@privaterelay.appleid.com",
+    );
+    assert.equal(returned.approved[0].access_code, undefined);
+    assert.equal(returned.approved[0].scope, "ride:read ride:trade");
+    assert.equal(
+      returned.redirects[0],
+      "https://client.example/callback?code=fixture",
+    );
+  }
+});
+it("keeps old Google callbacks working while rejecting unsupported stored providers before exchange", async () => {
+  const html = await consentHtml();
+  const legacy = consentPage(
+    html,
+    new Map(),
+    "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+  );
+  await legacy.callback;
+  assert.equal(legacy.approved[0].auth_provider, "GOOGLE");
+  const invalid = consentPage(
+    html,
+    new Map([["ride:auth:provider", "GITHUB"]]),
+    "https://ride.test/authorize?privy_oauth_code=code&privy_oauth_state=state",
+  );
+  await invalid.callback;
+  assert.equal(invalid.completed.length, 0);
+  assert.equal(invalid.approved.length, 0);
+  assert.match(
+    invalid.elements.get("status").textContent,
+    /Choose Google or Apple/,
   );
 });
 
@@ -319,6 +521,41 @@ describe("Ride OAuth approval redirects", () => {
       redirect: "manual",
     });
     assert.equal(formResponse.status, 302);
+  });
+
+  it("accepts only supported providers and defaults existing OAuth clients to Google", async () => {
+    const seen: PrivyAuthorizationInput[] = [];
+    const provider = createProvider((input) => seen.push(input));
+    await provider.clientsStore.registerClient!(client);
+    const baseUrl = await startApprovalServer(provider);
+    const payload = {
+      client_id: client.client_id,
+      redirect_uri: client.redirect_uris[0],
+      code_challenge: "challenge",
+      privy_id: "fixture",
+      privy_access_token: "fixture-token",
+      access_code: "legacy-code",
+    };
+    for (const choice of [undefined, "GOOGLE", "APPLE"]) {
+      const response = await fetch(`${baseUrl}/auth/privy/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...payload, auth_provider: choice }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(seen.at(-1)!.authProvider, choice ?? "GOOGLE");
+      assert.equal(seen.at(-1)!.accessCode, "legacy-code");
+    }
+    for (const choice of ["GITHUB", "apple", null, 1]) {
+      const count = seen.length;
+      const response = await fetch(`${baseUrl}/auth/privy/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...payload, auth_provider: choice }),
+      });
+      assert.equal(response.status, 400);
+      assert.equal(seen.length, count);
+    }
   });
 
   it("rejects oversized chunked OAuth JSON before SDK parsing", async () => {

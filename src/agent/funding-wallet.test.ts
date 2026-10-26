@@ -56,7 +56,7 @@ async function fixture(
   options: { noUser?: boolean; storage?: boolean; deferred?: boolean } = {},
 ) {
   const ids = Object.fromEntries(
-    ["content", "status", "login", "sign-in", "access-code"].map((id) => [
+    ["content", "status", "login", "sign-in", "sign-in-apple"].map((id) => [
       id,
       new Element("div"),
     ]),

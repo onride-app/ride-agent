@@ -291,6 +291,45 @@ export const stateTools = new Set<ToolName>([
   "get_daily_checkin",
 ]);
 export const TOOL_NAMES = Object.keys(inputs) as ToolName[];
+export const errorDetails = z
+  .object({
+    operation: z
+      .string()
+      .regex(/^[a-z_]{1,64}$/)
+      .optional(),
+    grpc_code: z
+      .enum([
+        "OK",
+        "CANCELLED",
+        "UNKNOWN",
+        "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED",
+        "NOT_FOUND",
+        "ALREADY_EXISTS",
+        "PERMISSION_DENIED",
+        "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION",
+        "ABORTED",
+        "OUT_OF_RANGE",
+        "UNIMPLEMENTED",
+        "INTERNAL",
+        "UNAVAILABLE",
+        "DATA_LOSS",
+        "UNAUTHENTICATED",
+      ])
+      .optional(),
+    reason_code: z
+      .string()
+      .regex(/^[A-Z0-9_]{1,64}$/)
+      .optional(),
+    retry_after_ms: z.number().int().nonnegative().max(60_000).optional(),
+    blockers: z
+      .array(z.string().regex(/^[A-Z0-9_]{1,64}$/))
+      .max(20)
+      .optional(),
+  })
+  .strict();
+export type ErrorDetails = z.infer<typeof errorDetails>;
 export const output = z
   .object({
     version: z.literal("3"),
@@ -312,7 +351,12 @@ export const output = z
     warnings: z.array(z.string()),
     as_of: z.string(),
     error: z
-      .object({ code: z.string(), message: z.string(), retryable: z.boolean() })
+      .object({
+        code: z.string(),
+        message: z.string(),
+        retryable: z.boolean(),
+        details: errorDetails.optional(),
+      })
       .strict()
       .optional(),
   })
@@ -325,6 +369,7 @@ export class AgentError extends Error {
     message: string,
     public retryable = false,
     public httpStatus = 409,
+    public details?: ErrorDetails,
   ) {
     super(message);
   }
@@ -361,7 +406,12 @@ export function failure(error: unknown): Result {
           );
   return {
     ...result({}, "failed"),
-    error: { code: e.code, message: e.message, retryable: e.retryable },
+    error: {
+      code: e.code,
+      message: e.message,
+      retryable: e.retryable,
+      ...(e.details ? { details: errorDetails.parse(e.details) } : {}),
+    },
   };
 }
 

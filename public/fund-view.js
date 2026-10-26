@@ -588,7 +588,7 @@ function showLogin() {
       "Connect Ride to confirm funding here";
     document.getElementById("sign-in").textContent =
       "Connect Ride in this card";
-    document.getElementById("access-code").parentElement.hidden = true;
+    document.getElementById("sign-in-apple").hidden = true;
     announce("sign_in_required");
   }
 }
@@ -648,7 +648,7 @@ async function connectInline() {
       privyAccessToken: await c.getAccessToken(),
       walletAddress: wallet?.address,
       privyWalletId: wallet?.id,
-      authProvider: "GOOGLE",
+      authProvider: loginProvider(user),
     })
   ).csrf;
   await ready();
@@ -690,34 +690,42 @@ async function finish(session) {
     privyAccessToken: await c.getAccessToken(),
     walletAddress: wallet?.address,
     privyWalletId: wallet?.id,
-    authProvider: "GOOGLE",
-    accessCode: sessionStorage.getItem("ride:agent:access-code") ?? undefined,
+    authProvider: loginProvider(user),
   });
   csrf = login.csrf;
-  sessionStorage.removeItem("ride:agent:access-code");
   await ready();
 }
-document.getElementById("sign-in").onclick = async () => {
+function loginProvider(currentUser) {
+  const stored = sessionStorage.getItem("ride:auth:provider");
+  if (stored === "GOOGLE" || stored === "APPLE") return stored;
+  if (stored != null) throw Error("Choose Google or Apple to restart sign-in.");
+  const accounts =
+    currentUser?.linked_accounts ?? currentUser?.linkedAccounts ?? [];
+  return accounts.some((a) => a.type === "apple_oauth" || a.type === "apple") &&
+    !accounts.some((a) => a.type === "google_oauth" || a.type === "google")
+    ? "APPLE"
+    : "GOOGLE";
+}
+async function startLogin(provider) {
   try {
     if (embedded) {
       await connectInline();
       return;
     }
+    sessionStorage.setItem("ride:auth:provider", provider);
     const c = await init();
     sessionStorage.setItem("ride:mcp:oauth_authorize_url", location.href);
-    sessionStorage.setItem(
-      "ride:agent:access-code",
-      document.getElementById("access-code").value,
-    );
     const out = await c.auth.oauth.generateURL(
-      "google",
+      provider.toLowerCase(),
       `${location.origin}/auth/privy/oauth/callback`,
     );
     location.assign(out.url);
   } catch (e) {
     showError(e);
   }
-};
+}
+document.getElementById("sign-in").onclick = () => startLogin("GOOGLE");
+document.getElementById("sign-in-apple").onclick = () => startLogin("APPLE");
 const query = new URL(location.href).searchParams;
 try {
   if (query.get("privy_oauth_code") && query.get("privy_oauth_state")) {
@@ -725,7 +733,7 @@ try {
     const session = await c.auth.oauth.loginWithCode(
       query.get("privy_oauth_code"),
       query.get("privy_oauth_state"),
-      "google",
+      loginProvider().toLowerCase(),
     );
     const clean = new URL(location.href);
     clean.searchParams.delete("privy_oauth_code");
