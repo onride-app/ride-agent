@@ -51,14 +51,29 @@ export const securityHeaders: RequestHandler = (_req, res, next) => {
   next();
 };
 
+export function trustedProxyHopsFromEnv(env: NodeJS.ProcessEnv): number {
+  const raw = env.HTTP_TRUST_PROXY_HOPS;
+  if (raw === undefined) return env.RAILWAY_ENVIRONMENT_ID ? 1 : 0;
+  if (!/^[0-3]$/.test(raw)) {
+    throw new Error("HTTP_TRUST_PROXY_HOPS must be an integer from 0 to 3");
+  }
+  return Number(raw);
+}
+
 /**
  * Builds the production HTTP app with OAuth parsers mounted before the general
  * MCP JSON parser. This ordering is security-sensitive: mounting the SDK's
  * default JSON parser first would cause a later 32 KiB OAuth parser to skip an
  * already-parsed request body.
  */
-export function createRideHttpApp(host: string): Express {
+export function createRideHttpApp(
+  host: string,
+  trustedProxyHops = trustedProxyHopsFromEnv(process.env),
+): Express {
   const app = express();
+  // Railway public HTTP ingress supplies the client address. Trust only the
+  // nearest configured hops, never an arbitrary leftmost forwarded address.
+  app.set("trust proxy", trustedProxyHops === 0 ? false : trustedProxyHops);
   app.disable("x-powered-by");
   app.use(securityHeaders);
   app.use(rejectOversizedDeclaredBody);
