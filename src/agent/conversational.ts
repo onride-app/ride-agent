@@ -93,6 +93,17 @@ export function alternatives(plan: Plan, candidates: Candidate[]) {
     outgoing_trader_id: string;
     incoming_trader: Candidate;
     fewer_flags: number;
+    base_plan_id: string;
+    kind: "one_for_one_replacement";
+    trader_count_unchanged: true;
+    measured_risk_improvement: null;
+    replacement_arguments: {
+      plan_id: string;
+      replacements: {
+        outgoing_trader_id: string;
+        incoming_trader_id: string;
+      }[];
+    };
   }[] = [];
   for (const out of plan.allocations)
     for (const candidate of candidates) {
@@ -109,6 +120,19 @@ export function alternatives(plan: Plan, candidates: Candidate[]) {
           outgoing_trader_id: out.trader.id,
           incoming_trader: candidate,
           fewer_flags: improvement,
+          base_plan_id: plan.id,
+          kind: "one_for_one_replacement",
+          trader_count_unchanged: true,
+          measured_risk_improvement: null,
+          replacement_arguments: {
+            plan_id: plan.id,
+            replacements: [
+              {
+                outgoing_trader_id: out.trader.id,
+                incoming_trader_id: candidate.id,
+              },
+            ],
+          },
         });
     }
   return suggestions

@@ -75,6 +75,7 @@ export const inputs = {
   set_preferences: preferenceAnswers,
   recommend_traders: z
     .object({
+      detail: z.enum(["brief", "detailed"]).default("brief"),
       preferences: preferenceAnswers.optional(),
       batch_action: z.enum(["first", "next", "saved"]).optional(),
       batch_index: z.number().int().min(0).max(1).optional(),
@@ -92,6 +93,9 @@ export const inputs = {
     .strict(),
   browse_traders: z
     .object({
+      plan_id: id.optional(),
+      exclude_selected: z.boolean().default(false),
+      detail: z.enum(["brief", "detailed"]).default("brief"),
       sort_by: z.enum(["score", "drawdown", "roi"]).default("score"),
       direction: z.enum(["asc", "desc"]).optional(),
       limit: z.number().int().min(1).max(20).default(5),
@@ -114,6 +118,14 @@ export const inputs = {
   recalculate_plan: z
     .object({
       plan_id: id,
+      detail: z.enum(["brief", "detailed"]).default("brief"),
+      replacements: z
+        .array(
+          z.object({ outgoing_trader_id: id, incoming_trader_id: id }).strict(),
+        )
+        .min(1)
+        .max(8)
+        .optional(),
       preferences: preferenceAnswers.optional(),
       allocations: z
         .array(
@@ -121,7 +133,13 @@ export const inputs = {
             .object({
               trader_id: id,
               amount_usdc: positiveMoney,
-              leverage_cap: z.number().int().min(1).max(40).nullable().optional(),
+              leverage_cap: z
+                .number()
+                .int()
+                .min(1)
+                .max(40)
+                .nullable()
+                .optional(),
               stop_loss_pct: z.number().min(1).max(100).optional(),
               ...copySettings,
             })
@@ -131,7 +149,11 @@ export const inputs = {
         .max(8)
         .optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (v) => !v.replacements || (!v.allocations && !v.preferences),
+      "Use replacements alone to preserve the original allocation and risk settings",
+    ),
   get_performance: z
     .object({
       portfolio_id: id.optional(),
@@ -167,7 +189,15 @@ export const inputs = {
         }, "Use an IANA timezone"),
     })
     .strict(),
-  get_portfolio: portfolioInput,
+  get_portfolio: portfolioInput
+    .extend({
+      plan_id: id.optional(),
+      detail: z.enum(["brief", "detailed"]).default("brief"),
+    })
+    .refine(
+      (v) => !(v.plan_id && v.portfolio_id),
+      "Read a plan or a portfolio, not both",
+    ),
   update_copy: z
     .object({
       copy_id: id,

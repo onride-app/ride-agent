@@ -177,3 +177,9 @@ Conversational features include single or 2–8 trader previews, fixed/proportio
 Recommendation onboarding now returns missing preference questions and persists partial answers before fetching candidates. Perps funding continues from the owned receiving wallet through browser confirmation, optional Embedded Wallet signature, trading-account activation and verified trading balance. Prediction status verifies trading collateral separately from bridge completion. Old App routes and deployments remain independent.
 
 Widget/account repairs in 0.4.3 default asset preferences to unrestricted Crypto/RWA, keep candidates visible without a plan, and explain feasible trader counts without changing risk settings. `get_portfolio` separates per-market balances from copy allocations; missing modules remain unavailable. See [behavior, coverage and acceptance](docs/widget-account-v043.md).
+
+### Candidate browsing and concise previews
+
+Native recommendations default to `conversation_display.markdown`: one combined allocation/performance table, concrete copy-sizing and exit-trigger summaries, and a details action. `get_portfolio` with `plan_id` and `detail: detailed` explains the same immutable preview without regenerating it. Compatible recommendation/comparison fields remain available.
+
+For alternatives, `browse_traders` accepts `plan_id` and `exclude_selected: true`; browsing or refreshing candidate data never changes plans or preferences. An explicit one-for-one edit uses `recalculate_plan.replacements`, preserving count, slot amounts and risk/copy settings. Other count or amount edits retain the existing explicit allocation API. Returned `plan_change` identifies each compared plan; capital concentration and qualitative overlap flags are not measured risk reduction.
