@@ -17,6 +17,7 @@ import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
 import { SourceFeed } from "./source-feed.js";
 import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
+import { readSelectedPlanEvidence } from "./read-evidence.js";
 import {
   checkPerpsOrder,
   HYPERLIQUID_MIN_OPEN_NOTIONAL_USDC,
@@ -1683,6 +1684,11 @@ export class CoreBridge {
   }
   async operation(op: string, input: any): Promise<unknown> {
     switch (op) {
+      case "read_plan_evidence":
+        return readSelectedPlanEvidence(input?.traders, {
+          resolveTrader: (id) => this.resolve(id),
+          info: (payload) => this.info(payload, true),
+        });
       case "deposit_options":
         return new DepositReads(
           (op, input) => this.core(op, input),

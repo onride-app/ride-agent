@@ -1,4 +1,5 @@
 import { AgentError, errorDetails } from "./contracts.js";
+import { isPlanReadEvidence, type PlanReadEvidence } from "./read-evidence.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -20,6 +21,7 @@ export interface ActivationCheck {
   idempotent_existing: boolean;
 }
 export interface VenueAdapter {
+  readPlanEvidence?(traders: Candidate[]): Promise<PlanReadEvidence>;
   activationCheck?(
     user: string,
     portfolio: Portfolio,
@@ -135,6 +137,7 @@ function invalidBridgeResponse(response: Response): AgentError {
 
 function validBridgeResponse(operation: string, data: unknown): boolean {
   if (operation === "candidates") return Array.isArray(data);
+  if (operation === "read_plan_evidence") return isPlanReadEvidence(data);
   if (!record(data)) return false;
   if (!["account", "preflight", "bind"].includes(operation)) return true;
   return (
@@ -268,6 +271,23 @@ export class BridgeAdapter implements VenueAdapter {
   }
   candidates(market?: "perps" | "prediction" | "both") {
     return this.call<Candidate[]>("candidates", market ? { market } : {});
+  }
+  async readPlanEvidence(traders: Candidate[]) {
+    const result = await this.call<PlanReadEvidence>("read_plan_evidence", {
+      traders,
+    });
+    const expected = new Set(traders.map((trader) => trader.id));
+    if (
+      result.sources.length !== expected.size ||
+      result.sources.some((source) => !expected.has(source.trader_id))
+    )
+      throw new AgentError(
+        "EXECUTOR_RESPONSE_INVALID",
+        "Read-only evidence did not match the selected traders.",
+        true,
+        502,
+      );
+    return result;
   }
   sourceFills(trader: Candidate, start: number, end: number) {
     return this.call<{

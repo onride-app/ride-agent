@@ -52,6 +52,7 @@ export const preferenceAnswers = z
   .partial()
   .strict();
 export const analysisOptions = {
+  locale: z.enum(["en", "zh"]).optional(),
   analysis_depth: z.enum(["summary", "extended"]).default("summary"),
   include_calculations: z.boolean().default(false),
 };
@@ -81,7 +82,9 @@ export const candidateMetricWindow = z
     "Metric window must have start before end",
   );
 export const inputs = {
-  get_preferences: z.object({}).strict(),
+  get_preferences: z
+    .object({ locale: z.enum(["en", "zh"]).optional() })
+    .strict(),
   prepare_deposit: z
     .object({ deposit_id: id, amount_usdc: positiveMoney })
     .strict(),
@@ -130,6 +133,7 @@ export const inputs = {
     ),
   browse_traders: z
     .object({
+      locale: z.enum(["en", "zh"]).optional(),
       plan_id: id.optional(),
       exclude_selected: z.boolean().default(false),
       detail: z.enum(["brief", "detailed"]).default("brief"),
@@ -150,8 +154,15 @@ export const inputs = {
     ),
   get_trader_profile: z
     .object({
+      locale: z.enum(["en", "zh"]).optional(),
       trader_id: id,
       market: z.enum(["perps", "prediction"]).optional(),
+    })
+    .strict(),
+  preview_copy_orders: z
+    .object({
+      plan_id: id,
+      locale: z.enum(["en", "zh"]).optional(),
     })
     .strict(),
   start_copy: z

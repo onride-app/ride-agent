@@ -1,5 +1,33 @@
 import { preferences, type Preferences } from "./contracts.js";
 import type { State } from "./repository.js";
+import { localized, type Locale } from "./locale.js";
+
+export function preferenceCollectionDisplay<T extends Record<string, any>>(
+  value: T,
+  locale?: Locale,
+): T {
+  if (!locale) return value;
+  const out: Record<string, any> = structuredClone(value);
+  const english: Record<string, string> = {
+    budget_usdc: "How much USDC would you like to allocate?",
+    risk_tolerance:
+      "Is your risk preference conservative, balanced or aggressive?",
+    fixed_margin_usdc:
+      "How much USDC margin should each verified new source opening use in fixed mode?",
+  };
+  if (Array.isArray(out.questions))
+    out.questions = out.questions.map((q: any) => ({
+      ...q,
+      question: localized(locale, q.question, english[q.field] ?? q.question),
+    }));
+  if (out.suggestions?.explanation)
+    out.suggestions.explanation = localized(
+      locale,
+      out.suggestions.explanation,
+      "Suggested portfolio loss-exit trigger, editable before confirmation; exits are best-effort, not a maximum-loss guarantee.",
+    );
+  return out as T;
+}
 
 // Product planning presets, not inferred user consent or guaranteed loss caps.
 export const suggestedLoss = { low: 10, medium: 20, high: 30 } as const;

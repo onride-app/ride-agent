@@ -27,6 +27,7 @@ import {
   type AccountSnapshot,
 } from "../src/agent/domain.js";
 import type { VenueAdapter } from "../src/agent/adapter.js";
+import type { PlanReadEvidence } from "../src/agent/read-evidence.js";
 import { saveSession } from "../src/cli/session.js";
 
 const run = promisify(execFile),
@@ -528,7 +529,7 @@ try {
     });
     assert.deepEqual(mcp.structuredContent, guide);
     assert.deepEqual(await cli(["guide", "--server", base + "/mcp"]), guide);
-    assert.equal((await alice.client.listTools()).tools.length, 26);
+    assert.equal((await alice.client.listTools()).tools.length, 27);
     assert(alice.client.getInstructions()?.includes("get_ride_guide"));
     assert.equal(guide.protocol, "ride-guide-v1");
     const demo = await alice.client.callTool({
@@ -536,7 +537,7 @@ try {
       arguments: { mode: "demo" },
     });
     assert.equal((demo.structuredContent as any).data.confirmation_demo, true);
-    return { release: guide.release, sha256: guide.sha256, tools: 26 };
+    return { release: guide.release, sha256: guide.sha256, tools: 27 };
   });
   await check(
     "45 20-USDC Perps：MCP/CLI 推荐、重算和确认前不下单",
@@ -2162,7 +2163,10 @@ try {
         })
       ).data;
       assert.equal(brief.conversation_display.detail, "brief");
-      assert(brief.conversation_display.markdown.length < 1300);
+      assert(
+        brief.conversation_display.markdown.length < 1300,
+        `Brief output exceeded its limit: ${brief.conversation_display.markdown.length}`,
+      );
       assert.match(
         brief.conversation_display.markdown,
         /分配资金与源账户权益的比例/,
@@ -2190,7 +2194,10 @@ try {
       );
       assert(
         detail.final_review.traders.every(
-          (t: any) => t.copy_rule.next_order_size === null,
+          (t: any) =>
+            t.copy_rule.next_order_size?.scope ===
+              "hypothetical_initial_target" &&
+            t.copy_rule.next_order_size.status === "incomplete",
         ),
       );
       const plansAfter = await repo.transact(users.widget, async (state) =>
@@ -2506,6 +2513,157 @@ try {
       delete (venue as any).activationCheck;
     }
   });
+  await check(
+    "53 只读证据和订单预检：双语同事实、不改方案且不触发执行",
+    async () => {
+      const before = await repo.read(users.widget);
+      const saved = before.plans.at(-1)!;
+      assert(saved && saved.allocations.length === 4);
+      const submitted = venue.submits.length;
+      const oldRead = (venue as VenueAdapter).readPlanEvidence;
+      const at = now();
+      const assets = [
+        ...new Set(saved.allocations.flatMap((a) => a.trader.assets)),
+      ];
+      const evidence: PlanReadEvidence = {
+        observed_at: at,
+        read_only: true,
+        execution_authorized: false,
+        sources: saved.allocations.map((a) => ({
+          trader_id: a.trader.id,
+          status: "available",
+          equity_basis: "standard_clearinghouse_account_value",
+          equity_verified: true,
+          account_mode: "standard",
+          scope: "base_perps",
+          coverage_complete: true,
+          timestamp_basis: "read_completed_at",
+          snapshot: {
+            observed_at: at,
+            revision: "functional_public_snapshot",
+            account_value_usdc: "1000",
+            complete: true,
+            positions: [
+              {
+                key: `perps:${a.trader.assets[0]}`,
+                asset: a.trader.assets[0],
+                market: "perps",
+                quantity: "20",
+                price: "100",
+                source_entry_price: "100",
+                source_leverage: 2,
+                source_leverage_verified: true,
+                observed_at: at,
+                source_revision: "functional_public_snapshot",
+                mark_price: "100",
+                position_notional_usdc: "2000",
+                position_notional_basis: "current_mark",
+              },
+            ],
+          },
+        })),
+        market: {
+          observed_at: at,
+          prices: Object.fromEntries(assets.map((a) => [`perps:${a}`, "100"])),
+          max_leverages: Object.fromEntries(
+            assets.map((a) => [`perps:${a}`, 8]),
+          ),
+          quantity_decimals: Object.fromEntries(
+            assets.map((a) => [`perps:${a}`, 2]),
+          ),
+          min_notionals: Object.fromEntries(
+            assets.map((a) => [`perps:${a}`, "10"]),
+          ),
+          coverage_complete: true,
+          scope: "base_perps",
+          product_planning_max_leverage: 40,
+          legacy_candidate_venue_max_leverage_basis:
+            "product_planning_envelope",
+          reason_codes: [],
+        },
+      };
+      (venue as VenueAdapter).readPlanEvidence = async (traders) => ({
+        ...structuredClone(evidence),
+        sources: structuredClone(
+          evidence.sources.filter((source) =>
+            traders.some((t) => t.id === source.trader_id),
+          ),
+        ),
+      });
+      try {
+        const en = (
+          await ok(widgetClient, "get_portfolio", {
+            plan_id: saved.id,
+            locale: "en",
+          })
+        ).data;
+        const zh = (
+          await ok(widgetClient, "get_portfolio", {
+            plan_id: saved.id,
+            locale: "zh",
+          })
+        ).data;
+        const check = (
+          await ok(widgetClient, "preview_copy_orders", {
+            plan_id: saved.id,
+            locale: "en",
+          })
+        ).data;
+        assert.deepEqual(en.plan, saved);
+        assert.deepEqual(zh.plan, saved);
+        assert.deepEqual(
+          en.conversation_display.trader_ids,
+          zh.conversation_display.trader_ids,
+        );
+        assert.deepEqual(
+          en.order_precheck.orders.map((o: any) => [
+            o.key,
+            o.target_quantity,
+            o.order_notional_usdc,
+            o.reason_code,
+          ]),
+          zh.order_precheck.orders.map((o: any) => [
+            o.key,
+            o.target_quantity,
+            o.order_notional_usdc,
+            o.reason_code,
+          ]),
+        );
+        assert.doesNotMatch(
+          en.conversation_display.markdown,
+          /[\u4e00-\u9fff]/,
+        );
+        assert.match(zh.conversation_display.markdown, /方案|组合|交易员/);
+        assert.equal(check.order_precheck.status, "checked");
+        assert.equal(check.order_precheck.execution_authorized, false);
+        assert.equal(check.order_precheck.account_conditions_verified, false);
+        assert.equal(
+          check.source_evidence.market.product_planning_max_leverage,
+          40,
+        );
+        assert.equal(
+          Object.values(check.source_evidence.market.max_leverages)[0],
+          8,
+        );
+        assert.equal(
+          check.source_evidence.sources[0].snapshot.positions[0]
+            .position_leverage_setting,
+          2,
+        );
+        assert.deepEqual(await repo.read(users.widget), before);
+        assert.equal(venue.submits.length, submitted);
+        return {
+          exact_saved_plan: true,
+          original_count: 4,
+          source_and_venue_facts_separate: true,
+          language_changes_presentation_only: true,
+          real_financial_actions: 0,
+        };
+      } finally {
+        (venue as VenueAdapter).readPlanEvidence = oldRead;
+      }
+    },
+  );
 } catch (e) {
   results.push({
     name: "Harness startup or critical journey prerequisite",

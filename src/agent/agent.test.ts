@@ -442,7 +442,7 @@ describe("approval and ownership", () => {
     assert.equal(adapter.submitCount, count);
   });
 });
-it("exposes twenty-three serializable tools and a read-only directory subset", async () => {
+it("exposes serializable tools and a read-only directory subset", async () => {
   for (const readOnly of [false, true]) {
     const server = new McpServer({ name: "test", version: "1" });
     registerAgentTools(server, async () => result({}), readOnly);
@@ -450,7 +450,7 @@ it("exposes twenty-three serializable tools and a read-only directory subset", a
     const [a, b] = InMemoryTransport.createLinkedPair();
     await Promise.all([server.connect(a), client.connect(b)]);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, readOnly ? 12 : 23);
+    assert.equal(tools.tools.length, readOnly ? 13 : 24);
     assert(tools.tools.every((t) => t.inputSchema.type === "object"));
     for (const name of [
       "get_preferences",

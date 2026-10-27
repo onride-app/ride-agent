@@ -64,7 +64,7 @@ it("publishes the exact OAuth scope for every hosted account tool, including car
           tool.name,
         );
       }
-      assert.equal(tools.length, 25);
+      assert.equal(tools.length, 26);
     },
   );
 });

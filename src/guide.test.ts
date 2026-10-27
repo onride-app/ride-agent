@@ -69,7 +69,7 @@ it("an unchanged running stdio MCP reads a newly deployed workflow without setup
     try {
       await client.connect(transport);
       assert.equal(client.getInstructions(), GUIDE_INSTRUCTIONS);
-      assert.equal((await client.listTools()).tools.length, 25);
+      assert.equal((await client.listTools()).tools.length, 26);
       const resource = (await client.readResource({ uri: RESOURCE_URI }))
         .contents[0];
       assert.deepEqual((resource._meta?.ui as any).csp.frameDomains, [

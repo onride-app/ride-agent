@@ -99,6 +99,7 @@ export const emptyState = (): State => ({
   checkpoints: [],
 });
 export interface Repository {
+  read(user: string): Promise<State>;
   transact<T>(user: string, fn: (state: State) => Promise<T>): Promise<T>;
   users(): Promise<string[]>;
   close(): Promise<void>;
@@ -115,6 +116,16 @@ export class PgRepository implements Repository {
   async migrate(): Promise<void> {
     await this.pool.query(
       `CREATE TABLE IF NOT EXISTS ride_agent_state (user_id TEXT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`,
+    );
+  }
+  async read(user: string): Promise<State> {
+    // Inspections neither create an account row nor lock/update saved plans.
+    const value = await this.pool.query(
+      "SELECT state FROM ride_agent_state WHERE user_id=$1",
+      [user],
+    );
+    return structuredClone(
+      (value.rows[0]?.state as State | undefined) ?? emptyState(),
     );
   }
   async transact<T>(
@@ -164,6 +175,10 @@ export class PgRepository implements Repository {
 export class MemoryRepository implements Repository {
   private states = new Map<string, State>();
   private tails = new Map<string, Promise<unknown>>();
+  async read(user: string): Promise<State> {
+    await (this.tails.get(user) ?? Promise.resolve()).catch(() => {});
+    return structuredClone(this.states.get(user) ?? emptyState());
+  }
   async transact<T>(
     user: string,
     fn: (state: State) => Promise<T>,

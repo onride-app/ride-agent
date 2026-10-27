@@ -444,7 +444,9 @@ function description(name: ToolName): string {
     browse_traders:
       "Browse alternatives without changing the saved plan or preferences: pass plan_id and exclude_selected:true to omit its selected traders; absent/expired snapshots refresh on a request without cursor. detail defaults brief. Page or sort the entire current verified candidate snapshot by score/drawdown/ROI; missing metrics sort last. Filters min_score/max_drawdown_pct/min_roi_pct/max_roi_pct apply to the complete verified snapshot before sorting/pagination. metric_window requires exact verified start/end; missing/unknown periods are excluded, never replaced with another period. Display applied_filters/metric_basis/filter_counts and source coverage. Restart when query changes; carry the same filters/window with next_cursor. compare_ids cannot be mixed with filters/window. Default five, request limit:10 for ten more, pass next_cursor with the same sort. compare_ids compares named public IDs. Does not replace the plan, allocations or selections. Disclose source pool limits, metric periods and incomparable/missing data. Refresh expired snapshots by browsing without a cursor; never generate a replacement plan to browse.",
     get_trader_profile:
-      "Read verified source statistics and actual Copy Score components using a public trader ID.",
+      "Read source statistics and Copy Score components using a public trader ID. Use locale:en for English or locale:zh for Chinese. Read source_evidence and leverage_context: legacy venue_max_leverage is a product planning envelope, not actual source leverage or the per-asset exchange limit. Current positions are not historical opening fills or measured copy success.",
+    preview_copy_orders:
+      "Inspect an exact owned saved plan_id with current public source evidence and per-asset venue rules, without changing its traders, amounts, controls or expiry. Use locale:en or locale:zh to match the user. Read-only hypothetical initial targets from a flat-account assumption, including rounding, basket netting, entry checks, existing portfolio risk rules and order minimums. Never binds an account, configures authority, funds, confirms, ticks a runner or submits an order. Fixed mode requires verified future source fills; incomplete scopes remain unverified. No claim of available collateral, future fill, slippage or actual copy-success rate. An expired plan is inspected as saved, never refreshed.",
     start_copy:
       "Create an expiring start proposal. Human confirmation in Ride is required unless bounded Ride authority applies.",
     get_portfolio:
@@ -460,5 +462,18 @@ function description(name: ToolName): string {
     close_position:
       "Propose closing one owned aggregate position. All affected sleeves are included.",
   };
-  return descriptions[name];
+  return (
+    descriptions[name] +
+    ([
+      "get_preferences",
+      "recommend_traders",
+      "recalculate_plan",
+      "browse_traders",
+      "get_trader_profile",
+      "get_portfolio",
+      "preview_copy_orders",
+    ].includes(name)
+      ? " Pass locale:en for an English user or locale:zh for a Chinese user. Show localized conversation_display, not archived free-form text from the immutable plan. If a cached client schema has no locale parameter, select only the matching markdown_by_locale.en or .zh variant; do not print both or ask for login to change language. A language change never changes the selected traders, amounts or controls."
+      : "")
+  );
 }

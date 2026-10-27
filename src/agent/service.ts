@@ -50,6 +50,7 @@ import { depositView } from "./deposits.js";
 import { localDay } from "./analytics.js";
 import {
   preferenceCollection,
+  preferenceCollectionDisplay,
   completePreferences,
   normalizedAssetPreferences,
   savePreferenceCollection,
@@ -68,6 +69,15 @@ import {
 } from "./conversation-presentation.js";
 import { inheritReselectedSlots } from "./plan-reselection.js";
 import { executionStatus } from "./risk-status.js";
+import {
+  inspectPlanOrders,
+  copyEvidenceOverlay,
+  unavailablePlanEvidence,
+} from "./order-precheck.js";
+import { isPlanReadEvidence } from "./read-evidence.js";
+import type { PlanReadEvidence } from "./read-evidence.js";
+import { sourceEvidenceView } from "./source-evidence-view.js";
+import { localized, resolveLocale, type Locale } from "./locale.js";
 
 export class AgentService {
   get funding() {
@@ -85,20 +95,70 @@ export class AgentService {
   ) {}
   async tool(user: string, name: ToolName, input: unknown): Promise<Result> {
     const args = inputs[name].parse(input) as Record<string, unknown>;
+    if (
+      name === "preview_copy_orders" ||
+      (name === "get_portfolio" && args.plan_id)
+    )
+      return this.inspectSavedPlan(user, args, name === "preview_copy_orders");
+    if (name === "get_portfolio" && !args.portfolio_id) {
+      const state = await this.repository.read(user);
+      const saved = !findPortfolio(state) ? state.plans.at(-1) : undefined;
+      if (saved) {
+        const view = await this.inspectSavedPlan(
+          user,
+          { ...args, plan_id: saved.id },
+          false,
+          state,
+        );
+        return {
+          ...view,
+          status: "empty",
+          data: {
+            ...view.data,
+            portfolio: null,
+            recovery: {
+              source: "saved_preview",
+              plan_id: saved.id,
+              created_at: saved.created_at,
+              expires_at: saved.expires_at,
+              read_only: true,
+              instruction: localized(
+                args.locale as Locale | undefined,
+                "这是原保存方案，读取与预检不会重新选人、刷新方案或执行交易。",
+                "This is the exact saved plan. Reading and inspection do not reselect traders, refresh it or execute trades.",
+              ),
+            },
+            recommendation_batches: state.recommendation_batches,
+            saved_preview: true,
+            candidates: saved.allocations.map((a) => a.trader),
+            unallocated_usdc: cash(
+              D(saved.preferences.budget_usdc).minus(
+                saved.allocations.reduce((n, a) => n.plus(a.amount_usdc), D(0)),
+              ),
+            ),
+          },
+        };
+      }
+    }
     if (name === "prepare_deposit")
       return this.funding.prepare(
         user,
         args.deposit_id as string,
         String(args.amount_usdc),
       );
-    if (name === "get_preferences")
-      return this.repository.transact(user, async (s) => {
-        const collection = preferenceCollection(s);
-        return result(
-          { preference_collection: collection },
-          collection.ready ? "ok" : "requires_preferences",
-        );
-      });
+    if (name === "get_preferences") {
+      const s = await this.repository.read(user);
+      const collection = preferenceCollection(s);
+      return result(
+        {
+          preference_collection: preferenceCollectionDisplay(
+            collection,
+            args.locale as Locale | undefined,
+          ),
+        },
+        collection.ready ? "ok" : "requires_preferences",
+      );
+    }
     if (name === "get_deposit_options") {
       if (!this.adapter.depositOptions)
         throw new AgentError(
@@ -118,15 +178,52 @@ export class AgentService {
           false,
           404,
         );
-      return this.repository.transact(user, async (state) =>
-        result({
-          trader: c,
-          preferences: preferenceCollection(state).answers,
-          saved_plan: state.portfolios.some((p) => p.state !== "closed")
-            ? null
-            : (state.plans.at(-1) ?? null),
-        }),
-      );
+      const state = await this.repository.read(user);
+      const sourceEvidence = await this.readEvidence([c]);
+      const observedEvidence = sourceEvidenceView(sourceEvidence);
+      return result({
+        trader: c,
+        source_evidence: observedEvidence,
+        leverage_context: {
+          legacy_venue_max_leverage_deprecated: true,
+          legacy_venue_max_leverage_basis:
+            c.market === "perps"
+              ? "product_planning_envelope"
+              : "prediction_fixed_1x",
+          product_planning_max_leverage:
+            c.market === "perps"
+              ? sourceEvidence.market.product_planning_max_leverage
+              : 1,
+          actual_per_asset_venue_max_leverage:
+            sourceEvidence.market.max_leverages,
+          per_asset_venue_limit_lookup: "source_evidence.market.max_leverages",
+          source_leverage_basis: "venue_position_leverage_setting",
+          base_perps_gross_exposure_to_equity:
+            observedEvidence.sources[0]?.base_perps_gross_exposure_to_equity ??
+            null,
+          current_source_positions:
+            observedEvidence.sources[0]?.snapshot?.positions.map((p) => ({
+              key: p.key,
+              asset: p.asset,
+              source_leverage: p.source_leverage_verified
+                ? p.source_leverage
+                : null,
+              verified: p.source_leverage_verified,
+              position_leverage_setting: p.position_leverage_setting,
+              base_perps_position_notional_to_equity:
+                p.base_perps_position_notional_to_equity,
+              position_notional_usdc: p.position_notional_usdc,
+              observed_at: p.observed_at,
+            })) ?? [],
+          historical_source_leverage_distribution: null,
+        },
+        read_only: true,
+        execution_authorized: false,
+        preferences: preferenceCollection(state).answers,
+        saved_plan: state.portfolios.some((p) => p.state !== "closed")
+          ? null
+          : (state.plans.at(-1) ?? null),
+      });
     }
     if (name === "browse_traders") {
       return this.repository.transact(user, async (s) => {
@@ -237,7 +334,15 @@ export class AgentService {
           return {
             ...result(
               {
-                ...conversationView(null, collection, [], !!selectedIds),
+                ...conversationView(
+                  null,
+                  collection,
+                  [],
+                  !!selectedIds,
+                  args.detail as Detail,
+                  undefined,
+                  args as AnalysisOptions,
+                ),
                 plan: null,
                 plan_unchanged: true,
                 saved_plan_id: s.plans.at(-1)?.id ?? null,
@@ -284,8 +389,13 @@ export class AgentService {
         saveDiscovery(s, savedPref, pool);
         const candidatePage =
           s.discovery!.expires_at > now()
-            ? browse(s, savedPref, { limit: 5 }, user, this.cursor)
-                .candidates_meta
+            ? browse(
+                s,
+                savedPref,
+                { limit: 5, locale: args.locale as Locale | undefined },
+                user,
+                this.cursor,
+              ).candidates_meta
             : null;
         let displayedPool = eligibleCandidates(pref, pool);
         if (args.batch_action) {
@@ -482,6 +592,9 @@ export class AgentService {
                   collection,
                   eligibleCandidates(pref, pool),
                   !!selectedIds,
+                  args.detail as Detail,
+                  undefined,
+                  args as AnalysisOptions,
                 ),
                 preferences: pref,
                 candidate_page: candidatePage,
@@ -501,6 +614,10 @@ export class AgentService {
                       ? null
                       : recommendedLeverage(pref, c),
                   maximum_leverage_cap: maximumUserLeverage(c),
+                  maximum_leverage_cap_basis:
+                    c.market === "perps"
+                      ? "product_planning_envelope"
+                      : "prediction_fixed_1x",
                 })),
                 candidates_meta: {
                   total: eligibleCandidates(pref, pool).length,
@@ -563,6 +680,10 @@ export class AgentService {
                   ? null
                   : recommendedLeverage(pref, c),
               maximum_leverage_cap: maximumUserLeverage(c),
+              maximum_leverage_cap_basis:
+                c.market === "perps"
+                  ? "product_planning_envelope"
+                  : "prediction_fixed_1x",
             })),
             portfolio_historical_drawdown_pct: null,
             compatibility: compatibility(plan),
@@ -688,7 +809,10 @@ export class AgentService {
         if (!collection.ready) {
           return result(
             {
-              preference_collection: collection,
+              preference_collection: preferenceCollectionDisplay(
+                collection,
+                args.locale as Locale | undefined,
+              ),
               existing_portfolios_unchanged: true,
             },
             "requires_preferences",
@@ -974,6 +1098,10 @@ export class AgentService {
                   ? null
                   : recommendedLeverage(pref, c),
               maximum_leverage_cap: maximumUserLeverage(c),
+              maximum_leverage_cap_basis:
+                c.market === "perps"
+                  ? "product_planning_envelope"
+                  : "prediction_fixed_1x",
             })),
             compatibility: compatibility(plan),
             alternatives: alternatives(plan, candidates),
@@ -990,11 +1118,16 @@ export class AgentService {
               : undefined,
             candidate_page:
               s.discovery!.expires_at > now()
-                ? browse(s, savedPreferences, { limit: 5 }, user, this.cursor)
-                    .candidates_meta
+                ? browse(
+                    s,
+                    savedPreferences,
+                    { limit: 5, locale: args.locale as Locale | undefined },
+                    user,
+                    this.cursor,
+                  ).candidates_meta
                 : null,
             previous_plan_id: previous.id,
-            plan_change: planChange(previous, plan),
+            plan_change: planChange(previous, plan, args as AnalysisOptions),
             edit_kind: replacements
               ? "one_for_one_replacement"
               : args.allocations || args.preferences
@@ -1182,40 +1315,6 @@ export class AgentService {
         );
       }
       if (name === "get_portfolio") {
-        if (args.plan_id) {
-          const plan = s.plans.find((p) => p.id === args.plan_id);
-          if (!plan)
-            throw new AgentError(
-              "NOT_FOUND",
-              "Saved plan not found for this account.",
-              false,
-              404,
-            );
-          const previous = s.plans.find((p) => p.id === plan.previous_plan_id);
-          return result({
-            ...conversationView(
-              plan,
-              preferenceCollection({
-                ...s,
-                preferences: plan.preferences,
-                preference_sources:
-                  plan.preference_sources ?? s.preference_sources,
-                preference_draft: undefined,
-              }),
-              plan.allocations.map((a) => a.trader),
-              !!s.selected_trader_ids?.length,
-              args.detail as Detail,
-              previous,
-              args as AnalysisOptions,
-            ),
-            plan,
-            compatibility: compatibility(plan),
-            ...(previous ? { plan_change: planChange(previous, plan) } : {}),
-            read_only: true,
-            plan_unchanged: true,
-            plan_status: plan.expires_at > now() ? "ready" : "expired",
-          });
-        }
         const p = findPortfolio(s, args.portfolio_id as string | undefined);
         if (!p) {
           if (args.portfolio_id) return result({ portfolio: null }, "empty");
@@ -1299,7 +1398,7 @@ export class AgentService {
         } catch {
           /* Return explicitly stale stored snapshot; runner owns settlement. */
         }
-        return portfolioView(p);
+        return portfolioView(p, args.locale as Locale | undefined);
       }
       if (name === "review_portfolio") {
         const p = findPortfolio(s, args.portfolio_id as string | undefined);
@@ -1319,6 +1418,123 @@ export class AgentService {
         });
       }
       return this.propose(user, s, name, args);
+    });
+  }
+  private async readEvidence(traders: Candidate[]): Promise<PlanReadEvidence> {
+    const shell = {
+      allocations: traders.map((trader) => ({ trader })),
+    } as Plan;
+    try {
+      const value = this.adapter.readPlanEvidence
+        ? await this.adapter.readPlanEvidence(traders)
+        : null;
+      if (
+        !isPlanReadEvidence(value) ||
+        value.sources.length !== traders.length ||
+        value.sources.some(
+          (s) => !s || !traders.some((t) => t.id === s.trader_id),
+        ) ||
+        new Set(value.sources.map((s) => s.trader_id)).size !== traders.length
+      )
+        return unavailablePlanEvidence(shell);
+      return value;
+    } catch (error) {
+      return unavailablePlanEvidence(
+        shell,
+        error instanceof AgentError && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code)
+          ? error.code
+          : "EVIDENCE_READER_UNAVAILABLE",
+      );
+    }
+  }
+  private async inspectSavedPlan(
+    user: string,
+    args: Record<string, unknown>,
+    onlyPrecheck: boolean,
+    stateSnapshot?: State,
+  ): Promise<Result> {
+    // Release the repository read before any public network request. Inspection
+    // never creates account state, updates timestamps or writes frozen plans.
+    const state = stateSnapshot ?? (await this.repository.read(user));
+    const plan = state.plans.find((p) => p.id === args.plan_id);
+    if (!plan)
+      throw new AgentError(
+        "NOT_FOUND",
+        "Saved plan not found for this account.",
+        false,
+        404,
+      );
+    const locale = args.locale as Locale | undefined;
+    const evidence = await this.readEvidence(
+      plan.allocations.map((a) => a.trader),
+    );
+    const precheck = inspectPlanOrders(plan, evidence, locale);
+    if (onlyPrecheck) {
+      const escape = (value: unknown) =>
+        String(value).replace(/[\\`*_{}\[\]<>|\r\n]/g, " ");
+      const headers = localized(
+        locale,
+        "| 资产（组合净额） | 目标数量 | 名义金额 USDC | 检查结果 |\n|---|---:|---:|---|",
+        "| Asset (basket net) | Target quantity | Notional USDC | Check |\n|---|---:|---:|---|",
+      );
+      const rows = precheck.orders.map(
+        (o) =>
+          `| ${escape(o.key)} | ${escape(o.target_quantity)} | ${o.order_notional_usdc} | ${escape(o.reason ?? localized(locale, o.status === "flat" ? "净额为零" : "当前规则检查通过", o.status === "flat" ? "No net order" : "Within current rules"))} |`,
+      );
+      return result(
+        {
+          plan_id: plan.id,
+          read_only: true,
+          plan_unchanged: true,
+          execution_authorized: false,
+          source_evidence: sourceEvidenceView(evidence),
+          order_precheck: precheck,
+          conversation_display: {
+            locale: resolveLocale(locale),
+            plan_id: plan.id,
+            markdown: [
+              precheck.summary,
+              ...(rows.length ? ["", headers, ...rows] : []),
+            ].join("\n"),
+            instruction: localized(
+              locale,
+              "只展示本语言的简短只读预检。名义金额是组合净额的当前快照估算，不是分配保证金、未来开仓或实盘成交。不要改方案、发起确认或执行交易。",
+              "Show this concise read-only inspection in this language. Notional is the basket-net estimate at this snapshot, not allocated margin, a future opening or a fill. Do not change the plan, request confirmation or execute trades.",
+            ),
+          },
+        },
+        precheck.status === "incomplete" ? "stale" : "ok",
+      );
+    }
+    const previous = state.plans.find((p) => p.id === plan.previous_plan_id);
+    const options: AnalysisOptions = {
+      ...args,
+      copy_evidence: copyEvidenceOverlay(precheck),
+    };
+    return result({
+      ...conversationView(
+        plan,
+        preferenceCollection({
+          ...state,
+          preferences: plan.preferences,
+          preference_sources:
+            plan.preference_sources ?? state.preference_sources,
+          preference_draft: undefined,
+        }),
+        plan.allocations.map((a) => a.trader),
+        !!state.selected_trader_ids?.length,
+        args.detail as Detail,
+        previous,
+        options,
+      ),
+      plan,
+      compatibility: compatibility(plan),
+      ...(previous ? { plan_change: planChange(previous, plan, options) } : {}),
+      source_evidence: sourceEvidenceView(evidence),
+      order_precheck: precheck,
+      read_only: true,
+      plan_unchanged: true,
+      plan_status: plan.expires_at > now() ? "ready" : "expired",
     });
   }
   private async propose(
@@ -1627,10 +1843,15 @@ export class AgentService {
       plan,
       preferences: pref,
       candidates,
-      candidate_page: browse(next, pref, { limit: 5 }, user, this.cursor)
-        .candidates_meta,
+      candidate_page: browse(
+        next,
+        pref,
+        { limit: 5, locale: args.locale as Locale | undefined },
+        user,
+        this.cursor,
+      ).candidates_meta,
       previous_plan_id: previous.id,
-      plan_change: planChange(previous, plan),
+      plan_change: planChange(previous, plan, args as AnalysisOptions),
       edit_kind: "system_reselection",
       original_plan_unchanged: true,
       slot_amounts_unchanged: true,
@@ -2260,7 +2481,7 @@ function findByOwnership(
           ),
   );
 }
-export function portfolioView(p: Portfolio): Result {
+export function portfolioView(p: Portfolio, locale?: Locale): Result {
   const snap = p.snapshot,
     stats = pnl(p),
     stale = !snap || !fresh(snap.observed_at);
@@ -2296,7 +2517,12 @@ export function portfolioView(p: Portfolio): Result {
         ? {
             conversation_display: {
               portfolio_id: p.id,
-              markdown: `${execution.summary_zh}：${execution.reason.message_zh}\n\n此状态仅指本次目标调整；历史订单与成交按实际执行记录单独展示。`,
+              locale: resolveLocale(locale),
+              markdown: localized(
+                locale,
+                `${execution.summary_zh}：${execution.reason.message_zh}\n\n此状态仅指本次目标调整；历史订单与成交按实际执行记录单独展示。`,
+                `${execution.summary}. ${execution.reason.message}\n\nThis applies to the proposed target update. Existing orders and fills are reported separately from actual execution records.`,
+              ),
               markdown_en: `${execution.summary}. ${execution.reason.message}\n\nThis applies to the proposed target update. Existing orders and fills are reported separately from actual execution records.`,
               instruction:
                 "Report this execution status and its reason in the user's language, even when operational is true. In Chinese, explicitly say 因风控暂未下单. This concerns the proposed target update only; distinguish any existing orders and fills. Do not infer that the account has never traded or propose changing risk rules, funding or traders to bypass the blocker.",
