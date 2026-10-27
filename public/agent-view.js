@@ -620,9 +620,9 @@ export function render(
       );
       const fixed = field(
           controls,
-          "Fixed margin per source entry · USDC",
+          "Fixed margin per source entry · USDC · required",
           "text",
-          s.fixed_margin_usdc ?? "10",
+          s.fixed_margin_usdc ?? "",
         ),
         multiplier = field(
           controls,
@@ -646,8 +646,36 @@ export function render(
           s.emergency_exit_pct ?? 70,
         );
       const edit = el("button", "Review parameter change", "secondary");
-      edit.disabled = s.state === "closed";
-      edit.addEventListener("click", () =>
+      fixed.inputMode = "decimal";
+      const fixedHint = el("p", "", "error");
+      fixedHint.id = `fixed-margin-help-${++copyFieldId}`;
+      fixedHint.setAttribute("role", "status");
+      fixedHint.setAttribute("aria-live", "polite");
+      fixed.setAttribute("aria-describedby", fixedHint.id);
+      edit.setAttribute("aria-describedby", fixedHint.id);
+      fixed.parentElement.append(fixedHint);
+      const validateCopyMode = () => {
+        const isFixed = mode.value === "fixed";
+        fixed.required = isFixed;
+        fixed.disabled = !isFixed;
+        fixed.parentElement.hidden = !isFixed;
+        multiplier.disabled = mode.value !== "proportional";
+        multiplier.parentElement.hidden = mode.value !== "proportional";
+        const message = isFixed
+          ? fixedMarginMessage(fixed.value, margin.value, s.trader?.market)
+          : "";
+        fixed.setAttribute("aria-invalid", String(!!message));
+        fixed.setCustomValidity(message);
+        fixedHint.textContent = message;
+        fixedHint.hidden = !message;
+        edit.disabled = s.state === "closed" || !!message;
+        return !edit.disabled;
+      };
+      controls.addEventListener("input", validateCopyMode);
+      mode.addEventListener("change", validateCopyMode);
+      validateCopyMode();
+      edit.addEventListener("click", () => {
+        if (!validateCopyMode()) return;
         callTool("update_copy", {
           copy_id: s.copy_id,
           amount_usdc: margin.value.trim(),
@@ -662,8 +690,8 @@ export function render(
           ...(lossPolicy.value === "pause_then_exit"
             ? { emergency_exit_pct: Number(emergency.value) }
             : {}),
-        }),
-      );
+        });
+      });
       controls.append(edit);
       if (s.state === "risk_off") {
         const resume = el("button", "Review resuming new trades", "secondary");
@@ -1077,6 +1105,32 @@ function select(parent, label, options, value) {
   parent.append(wrap);
   return input;
 }
+// Mirror the existing decimal/positive Fixed requirements for input guidance.
+// The server remains authoritative; this never changes or sizes a saved plan.
+const inputMicros = (value) => {
+  const text = String(value).trim();
+  if (!/^(0|[1-9]\d{0,11})(\.\d{1,6})?$/.test(text)) return null;
+  const [whole, fraction = ""] = text.split(".");
+  return BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, "0"));
+};
+function fixedMarginMessage(value, allocation, market) {
+  if (market === "prediction")
+    return "Fixed margin is available for Perps only.";
+  if (String(value).trim() === "")
+    return "Enter the fixed margin per source entry in USDC.";
+  const amount = inputMicros(value);
+  if (amount == null || amount <= 0n)
+    return "Enter a positive USDC amount with up to 6 decimal places.";
+  if (allocation != null) {
+    const limit = inputMicros(allocation);
+    if (limit == null || limit <= 0n)
+      return "Enter a valid trader allocation before setting its fixed margin.";
+    if (amount > limit)
+      return `Fixed margin cannot exceed this trader's allocation (${String(allocation).trim()} USDC).`;
+  }
+  return "";
+}
+let copyFieldId = 0;
 function welcome(root, callTool, pref = {}, collection) {
   root.append(
     el("h1", "Plan your copy trading in conversation"),
@@ -1114,28 +1168,52 @@ function welcome(root, callTool, pref = {}, collection) {
         )
       : null;
   const fixed = collection?.missing_fields?.includes("fixed_margin_usdc")
-    ? field(details, "Fixed margin per source entry · USDC", "text", "")
+    ? field(
+        details,
+        "Fixed margin per source entry · USDC · required",
+        "text",
+        "",
+      )
     : null;
+  const fixedHint = fixed ? el("p", "", "error") : null;
+  if (fixed) {
+    fixed.required = true;
+    fixed.inputMode = "decimal";
+    fixedHint.id = `fixed-margin-help-${++copyFieldId}`;
+    fixedHint.setAttribute("role", "status");
+    fixedHint.setAttribute("aria-live", "polite");
+    fixed.setAttribute("aria-describedby", fixedHint.id);
+    details.append(fixedHint);
+  }
   const button = el("button", "Continue in conversation");
   const validate = () => {
+    const message = fixed ? fixedMarginMessage(fixed.value) : "";
+    if (fixed) {
+      fixedHint.textContent = message;
+      fixedHint.hidden = !message;
+      fixed.setAttribute("aria-invalid", String(!!message));
+      fixed.setCustomValidity(message);
+    }
     button.disabled = !!(
       (budget && !(Number(budget.value) > 0)) ||
       (tolerance && !tolerance.value) ||
-      (fixed && !(Number(fixed.value) > 0))
+      message
     );
+    return !button.disabled;
   };
   for (const input of [budget, tolerance, fixed].filter(Boolean))
     input.addEventListener("input", validate);
   validate();
-  button.addEventListener("click", () =>
+  button.addEventListener("click", () => {
+    if (!validate()) return;
     callTool("recommend_traders", {
       preferences: {
         ...(budget ? { budget_usdc: budget.value.trim() } : {}),
         ...(tolerance ? { risk_tolerance: tolerance.value } : {}),
         ...(fixed ? { fixed_margin_usdc: fixed.value.trim() } : {}),
       },
-    }),
-  );
+    });
+  });
   details.append(button);
   root.append(details);
 }
@@ -1146,7 +1224,13 @@ function planEditor(plan, data, callTool, start) {
         : "Adjust your basket",
     ),
     rows = el("div", null, "grid"),
-    editors = [];
+    editors = [],
+    recalc = el("button", "Recalculate and review"),
+    validationNote = el("p", "", "error");
+  validationNote.id = `copy-settings-help-${++copyFieldId}`;
+  validationNote.setAttribute("role", "status");
+  validationNote.setAttribute("aria-live", "polite");
+  recalc.setAttribute("aria-describedby", validationNote.id);
   const candidates = data.candidates ?? plan.allocations.map((a) => a.trader);
   const maximumLimits = new Map(
     (data.candidate_limits ?? []).map((x) => [
@@ -1158,6 +1242,32 @@ function planEditor(plan, data, callTool, start) {
     start.dataset.dirty = "true";
     start.disabled = true;
     note.textContent = "Changes need recalculation before you can start.";
+    validateCopyModes();
+  };
+  const validateCopyModes = () => {
+    let first = "";
+    for (const e of editors) {
+      const isFixed = e.mode.value === "fixed";
+      e.fixed.required = isFixed;
+      e.fixed.disabled = !isFixed;
+      e.fixed.parentElement.hidden = !isFixed;
+      e.multiplier.disabled = e.mode.value !== "proportional";
+      e.multiplier.parentElement.hidden = e.mode.value !== "proportional";
+      const selected = candidates.find((t) => t.id === e.trader.value);
+      const message = isFixed
+        ? fixedMarginMessage(e.fixed.value, e.amount.value, selected?.market)
+        : "";
+      e.fixed.setAttribute("aria-invalid", String(!!message));
+      e.fixed.setCustomValidity(message);
+      e.fixedHint.textContent = message;
+      e.fixedHint.hidden = !message;
+      if (!first && message)
+        first = `${selected?.handle ?? "Trader"}: ${message}`;
+    }
+    recalc.disabled = !!first;
+    validationNote.textContent = first;
+    validationNote.hidden = !first;
+    return !first;
   };
   const note = el(
     "p",
@@ -1217,9 +1327,9 @@ function planEditor(plan, data, callTool, start) {
       ),
       fixed = field(
         r,
-        "Fixed margin · USDC",
+        "Fixed margin per source entry · USDC · required",
         "text",
-        a.fixed_margin_usdc ?? "10",
+        a.fixed_margin_usdc ?? "",
       ),
       multiplier = field(
         r,
@@ -1242,6 +1352,13 @@ function planEditor(plan, data, callTool, start) {
         "number",
         a.emergency_exit_pct ?? 70,
       );
+    fixed.inputMode = "decimal";
+    const fixedHint = el("p", "", "error");
+    fixedHint.id = `fixed-margin-help-${++copyFieldId}`;
+    fixedHint.setAttribute("role", "status");
+    fixedHint.setAttribute("aria-live", "polite");
+    fixed.setAttribute("aria-describedby", fixedHint.id);
+    fixed.parentElement.append(fixedHint);
     const editor = {
       r,
       trader,
@@ -1250,12 +1367,14 @@ function planEditor(plan, data, callTool, start) {
       loss,
       mode,
       fixed,
+      fixedHint,
       multiplier,
       policy,
       emergency,
     };
     editors.push(editor);
     r.addEventListener("input", dirty);
+    mode.addEventListener("change", dirty);
     trader.addEventListener("change", () => {
       const selected = candidates.find((t) => t.id === trader.value);
       const maximum =
@@ -1285,6 +1404,7 @@ function planEditor(plan, data, callTool, start) {
     });
     r.append(remove);
     rows.append(r);
+    validateCopyModes();
   }
   plan.allocations.forEach(add);
   c.append(rows);
@@ -1316,8 +1436,8 @@ function planEditor(plan, data, callTool, start) {
     });
     dirty();
   });
-  const recalc = el("button", "Recalculate and review");
-  recalc.addEventListener("click", () =>
+  recalc.addEventListener("click", () => {
+    if (!validateCopyModes()) return;
     callTool("recalculate_plan", {
       plan_id: plan.id,
       preferences: plan.preferences,
@@ -1336,11 +1456,11 @@ function planEditor(plan, data, callTool, start) {
           ? { emergency_exit_pct: Number(e.emergency.value) }
           : {}),
       })),
-    }),
-  );
+    });
+  });
   const actions = el("div", null, "actions");
   actions.append(plus, recalc);
-  c.append(actions, note);
+  c.append(actions, validationNote, note);
   const details = el("details");
   details.append(el("summary", "Edit allocations and traders"), c);
   return details;

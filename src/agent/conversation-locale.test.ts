@@ -387,8 +387,8 @@ it("keeps actual precheck blockers visible in one concise sentence in either lan
   assert.match(en.markdown, /below the venue minimum/);
   assert.match(zh.markdown, /现有集中度上限/);
   assert.match(zh.markdown, /低于交易所最小下单额/);
-  assert.equal((en.markdown.match(/Copyability precheck:/g) ?? []).length, 1);
-  assert.equal((zh.markdown.match(/本次复制性预检：/g) ?? []).length, 1);
+  assert.equal((en.markdown.match(/\nLimit: /g) ?? []).length, 1);
+  assert.equal((zh.markdown.match(/\n限制：/g) ?? []).length, 1);
   assert.equal((en.markdown.match(/\| Trader \|/g) ?? []).length, 1);
   assert.doesNotMatch(
     en.markdown,

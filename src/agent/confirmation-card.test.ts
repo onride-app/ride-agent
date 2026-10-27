@@ -121,6 +121,7 @@ it("read-only card tool renders a no-execution demo or owned proposal and never 
         item.text.includes('"confirmation_origin":"https://ride.test"'),
     );
     for (const uri of [
+      "ui://ride/agent-v9-confirmation.html",
       "ui://ride/agent-v8-confirmation.html",
       "ui://ride/agent-v7-confirmation.html",
       "ui://ride/agent-v6-confirmation.html",

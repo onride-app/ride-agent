@@ -282,8 +282,8 @@ it("keeps default output short with every selected trader, concrete copy rules a
   for (const a of initial.plan.allocations)
     assert(d.markdown.includes(a.trader.handle));
   assert(d.markdown.length < 1300);
-  assert.match(d.markdown, /分配资金与源账户权益的比例/);
-  assert.match(d.markdown, /不足最小下单额则跳过/);
+  assert.match(d.markdown, /分配资金.*核实源权益.*比例/);
+  assert.match(d.markdown, /未达最小下单额跳过/);
   assert.match(d.markdown, /分析这组 trader/);
   assert.doesNotMatch(d.markdown, /目标数量 =|2.Trader Alternative|两人替代/);
   for (const row of initial.final_review.traders) {

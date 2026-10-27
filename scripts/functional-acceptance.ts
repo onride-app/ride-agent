@@ -2164,14 +2164,12 @@ try {
       ).data;
       assert.equal(brief.conversation_display.detail, "brief");
       assert(
-        brief.conversation_display.markdown.length < 1300,
+        brief.conversation_display.markdown.length < 1100,
         `Brief output exceeded its limit: ${brief.conversation_display.markdown.length}`,
       );
-      assert.match(
-        brief.conversation_display.markdown,
-        /分配资金与源账户权益的比例/,
-      );
-      assert.match(brief.conversation_display.markdown, /不足最小下单额则跳过/);
+      assert.match(brief.conversation_display.markdown, /分配资金/);
+      assert.match(brief.conversation_display.markdown, /核实源权益/);
+      assert.match(brief.conversation_display.markdown, /最小下单额.*跳过/);
       assert.match(brief.conversation_display.markdown, /分析这组 trader/);
       assert.doesNotMatch(JSON.stringify(detail), /目标数量 = 源仓位数量/);
       assert.equal(detail.conversation_display.analysis_depth, "summary");

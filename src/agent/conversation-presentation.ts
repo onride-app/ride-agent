@@ -175,7 +175,7 @@ export function copyabilityReason(code: string, locale?: Locale) {
       );
 }
 
-function copyabilitySummary(options: AnalysisOptions) {
+function copyabilitySummary(options: AnalysisOptions, compact = false) {
   if (!options.copy_evidence) return null;
   const codes = new Set<string>();
   let checked = false;
@@ -208,6 +208,18 @@ function copyabilitySummary(options: AnalysisOptions) {
           codes.add(position.reason_code);
   }
   if (!checked) return null;
+  if (compact)
+    return codes.size
+      ? localized(
+          options.locale,
+          `初始目标预检：${[...codes].map((code) => copyabilityReason(code, options.locale)).join("；")}`,
+          `Initial-target check: ${[...codes].map((code) => copyabilityReason(code, options.locale)).join("; ")}`,
+        )
+      : localized(
+          options.locale,
+          "预检仅限当前初始目标，不代表成交覆盖率",
+          "the check covers current initial targets, not fill coverage",
+        );
   if (codes.size)
     return localized(
       options.locale,
@@ -219,6 +231,152 @@ function copyabilitySummary(options: AnalysisOptions) {
     "本次预检只覆盖假设的初始目标，不代表实盘成交覆盖率或已经下单。",
     "This precheck covers hypothetical initial targets, not real fill coverage or an executed order.",
   );
+}
+
+function briefSetting(a: Allocation, locale?: Locale) {
+  const t = (zh: string, en: string) => localized(locale, zh, en);
+  const mode = a.copy_mode ?? "ride_recommends";
+  const sizing =
+    mode === "fixed"
+      ? t(
+          `固定 ${a.fixed_margin_usdc ?? "未设置"} USDC`,
+          `Fixed ${a.fixed_margin_usdc ?? "unset"} USDC`,
+        )
+      : `${mode === "proportional" ? t("比例", "Proportional") : "Ride"} ×${a.proportional_multiplier ?? 1}`;
+  return `${sizing} · ${
+    a.trader.market === "prediction"
+      ? "1x"
+      : a.leverage_cap == null
+        ? t("源杠杆，无额外上限", "source leverage, no extra cap")
+        : t(`保留 ${a.leverage_cap}x 上限`, `saved ${a.leverage_cap}x cap`)
+  }`;
+}
+
+function briefCopySummary(plan: Plan, options: AnalysisOptions) {
+  const t = (zh: string, en: string) => localized(options.locale, zh, en);
+  const proportional = plan.allocations.filter((a) => a.copy_mode !== "fixed");
+  const fixed = plan.allocations.filter((a) => a.copy_mode === "fixed");
+  const perps = plan.allocations.filter((a) => a.trader.market === "perps");
+  const multipliers = [
+    ...new Set(proportional.map((a) => a.proportional_multiplier ?? 1)),
+  ];
+  const margins = [
+    ...new Set(fixed.map((a) => a.fixed_margin_usdc ?? t("未设置", "unset"))),
+  ];
+  const caps = [...new Set(perps.map((a) => a.leverage_cap))];
+  const clauses = [
+    ...(proportional.length
+      ? [
+          t(
+            `按分配资金占核实源权益的比例跟随仓位${multipliers.length === 1 && multipliers[0] !== 1 ? `，再乘 ${multipliers[0]} 倍` : multipliers.length > 1 ? "，倍率见表" : ""}`,
+            `scale source positions by allocated USDC / verified source equity${multipliers.length === 1 && multipliers[0] !== 1 ? `, then ×${multipliers[0]}` : multipliers.length > 1 ? ", multipliers in table" : ""}`,
+          ),
+        ]
+      : []),
+    ...(fixed.length
+      ? [
+          t(
+            `固定模式每次核实源开仓用${margins.length === 1 ? ` ${margins[0]} USDC` : "表内"}保证金，减仓跟随源成交比例`,
+            `fixed mode uses ${margins.length === 1 ? `${margins[0]} USDC` : "table-listed"} margin per verified source opening; reductions follow source fills proportionally`,
+          ),
+        ]
+      : []),
+    ...(perps.length
+      ? [
+          caps.length === 1
+            ? caps[0] == null
+              ? t(
+                  "跟核实源杠杆，无额外上限",
+                  "follow verified source leverage, no extra user cap",
+                )
+              : t(`保留 ${caps[0]}x 用户上限`, `saved ${caps[0]}x user cap`)
+            : t("逐人杠杆设置见表", "saved leverage settings in table"),
+        ]
+      : []),
+    ...(plan.allocations.some((a) => a.trader.market === "prediction")
+      ? [t("预测市场 1x", "prediction markets 1x")]
+      : []),
+    t(
+      "交易所/预算/风控约束，未达最小下单额跳过",
+      "venue, budget and risk limits apply; skip below-minimum orders",
+    ),
+  ];
+  return `${clauses.join(t("；", "; "))}${t("。", ".")}`;
+}
+
+function briefPlanMarkdown(
+  plan: Plan,
+  previous: Plan | undefined,
+  options: AnalysisOptions,
+) {
+  const t = (zh: string, en: string) => localized(options.locale, zh, en);
+  let unknownPeriod = false;
+  const metric = (c: Candidate, name: "roi" | "drawdown") => {
+    const value = name === "roi" ? c.source_roi_pct : c.source_drawdown_pct;
+    const unverified =
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      !verifiedWindow(c, name);
+    unknownPeriod ||= unverified;
+    return `${pct(value, options.locale)}${unverified ? "†" : ""}`;
+  };
+  const settings = plan.allocations.map((a) => briefSetting(a, options.locale));
+  const showSettings = new Set(settings).size > 1;
+  const rows = plan.allocations.map(
+    (a, index) =>
+      `| ${cell(a.trader.handle)} | ${cell(a.amount_usdc)} | ${cell(a.trader.score)} | ${metric(a.trader, "roi")} | ${metric(a.trader, "drawdown")} |${showSettings ? ` ${cell(settings[index])} |` : ""}`,
+  );
+  const limitations = [
+    copyabilitySummary(options, true),
+    plan.risk_selection?.status === "insufficient_evidence" ||
+    plan.risk_selection?.status === "unsupported"
+      ? t(
+          "风险偏好匹配证据不足",
+          "risk-preference matching lacks sufficient evidence",
+        )
+      : null,
+  ].filter(Boolean);
+  const historyLimit = unknownPeriod
+    ? t("†周期未核实，非跟单收益", "† periods unverified; not follower returns")
+    : t("来源表现非跟单收益", "source performance is not follower returns");
+  const limitation = limitations.length
+    ? `${t("限制：", "Limit: ")}${[...limitations, historyLimit].join(t("；", "; "))}`
+    : historyLimit;
+  const triggerAmount = cash(
+    D(plan.preferences.budget_usdc)
+      .times(plan.preferences.loss_trigger_pct)
+      .div(100),
+  );
+  const triggerSource =
+    plan.preference_sources?.loss_trigger_pct === "user"
+      ? t("你设置", "set by you")
+      : plan.preference_sources?.loss_trigger_pct === "recommended"
+        ? t("建议，待确认", "suggested, unconfirmed")
+        : t("来源未核实", "source unverified");
+  const change = previous ? planChange(previous, plan, options) : null;
+  return [
+    t(
+      `${plan.allocations.length}人预览 · ${cell(plan.id.slice(-8))} · ${cell(plan.preferences.budget_usdc)} USDC${plan.expires_at <= Date.now() ? "（已过期，需刷新）" : ""}`,
+      `${plan.allocations.length}-trader preview · ${cell(plan.id.slice(-8))} · ${cell(plan.preferences.budget_usdc)} USDC${plan.expires_at <= Date.now() ? " (expired; refresh required)" : ""}`,
+    ),
+    `${t("| Trader | USDC | Score | 来源收益 | 来源回撤 |", "| Trader | USDC | Score | Source return | Source drawdown |")}${showSettings ? t(" 跟单设置 |", " Copy settings |") : ""}`,
+    `| --- | ---: | ---: | ---: | ---: |${showSettings ? " --- |" : ""}`,
+    ...rows,
+    `${t("跟单：", "Copy: ")}${briefCopySummary(plan, options)}`,
+    t(
+      `组合退出（${triggerSource}）：${plan.preferences.loss_trigger_pct}% / ${triggerAmount} USDC；尝试退出，不保证亏损上限。`,
+      `Portfolio exit (${triggerSource}): ${plan.preferences.loss_trigger_pct}% / ${triggerAmount} USDC; attempts an exit, not a guaranteed loss cap.`,
+    ),
+    `${limitation}${t("。", ".")}`,
+    ...(change
+      ? [
+          t(
+            `相对 ${previous!.id.slice(-8)}：${change.before_count} 人 → ${change.after_count} 人，移出 ${change.removed_trader_ids.length} 位、加入 ${change.added_trader_ids.length} 位；原方案保留。`,
+            `From ${previous!.id.slice(-8)}: ${change.before_count} → ${change.after_count} traders, ${change.removed_trader_ids.length} removed, ${change.added_trader_ids.length} added; original preserved.`,
+          ),
+        ]
+      : []),
+  ];
 }
 
 export function copyRule(a: Allocation, options: AnalysisOptions = {}) {
@@ -674,6 +832,12 @@ function planDisplayView(
         ]
       : []),
   ];
+  if (detail === "brief")
+    markdown.splice(
+      0,
+      markdown.length,
+      ...briefPlanMarkdown(plan, previous, options),
+    );
   if (analysis) {
     markdown.push(
       `${t("分析结论：", "Analysis: ")}${analysis.conclusion}`,
@@ -739,8 +903,8 @@ function planDisplayView(
   markdown.push(
     detail === "brief"
       ? t(
-          "可选：查看其他 trader · 分析这组 trader",
-          "Options: browse alternatives · analyze these traders",
+          "需本人确认；可分析这组 trader",
+          "Requires your confirmation · Analyze traders",
         )
       : depth === "summary" && !options.include_calculations
         ? t(

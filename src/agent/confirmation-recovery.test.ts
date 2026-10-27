@@ -35,6 +35,7 @@ class Element {
   className = "";
   hidden = false;
   disabled = false;
+  scrollHeight?: number;
   children: Element[] = [];
   parentElement?: Element;
   onclick?: () => Promise<void> | void;
@@ -78,6 +79,9 @@ async function fixture(
   options: {
     href?: string;
     embedded?: boolean;
+    loginHeight?: number;
+    signInContentHeight?: number;
+    bodyHeight?: number;
     opener?: { postMessage: (message: any, target: string) => void } | null;
     provider?: string;
     storedUser?: boolean;
@@ -114,6 +118,16 @@ async function fixture(
   elements
     .get("actions")!
     .append(elements.get("approve")!, elements.get("reject")!);
+  elements.get("login")!.scrollHeight = options.loginHeight;
+  const main = new Element("main");
+  main.append(
+    elements.get("login")!,
+    elements.get("status")!,
+    elements.get("content")!,
+    elements.get("actions")!,
+  );
+  main.scrollHeight = options.signInContentHeight;
+  const body = { scrollHeight: options.bodyHeight ?? 600 };
   const requests: Request[] = [],
     navigations: string[] = [],
     opened: string[] = [],
@@ -192,7 +206,7 @@ async function fixture(
     },
     document: {
       getElementById: (id: string) => elements.get(id),
-      body: { scrollHeight: 600 },
+      body,
     },
     window: {
       opener: options.opener ?? null,
@@ -241,7 +255,7 @@ async function fixture(
     )
     .replace("await import(config.privy_sdk)", "await globalThis.__loadPrivy()")
     .replace(/start\(\);\s*$/, "globalThis.__started = start();");
-  vm.runInContext(source, context);
+  vm.runInContext(source + "\n;globalThis.__announce = announce;", context);
   await (context as any).__started;
   return {
     requests,
@@ -249,6 +263,8 @@ async function fixture(
     opened,
     rendered,
     announcements,
+    announce: (state: string) => (context as any).__announce(state),
+    setBodyHeight: (height: number) => (body.scrollHeight = height),
     providerCalls,
     storage,
     location,
@@ -551,4 +567,54 @@ it("a card opens at most one sign-in window and retains it when partitioned cook
     JSON.stringify(f.announcements).includes("embedded-csrf"),
     false,
   );
+});
+
+it("sizes embedded sign-in from its content without growing with the host viewport", async () => {
+  const f = await fixture({
+    embedded: true,
+    loginHeight: 340,
+    bodyHeight: 900,
+    route: (r) => (r.operation === "session" ? denied() : undefined),
+  });
+  assert.equal(f.node("login").hidden, false);
+  assert.equal(f.node("actions").hidden, true);
+  assert.equal(f.announcements.at(-1).height, 420);
+  for (const hostHeight of [420, 760, 1400]) {
+    f.setBodyHeight(hostHeight);
+    f.announce("sign_in_required");
+    assert.equal(f.announcements.at(-1).height, 420);
+    assert.equal(f.announcements.at(-1).proposal_id, proposalId);
+  }
+  assert.deepEqual(f.providerCalls, []);
+  assert(!f.requests.some((r) => ["confirm", "reject"].includes(r.operation)));
+
+  const review = await fixture({
+    embedded: true,
+    loginHeight: 340,
+    bodyHeight: 900,
+  });
+  assert.equal(review.node("login").hidden, true);
+  assert.equal(review.announcements.at(-1).height, 924);
+});
+
+it("keeps a sign-in error inside the embedded height without using the host viewport", async () => {
+  const f = await fixture({
+    embedded: true,
+    loginHeight: 340,
+    signInContentHeight: 480,
+    bodyHeight: 1400,
+    route: (r) =>
+      r.operation === "session" ? denied("NOT_FOUND", 404) : undefined,
+  });
+  assert.equal(f.node("login").hidden, false);
+  assert.equal(f.node("actions").hidden, true);
+  assert.match(
+    f.node("status").textContent,
+    /not available for this Ride account/,
+  );
+  assert.equal(f.announcements.at(-1).height, 504);
+  f.setBodyHeight(1600);
+  f.announce("sign_in_required");
+  assert.equal(f.announcements.at(-1).height, 504);
+  assert(!f.requests.some((r) => ["confirm", "reject"].includes(r.operation)));
 });

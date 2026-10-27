@@ -265,7 +265,13 @@ export function mountHumanConfirmation(
         .set("Cache-Control", "no-store")
         .type("html")
         .send(
-          template.replace(
+          (funding
+            ? template
+            : template.replace(
+                '<body class="review-page">',
+                '<body class="review-page embedded-confirmation">',
+              )
+          ).replace(
             "/*CONFIG*/{}",
             JSON.stringify({
               proposal_id: req.params.proposalId,

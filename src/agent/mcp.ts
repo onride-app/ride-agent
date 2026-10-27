@@ -20,7 +20,7 @@ import {
   type ToolName,
 } from "./contracts.js";
 
-export const RESOURCE_URI = "ui://ride/agent-v9-confirmation.html";
+export const RESOURCE_URI = "ui://ride/agent-v10-compact-confirmation.html";
 export type McpOAuthContext = { resourceMetadataUrl: string };
 
 function securityMeta(scope: string, oauth?: McpOAuthContext) {
@@ -112,6 +112,7 @@ export function registerAgentTools(
   });
   for (const resourceUri of [
     RESOURCE_URI,
+    "ui://ride/agent-v9-confirmation.html",
     "ui://ride/agent-v8-confirmation.html",
     "ui://ride/agent-v7-confirmation.html",
     "ui://ride/agent-v6-confirmation.html",

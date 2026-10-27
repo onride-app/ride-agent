@@ -323,6 +323,30 @@ it("hands off a human session once to the same challenge/proposal and confines e
     f.close();
   }
 });
+it("compact sign-in is confined to embedded proposal cards", async () => {
+  const f = await fixture();
+  try {
+    for (const [path, compact] of [
+      [`/agent/card/${proposal}`, true],
+      ["/agent/card-demo", true],
+      [`/agent/confirm/${proposal}`, false],
+      [`/agent/fund-card/deposit_${"a".repeat(32)}`, false],
+      ["/agent/fund-demo", false],
+    ] as const) {
+      const response = await fetch(f.base + path);
+      assert.equal(response.status, 200);
+      assert.equal(
+        (await response.text()).includes(
+          '<body class="review-page embedded-confirmation">',
+        ),
+        compact,
+      );
+    }
+    assert.deepEqual(f.counts(), { exchanges: 0, writes: 0 });
+  } finally {
+    f.close();
+  }
+});
 it("only the dedicated card routes can be framed and demo rendering never calls a backend", async () => {
   const f = await fixture();
   try {

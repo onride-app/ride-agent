@@ -32,6 +32,7 @@ const showError = (e) => {
     ? "Sign in to Ride to review this proposal."
     : (e?.message ?? String(e));
   status.className = "warning error";
+  if (embedded && !loginView.hidden) announce("sign_in_required");
 };
 const knownProvider = (value) =>
   value === "APPLE" || value === "GOOGLE" ? value : undefined;
@@ -97,7 +98,17 @@ function announce(state) {
         type: "ride:confirmation-state",
         proposal_id: config.proposal_id,
         status: state,
-        height: Math.min(1400, Math.max(420, document.body.scrollHeight + 24)),
+        height: Math.min(
+          1400,
+          Math.max(
+            420,
+            (loginView.hidden
+              ? document.body.scrollHeight
+              : (loginView.parentElement?.scrollHeight ??
+                loginView.scrollHeight ??
+                document.body.scrollHeight)) + 24,
+          ),
+        ),
       },
       "*",
     );
