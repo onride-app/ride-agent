@@ -90,19 +90,20 @@ const concentrationBlocker = {
 it("shows the current risk blocker before account balances even while source monitoring is operational", () => {
   const { root } = fixture(concentrationBlocker);
   const text = root.text();
-  assert.match(text, /因风控暂未下单/);
+  assert.match(text, /No order placed: blocked by risk/);
   assert.match(
     text,
-    /HYPE 占拟议组合总暴露的 100%，超过 60% 的资产集中度上限。/,
+    /HYPE accounts for 100% of proposed exposure; limit 60%\./,
   );
-  assert.match(text, /信号监控正常运行/);
-  assert.match(text, /此状态仅指本次目标调整/);
-  assert.match(text, /历史订单、成交与退出记录单独展示/);
+  assert.match(text, /Source monitoring is running/);
+  assert.match(text, /Applies to the proposed target update\./);
+  assert.match(text, /Existing orders, fills and exits are shown separately\./);
+  assert.doesNotMatch(text, /因风控|拟议组合|信号监控/);
   assert.match(text, /Execution status\s+prior_exit_fixture\s+settled/);
   assert(root.all().some((node) => node.textContent === "Refresh portfolio"));
   assert.doesNotMatch(text, /Copying is not operational yet/);
   assert(
-    text.indexOf("因风控暂未下单") <
+    text.indexOf("No order placed: blocked by risk") <
       text.indexOf("Agent trading account snapshot"),
   );
 });
@@ -115,23 +116,22 @@ it("keeps account activation and risk blocking separate and renders reason text 
       reason: {
         ...concentrationBlocker.reason,
         message,
-        message_zh: undefined,
       },
     },
     false,
   );
   assert.match(root.text(), /Copying is not operational yet/);
-  assert.match(root.text(), /因风控暂未下单/);
-  assert.doesNotMatch(root.text(), /信号监控正常运行/);
+  assert.match(root.text(), /No order placed: blocked by risk/);
+  assert.doesNotMatch(root.text(), /Source monitoring is running/);
   assert(root.all().some((node) => node.textContent === message));
   assert(!root.all().some((node) => node.tag === "img"));
 });
 
 it("removes a resolved risk warning on refresh and does not invent one for older portfolio payloads", () => {
   const { root: legacy } = fixture();
-  assert.doesNotMatch(legacy.text(), /因风控暂未下单|本次目标调整/);
+  assert.doesNotMatch(legacy.text(), /blocked by risk|proposed target update/);
   const { root, refresh } = fixture(concentrationBlocker);
-  assert.match(root.text(), /因风控暂未下单/);
+  assert.match(root.text(), /blocked by risk/);
   refresh({ status: "monitoring", summary: "Monitoring" });
-  assert.doesNotMatch(root.text(), /因风控暂未下单|本次目标调整/);
+  assert.doesNotMatch(root.text(), /blocked by risk|proposed target update/);
 });

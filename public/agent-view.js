@@ -415,12 +415,11 @@ export function render(
       el("p", `${p.state} · ${p.id}`, "muted"),
     );
     if (p.execution_status?.status === "blocked_by_risk") {
-      const execution = card("因风控暂未下单");
+      const execution = card("No order placed: blocked by risk");
       execution.append(
         el(
           "p",
-          p.execution_status.reason?.message_zh ??
-            p.execution_status.reason?.message ??
+          p.execution_status.reason?.message ??
             p.execution_status.summary ??
             "A portfolio risk check blocked the proposed order.",
           "warning",
@@ -428,8 +427,8 @@ export function render(
         el(
           "p",
           p.operational === true
-            ? "信号监控正常运行。此状态仅指本次目标调整；历史订单、成交与退出记录单独展示。"
-            : "此状态仅指本次目标调整；历史订单、成交与退出记录单独展示。",
+            ? "Source monitoring is running. Applies to the proposed target update. Existing orders, fills and exits are shown separately."
+            : "Applies to the proposed target update. Existing orders, fills and exits are shown separately.",
           "muted",
         ),
       );

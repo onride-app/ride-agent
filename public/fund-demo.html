@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Rider · 对话内入金确认测试</title>
+    <title>Rider · In-chat funding confirmation demo</title>
     <style>
       /*INLINE_CSS*/:root {
   font-family:
@@ -755,16 +755,21 @@ main.app-auth {
     <main>
       <header>
         <strong class="brand">Rider</strong
-        ><span class="tag">0 USDC 模拟 · 不会转账</span>
+        ><span class="tag">0 USDC demo · no transfer</span>
       </header>
       <section class="card">
-        <h1>在对话内确认入金</h1>
-        <p>金额：0 USDC · Arbitrum · 虚构测试账户</p>
-        <p>此演示不连接账户、钱包或交易服务。点击后仅更新本卡片的演示状态。</p>
-        <p id="status" role="status" class="warning">等待模拟确认</p>
+        <h1>Confirm funding in the conversation</h1>
+        <p>Amount: 0 USDC · Arbitrum · fictional test account</p>
+        <p>
+          This demo does not connect to an account, wallet or trading service.
+          Buttons only update this card's demo status.
+        </p>
+        <p id="status" role="status" class="warning">
+          Waiting for demo confirmation
+        </p>
         <div class="actions">
-          <button id="confirm">模拟确认入金 · 0 USDC</button
-          ><button id="cancel" class="secondary">取消演示</button>
+          <button id="confirm">Confirm demo funding · 0 USDC</button
+          ><button id="cancel" class="secondary">Cancel demo</button>
         </div>
       </section>
     </main>
@@ -784,9 +789,13 @@ main.app-auth {
         [
           "confirm",
           "demo_confirmed",
-          "模拟确认成功 · 全程留在对话卡片内 · 未签名或提交真实转账",
+          "Demo confirmed · stayed in the conversation card · no real transfer signed or submitted",
         ],
-        ["cancel", "demo_rejected", "演示已取消 · 未签名或提交真实转账"],
+        [
+          "cancel",
+          "demo_rejected",
+          "Demo cancelled · no real transfer signed or submitted",
+        ],
       ])
         document.getElementById(id).onclick = () => {
           status.textContent = text;
