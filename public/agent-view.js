@@ -28,6 +28,44 @@ const card = (title) => {
   c.append(el("h2", title));
   return c;
 };
+function renderRiskStatus(root, portfolio, current = false) {
+  if (portfolio?.execution_status?.status !== "blocked_by_risk") return;
+  const execution = card(
+    current ? "Current portfolio status" : "No order placed: blocked by risk",
+  );
+  if (current)
+    execution.append(
+      el("h3", "No order placed: blocked by risk"),
+      row("Revision", portfolio.revision),
+    );
+  execution.append(
+    el(
+      "p",
+      portfolio.execution_status.reason?.message ??
+        portfolio.execution_status.summary ??
+        "A portfolio risk check blocked the proposed order.",
+      "warning",
+    ),
+    el(
+      "p",
+      portfolio.operational === true
+        ? "Source monitoring is running. Applies to the proposed target update. Existing orders, fills and exits are shown separately."
+        : "Applies to the proposed target update. Existing orders, fills and exits are shown separately.",
+      "muted",
+    ),
+  );
+  root.append(execution);
+}
+function renderProposalRiskStatus(root, data) {
+  const proposal = data.proposal,
+    current = data.current_portfolio;
+  if (
+    ["queued", "completed"].includes(proposal?.status) &&
+    typeof proposal.portfolio_id === "string" &&
+    current?.id === proposal.portfolio_id
+  )
+    renderRiskStatus(root, current, true);
+}
 const usdc = (v) => (v == null ? "Unavailable" : `${v} USDC`);
 const sumCash = (amounts) => {
   const n = amounts.reduce((total, v) => {
@@ -176,6 +214,7 @@ export function render(
             : "Operation status",
       ),
     );
+    renderProposalRiskStatus(root, d);
     confirmationCard(root, d.proposal, d.confirmation_demo === true);
     return;
   }
@@ -414,26 +453,7 @@ export function render(
       el("h1", "Your portfolio"),
       el("p", `${p.state} · ${p.id}`, "muted"),
     );
-    if (p.execution_status?.status === "blocked_by_risk") {
-      const execution = card("No order placed: blocked by risk");
-      execution.append(
-        el(
-          "p",
-          p.execution_status.reason?.message ??
-            p.execution_status.summary ??
-            "A portfolio risk check blocked the proposed order.",
-          "warning",
-        ),
-        el(
-          "p",
-          p.operational === true
-            ? "Source monitoring is running. Applies to the proposed target update. Existing orders, fills and exits are shown separately."
-            : "Applies to the proposed target update. Existing orders, fills and exits are shown separately.",
-          "muted",
-        ),
-      );
-      root.append(execution);
-    }
+    renderRiskStatus(root, p);
     if (p.activation && p.operational !== true) {
       const activation = card("Copying is not operational yet");
       activation.append(
@@ -742,9 +762,15 @@ export function render(
   if (d.proposal) {
     const q = d.proposal;
     root.append(
-      el("h1", "Review before confirming"),
+      el(
+        "h1",
+        q.status === "requires_confirmation"
+          ? "Review before confirming"
+          : "Operation status",
+      ),
       el("p", `${displayState(q.action)} · ${displayState(q.status)}`, "muted"),
     );
+    renderProposalRiskStatus(root, d);
     if (q.preview?.portfolio?.portfolio)
       renderNestedPortfolio(root, q.preview.portfolio.portfolio);
     const params = card("Frozen parameters");

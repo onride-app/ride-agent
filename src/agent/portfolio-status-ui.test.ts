@@ -27,6 +27,16 @@ class Element {
   }
 }
 
+function renderer() {
+  const source = readFileSync("public/agent-view.js", "utf8").replaceAll(
+    /^export /gm,
+    "",
+  );
+  return vm.runInNewContext(`${source}\n;({ render });`, {
+    document: { createElement: (tag: string) => new Element(tag) },
+  }).render;
+}
+
 function fixture(executionStatus?: unknown, operational = true) {
   const root = new Element("main");
   const calls: unknown[] = [];
@@ -45,13 +55,7 @@ function fixture(executionStatus?: unknown, operational = true) {
     executions: [{ key: "prior_exit_fixture", status: "settled" }],
   };
   const before = JSON.stringify(portfolio);
-  const source = readFileSync("public/agent-view.js", "utf8").replaceAll(
-    /^export /gm,
-    "",
-  );
-  const { render } = vm.runInNewContext(`${source}\n;({ render });`, {
-    document: { createElement: (tag: string) => new Element(tag) },
-  });
+  const render = renderer();
   const display = () =>
     render(
       root,
@@ -134,4 +138,129 @@ it("removes a resolved risk warning on refresh and does not invent one for older
   assert.match(root.text(), /blocked by risk/);
   refresh({ status: "monitoring", summary: "Monitoring" });
   assert.doesNotMatch(root.text(), /blocked by risk|proposed target update/);
+});
+
+function proposalFixture(
+  status = "completed",
+  currentId: string | null = "portfolio_confirm_fixture",
+  withConfirmationCard = false,
+) {
+  const proposal = {
+    id: "proposal_original_confirm_fixture",
+    portfolio_id: "portfolio_confirm_fixture",
+    status,
+    action: "start_copy",
+    preview_hash: "a".repeat(64),
+    expires_at: Date.now() + 60_000,
+    preview: {
+      portfolio: {
+        portfolio: {
+          projected_state: "active",
+          sleeves: [
+            {
+              trader: { id: "trader_frozen", handle: "Frozen preview trader" },
+              amount_usdc: "43.000000",
+              projected_state: "active",
+            },
+          ],
+        },
+      },
+      fees: { estimate_usdc: "0.010000" },
+    },
+    arguments: { plan_id: "plan_original_fixture" },
+  };
+  const value = {
+    status: "ok",
+    data: {
+      proposal,
+      confirmation_card: withConfirmationCard,
+      current_portfolio: currentId
+        ? {
+            id: currentId,
+            revision: 7,
+            operational: true,
+            as_of: Date.now(),
+            execution_status: concentrationBlocker,
+          }
+        : null,
+    },
+  };
+  const before = JSON.stringify(value);
+  const root = new Element("main");
+  const calls: unknown[] = [];
+  const render = renderer();
+  render(
+    root,
+    value,
+    (...args: unknown[]) => calls.push(args),
+    (...args: unknown[]) => calls.push(args),
+    withConfirmationCard
+      ? (target: Element, shown: typeof proposal) => {
+          assert.equal(shown, proposal);
+          target.append(new Element("article"));
+          target.children.at(-1)!.textContent =
+            "Original confirmation card: Frozen preview trader · 43.000000 USDC";
+        }
+      : undefined,
+  );
+  assert.equal(JSON.stringify(value), before);
+  assert.deepEqual(calls, []);
+  return root;
+}
+
+for (const status of ["queued", "completed"])
+  it(`shows the exact current portfolio risk beside a frozen ${status} proposal without adding controls`, () => {
+    const root = proposalFixture(status);
+    const text = root.text();
+    assert.match(text, /Operation status/);
+    assert.doesNotMatch(text, /Review before confirming/);
+    assert.match(text, /Current portfolio status/);
+    assert.match(text, /Revision\s+7/);
+    assert.match(text, /No order placed: blocked by risk/);
+    assert.match(text, /HYPE accounts for 100%.*limit 60%/);
+    assert.match(text, /Frozen preview trader/);
+    assert.match(text, /43.000000 USDC/);
+    assert.match(text, /Frozen parameters/);
+    assert.match(text, /0.010000 USDC/);
+    assert.match(text, /plan_original_fixture/);
+    assert.doesNotMatch(text, /Agent trading account snapshot|因风控|拟议组合/);
+    assert.equal(root.all().filter((n) => n.tag === "button").length, 0);
+    assert(
+      text.indexOf("Current portfolio status") <
+        text.indexOf("Frozen preview trader"),
+    );
+  });
+
+it("preserves the confirmation-card renderer while adding only a read-only current status card", () => {
+  const root = proposalFixture("completed", "portfolio_confirm_fixture", true);
+  assert.match(root.text(), /Current portfolio status/);
+  assert.match(
+    root.text(),
+    /Original confirmation card: Frozen preview trader/,
+  );
+  assert.match(root.text(), /43.000000 USDC/);
+  assert.equal(root.all().filter((n) => n.tag === "button").length, 0);
+});
+
+it("never attaches another portfolio's risk to a proposal or treats a pending preview as the current portfolio", () => {
+  for (const status of ["requires_confirmation", "rejected", "expired"])
+    for (const withCard of [false, true]) {
+      const root = proposalFixture(
+        status,
+        "portfolio_confirm_fixture",
+        withCard,
+      );
+      assert.doesNotMatch(
+        root.text(),
+        /Current portfolio status|blocked by risk/,
+      );
+    }
+  for (const currentId of [null, "portfolio_unrelated_fixture"])
+    for (const withCard of [false, true]) {
+      const root = proposalFixture("completed", currentId, withCard);
+      assert.doesNotMatch(
+        root.text(),
+        /Current portfolio status|blocked by risk/,
+      );
+    }
 });

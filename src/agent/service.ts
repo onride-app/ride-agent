@@ -2160,6 +2160,10 @@ export class AgentService {
   }
   private proposalView(p: Proposal, state: State): Result {
     const portfolio = state.portfolios.find((x) => x.id === p.portfolio_id);
+    const current =
+      portfolio && ["queued", "completed"].includes(p.status)
+        ? (portfolioView(portfolio).data.portfolio as Record<string, unknown>)
+        : null;
     const tasks =
       portfolio?.executions
         .filter(
@@ -2169,6 +2173,15 @@ export class AgentService {
         .map(({ allocations, fingerprint, ...e }) => e) ?? [];
     return result(
       {
+        current_portfolio: current
+          ? {
+              id: current.id,
+              revision: current.revision,
+              operational: current.operational,
+              as_of: current.as_of,
+              execution_status: current.execution_status,
+            }
+          : null,
         proposal: {
           ...p,
           preview_hash: fingerprint(p.preview),
