@@ -67,6 +67,7 @@ import {
   type AnalysisOptions,
 } from "./conversation-presentation.js";
 import { inheritReselectedSlots } from "./plan-reselection.js";
+import { executionStatus } from "./risk-status.js";
 
 export class AgentService {
   get funding() {
@@ -1374,6 +1375,8 @@ export class AgentService {
         };
       }
       await this.mutatePreview(p, args, name);
+      // The diagnostic describes the saved target, not this projected change.
+      p.target_blocker = undefined;
       const copy = owned.sleeves.find((x) => x.copy_id === args.copy_id);
       actionAmount =
         name === "update_copy"
@@ -2273,14 +2276,27 @@ export function portfolioView(p: Portfolio): Result {
         s.state === "closed" ||
         (s.initialized && s.last_source_at != null && fresh(s.last_source_at)),
     );
+  const execution = executionStatus(p, operational);
   return result(
     {
+      ...(execution.status === "blocked_by_risk" && execution.reason
+        ? {
+            conversation_display: {
+              portfolio_id: p.id,
+              markdown: `${execution.summary_zh}：${execution.reason.message_zh}\n\n此状态仅指本次目标调整；历史订单与成交按实际执行记录单独展示。`,
+              markdown_en: `${execution.summary}. ${execution.reason.message}\n\nThis applies to the proposed target update. Existing orders and fills are reported separately from actual execution records.`,
+              instruction:
+                "Report this execution status and its reason in the user's language, even when operational is true. In Chinese, explicitly say 因风控暂未下单. This concerns the proposed target update only; distinguish any existing orders and fills. Do not infer that the account has never traded or propose changing risk rules, funding or traders to bypass the blocker.",
+            },
+          }
+        : {}),
       portfolio: {
         id: p.id,
         revision: p.revision,
         state: p.state,
         account_bound: bound,
         operational,
+        execution_status: execution,
         activation: {
           status: !bound
             ? p.state === "attention" || p.activation_check?.eligible === false

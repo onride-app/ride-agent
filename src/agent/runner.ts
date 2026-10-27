@@ -23,6 +23,7 @@ import {
 import { event, AgentService } from "./service.js";
 import type { State } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
+import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
 import {
   recordPerformance,
@@ -664,11 +665,20 @@ export class AgentRunner {
             try {
               risk(basket, snap.prices, true);
               p.sleeves = basket.sleeves;
+              p.target_blocker = undefined;
             } catch (error) {
-              if (error instanceof AgentError)
+              if (error instanceof AgentError) {
+                p.target_blocker = describeRiskBlocker(
+                  error,
+                  basket,
+                  snap.prices,
+                );
                 eventOnce(state, error.code, p.id, error.message);
-              else throw error;
+              } else throw error;
             }
+          } else {
+            // No proposed source update remains blocked in this planning pass.
+            p.target_blocker = undefined;
           }
           const targets = risk(p, snap.prices, true);
           const keys = new Set([

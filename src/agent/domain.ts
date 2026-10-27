@@ -1,6 +1,7 @@
 import { Decimal } from "decimal.js";
 import { createHash, randomUUID } from "node:crypto";
 import { AgentError, type Preferences } from "./contracts.js";
+import type { TargetBlocker } from "./risk-status.js";
 import {
   createRiskSelectionPolicy,
   type RecommendationOptions,
@@ -255,6 +256,7 @@ export interface Execution {
   error: string | null;
 }
 export interface Portfolio {
+  target_blocker?: TargetBlocker;
   last_error?: {
     at: number;
     code: string;

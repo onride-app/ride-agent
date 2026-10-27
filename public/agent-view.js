@@ -414,6 +414,27 @@ export function render(
       el("h1", "Your portfolio"),
       el("p", `${p.state} · ${p.id}`, "muted"),
     );
+    if (p.execution_status?.status === "blocked_by_risk") {
+      const execution = card("因风控暂未下单");
+      execution.append(
+        el(
+          "p",
+          p.execution_status.reason?.message_zh ??
+            p.execution_status.reason?.message ??
+            p.execution_status.summary ??
+            "A portfolio risk check blocked the proposed order.",
+          "warning",
+        ),
+        el(
+          "p",
+          p.operational === true
+            ? "信号监控正常运行。此状态仅指本次目标调整；历史订单、成交与退出记录单独展示。"
+            : "此状态仅指本次目标调整；历史订单、成交与退出记录单独展示。",
+          "muted",
+        ),
+      );
+      root.append(execution);
+    }
     if (p.activation && p.operational !== true) {
       const activation = card("Copying is not operational yet");
       activation.append(
