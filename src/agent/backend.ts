@@ -351,22 +351,29 @@ export async function startBackend(): Promise<void> {
     Number(process.env.PORT ?? 3344),
     process.env.HOST ?? "127.0.0.1",
   );
-  process.once("SIGTERM", () => {
+  const shutdown = () => {
     controller.abort();
     listener.close();
-  });
-  process.once("SIGINT", () => {
-    controller.abort();
-    listener.close();
-  });
-  if (process.env.RIDE_AGENT_READ_ONLY === "true") {
-    await new Promise<void>((resolve) => {
-      controller.signal.addEventListener("abort", () => resolve(), {
-        once: true,
-      });
+    // Closing tracked database sockets must start before the runner returns:
+    // its current state SELECT may be blocked sending a large response.
+    void repository.close().catch(() => {
+      console.error("Rider database shutdown failed.");
     });
-  } else {
-    await runner.run(controller.signal);
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+  try {
+    if (process.env.RIDE_AGENT_READ_ONLY === "true") {
+      await new Promise<void>((resolve) => {
+        controller.signal.addEventListener("abort", () => resolve(), {
+          once: true,
+        });
+      });
+    } else {
+      await runner.run(controller.signal);
+    }
+  } finally {
+    listener.close();
+    await repository.close();
   }
-  await repository.close();
 }

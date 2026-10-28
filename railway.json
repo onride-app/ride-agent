@@ -8,6 +8,7 @@
     "startCommand": "HOST=${HOST:-0.0.0.0} node dist/${RIDE_SERVICE_ENTRYPOINT:-server}.js",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 120,
+    "drainingSeconds": 45,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 3
   }
