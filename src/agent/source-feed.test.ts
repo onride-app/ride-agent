@@ -192,7 +192,7 @@ it("a latest failure is surfaced instead of last-good data and retried only afte
   }, time);
   try {
     await feed.read("a");
-    time.advance(1000);
+    time.advance(5001);
     fail = true;
     await feed.pollOnce();
     assert.equal(calls, 2);
@@ -323,4 +323,117 @@ it("close clears timers and queued work and refuses late in-flight results", asy
     );
   }
   assert.equal(calls, 2);
+});
+
+it("polling reuses a fresh on-demand observation at the unchanged 5s boundary without relabeling it", async () => {
+  const time = fakeTime();
+  let calls = 0;
+  const feed = new SourceFeed(async () => ({
+    ...snapshot(time.clock(), `r${++calls}`),
+    expires_at: time.clock() + 20_000,
+  }), time);
+  try {
+    const first = await feed.read("a");
+    for (const elapsed of [0, 4999, 1]) {
+      time.advance(elapsed);
+      time.tick();
+      await feed.pollOnce();
+      const reused = await feed.read("a");
+      assert.equal(calls, 1);
+      assert.deepEqual(reused, first);
+      assert.equal(reused.observed_at, initialTime);
+      assert.equal(reused.positions[0].observed_at, initialTime);
+      assert.equal((reused as SourceSnapshot & {expires_at: number}).expires_at, initialTime + 20_000);
+    }
+    time.advance(1);
+    await feed.pollOnce();
+    const latest = await feed.read("a");
+    assert.equal(calls, 2);
+    assert.equal(latest.observed_at, initialTime + 5001);
+    assert.equal(latest.revision, "r2");
+  } finally { feed.close(); }
+});
+
+it("an on-demand refresh just before the next poll prevents a duplicate source REST fetch", async () => {
+  const time = fakeTime();
+  let calls = 0;
+  const feed = new SourceFeed(async () => snapshot(time.clock(), `r${++calls}`), time);
+  try {
+    await feed.read("a");
+    time.advance(5001);
+    const refreshed = await feed.read("a");
+    assert.equal(calls, 2);
+    time.advance(1000);
+    time.tick();
+    await feed.pollOnce();
+    assert.equal(calls, 2);
+    assert.deepEqual(await feed.read("a"), refreshed);
+    assert.equal(refreshed.observed_at, initialTime + 5001);
+  } finally { feed.close(); }
+});
+
+it("polling refreshes when any position timestamp or frame expiry is stale even while the top-level timestamp is fresh", async () => {
+  for (const variant of ["position", "expiry"] as const) {
+    const time = fakeTime();
+    let calls = 0;
+    const feed = new SourceFeed(async () => {
+      const observed = snapshot(time.clock(), `r${++calls}`);
+      if (calls === 1 && variant === "position") observed.positions[0].observed_at -= 4000;
+      return variant === "expiry" && calls === 1 ? { ...observed, expires_at: time.clock() + 1000 } : observed;
+    }, time);
+    try {
+      const initial = await feed.read("a");
+      time.advance(variant === "expiry" ? 1000 : 1001);
+      await feed.pollOnce();
+      assert.equal(calls, 2, variant);
+      const refreshed = await feed.read("a");
+      assert.equal(refreshed.revision, "r2");
+      assert.notEqual(refreshed.observed_at, initial.observed_at);
+    } finally { feed.close(); }
+  }
+});
+
+it("a cached flat observation is reused without inventing positions, timestamps or another live interest", async () => {
+  const time = fakeTime();
+  let calls = 0;
+  const feed = new SourceFeed(async () => ({ ...snapshot(time.clock(), `r${++calls}`), positions: [] }), time);
+  try {
+    const initial = await feed.read("a");
+    time.advance(1000);
+    await feed.pollOnce();
+    assert.equal(calls, 1);
+    assert.deepEqual(await feed.read("a"), initial);
+    // Only explicit reads renew lastReadAt; repeated timer polling does not.
+    for (let i = 0; i < 12; i++) {
+      time.advance(5000);
+      await feed.pollOnce();
+    }
+    assert.equal(time.counts().active, 0);
+  } finally { feed.close(); }
+});
+
+it("a known failure cannot be hidden by a previous frame that appears fresh after clock rollback", async () => {
+  const time = fakeTime();
+  const failure = new Error("latest source read failed");
+  let calls = 0, fail = false;
+  const feed = new SourceFeed(async () => {
+    calls++;
+    if (fail) throw failure;
+    return snapshot(time.clock());
+  }, time);
+  try {
+    await feed.read("a");
+    time.advance(5001);
+    fail = true;
+    await feed.pollOnce();
+    assert.equal(calls, 2);
+    time.advance(-4000); // Old successful frame now looks young; failure wins.
+    await feed.pollOnce();
+    await assert.rejects(feed.read("a"), error => error === failure);
+    assert.equal(calls, 2);
+    time.advance(9000);
+    await feed.pollOnce();
+    assert.equal(calls, 3);
+    await assert.rejects(feed.read("a"), error => error === failure);
+  } finally { feed.close(); }
 });

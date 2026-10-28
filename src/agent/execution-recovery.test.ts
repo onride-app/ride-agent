@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { VenueReads } from "./venue-reads.js";
+import { VenueReadBudget } from "./venue-read-budget.js";
 import { CoreBridge } from "./core_bridge.js";
 import { AgentError, failure, publicResult } from "./contracts.js";
 import { FakeAdapter, candidate, snapshot } from "./fixtures.js";
@@ -35,16 +36,26 @@ it("deduplicates concurrent reads, isolates values, and never reuses completed a
       return count === 1 ? gate.promise : new Response('{"balance":2}');
     }) as typeof fetch,
     () => clock,
+    2,
+    { budget: new VenueReadBudget({ clock: () => clock }) },
   );
-  const a = reads.read("https://venue.test/info", { type: "state" });
-  const b = reads.read("https://venue.test/info", { type: "state" });
+  const a = reads.read("https://venue.test/info", {
+    type: "clearinghouseState",
+  });
+  const b = reads.read("https://venue.test/info", {
+    type: "clearinghouseState",
+  });
   gate.resolve(new Response('{"balance":1}'));
   const [x, y] = await Promise.all([a, b]);
   x.balance = 99;
   assert.equal(y.balance, 1);
   assert.equal(count, 1);
   assert.equal(
-    (await reads.read("https://venue.test/info", { type: "state" })).balance,
+    (
+      await reads.read("https://venue.test/info", {
+        type: "clearinghouseState",
+      })
+    ).balance,
     2,
   );
   assert.equal(count, 2);
@@ -141,9 +152,20 @@ it("reserves source capacity while follower reads are hung and bounds each lane"
     if (key === "account2") return second.promise;
     return new Response("{}");
   }) as typeof fetch);
-  const a = reads.read("https://venue.test/info", { key: "account1" });
-  const b = reads.read("https://venue.test/info", { key: "account2" });
-  await reads.read("https://venue.test/info", { key: "source" }, 0, "source");
+  const a = reads.read("https://venue.test/info", {
+    type: "clearinghouseState",
+    key: "account1",
+  });
+  const b = reads.read("https://venue.test/info", {
+    type: "clearinghouseState",
+    key: "account2",
+  });
+  await reads.read(
+    "https://venue.test/info",
+    { type: "clearinghouseState", key: "source" },
+    0,
+    "source",
+  );
   assert.deepEqual(starts, ["account1", "source"]);
   first.resolve(new Response("{}"));
   await a;
@@ -164,19 +186,34 @@ it("shares Retry-After cooldown across source/account lanes without retry storms
         : new Response("{}");
     }) as typeof fetch,
     () => clock,
+    2,
+    { budget: new VenueReadBudget({ clock: () => clock }) },
   );
   await assert.rejects(
-    reads.read("https://venue.test/info", { key: "account" }),
+    reads.read("https://venue.test/info", {
+      type: "clearinghouseState",
+      key: "account",
+    }),
     (e: any) =>
       e.code === "VENUE_RATE_LIMITED" && e.details.retry_after_ms === 5000,
   );
   await assert.rejects(
-    reads.read("https://venue.test/info", { key: "source" }, 0, "source"),
+    reads.read(
+      "https://venue.test/info",
+      { type: "clearinghouseState", key: "source" },
+      0,
+      "source",
+    ),
     /cooling down/,
   );
   assert.equal(count, 1);
   clock += 5001;
-  await reads.read("https://venue.test/info", { key: "source" }, 0, "source");
+  await reads.read(
+    "https://venue.test/info",
+    { type: "clearinghouseState", key: "source" },
+    0,
+    "source",
+  );
   assert.equal(count, 2);
 });
 

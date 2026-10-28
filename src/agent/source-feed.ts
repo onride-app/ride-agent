@@ -171,8 +171,18 @@ export class SourceFeed {
     if (existing) return existing;
     if (this.closed) return Promise.reject(this.closedError());
     const interest = this.interests.get(id);
-    if (interest?.failure && interest.failure.retryAt > this.clock())
-      return Promise.reject(interest.failure.error);
+    const at = this.clock();
+    if (interest?.failure) {
+      if (interest.failure.retryAt > at)
+        return Promise.reject(interest.failure.error);
+      // Expiring cooldown still requires a successful new observation. Never
+      // let a prior cached frame hide the latest failed source read.
+    } else if (interest?.snapshot && this.isFresh(interest.snapshot, at)) {
+      // Polling shares the same existing freshness limit as on-demand reads.
+      // Reuse the real frame; do not relabel its observation or expiry time,
+      // renew interest, or spend another public REST read while it is fresh.
+      return Promise.resolve(interest.snapshot);
+    }
     const work = this.perform(id);
     this.flights.set(id, work);
     const cleanup = () => {
