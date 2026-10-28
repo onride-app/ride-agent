@@ -855,11 +855,6 @@ function renderAuthorizePage(
   const clientName = client.client_name || "MCP Client";
   const scopes = params.scopes || [...DEFAULT_RIDE_OAUTH_SCOPES];
   const scope = scopes.join(" ");
-  const permissions = scopes.map((scope) =>
-    scope === "ride:trade"
-      ? "Prepare and manage copy-trading. Orders require Ride confirmation or an existing bounded grant."
-      : "View your Ride account, portfolios and trader information.",
-  );
   const fields = {
     client_id: client.client_id,
     redirect_uri: params.redirectUri,
@@ -889,20 +884,24 @@ function renderAuthorizePage(
   <main class="app-auth oauth-auth">
     <div class="app-auth-visual" aria-hidden="true"></div>
     <div class="app-auth-brand"><div class="app-auth-wordmark">Rider</div><div class="app-auth-tagline">Follow top traders' bets.<br>Make smarter predictions.</div></div>
-    <div class="app-auth-intro"><h1>Connect your Ride account</h1><p>${escapeHtml(clientName)} wants to connect to your Ride account.</p></div>
+    <div class="app-auth-intro"><h1 id="auth-heading">Connect your Rider account</h1><p>${escapeHtml(clientName)} wants to connect to your Rider account.</p></div>
 
     <form id="sign-in-form">
-      <div class="auth-actions">
+      <div id="auth-entry" class="auth-actions">
+        <button id="log-in" class="auth-primary" type="button">Log in</button>
+        <button id="sign-up" type="button">Sign up</button>
+      </div>
+      <div id="auth-providers" class="auth-actions" hidden>
         <button id="google-login" class="google" type="button">
           Continue with Google
         </button>
         <button id="apple-login" class="apple" type="button">Continue with Apple</button>
         <button id="wallet-setup-retry" class="google" type="button" hidden>Retry wallet setup</button>
+        <button id="auth-back" class="auth-back" type="button">Back</button>
       </div>
       <div id="status" class="status" aria-live="polite"></div>
     </form>
 
-    <details class="connection-permissions"><summary>Connection permissions</summary><ul>${permissions.map((permission) => `<li>${escapeHtml(permission)}</li>`).join("")}</ul></details>
     <p class="app-auth-policy">By continuing, you agree to the <a href="https://docs.fiammalabs.io/terms-and-privacy-policy-ride/terms-of-service-ride" target="_blank" rel="noreferrer">Terms</a> and <a href="https://docs.fiammalabs.io/terms-and-privacy-policy-ride/privacy-policy-ride" target="_blank" rel="noreferrer">Privacy Policy</a>.</p>
 
     ${
@@ -925,7 +924,13 @@ function renderAuthorizePage(
     }
   </main>
   <script type="module">
-    import Privy, {LocalStorage} from '${escapeJs(config.jsSdkUrl)}';
+    async function loadPrivySdk() {
+      try {
+        return await import('${escapeJs(config.jsSdkUrl)}');
+      } catch {
+        throw new Error('Could not load Rider sign-in. Check your connection and try again.');
+      }
+    }
 
     const config = {
       privyAppId: '${escapeJs(config.privyAppId)}',
@@ -935,6 +940,9 @@ function renderAuthorizePage(
 
     const AUTH_PROVIDER_KEY = 'ride:auth:provider';
     const statusEl = document.getElementById('status');
+    const authEntry = document.getElementById('auth-entry');
+    const authProviders = document.getElementById('auth-providers');
+    const authHeading = document.getElementById('auth-heading');
     const googleLoginButton = document.getElementById('google-login');
     const appleLoginButton = document.getElementById('apple-login');
     const walletRetryButton = document.getElementById('wallet-setup-retry');
@@ -977,14 +985,15 @@ function renderAuthorizePage(
       if (!config.privyAppId) {
         throw new Error('Rider is missing Privy configuration.');
       }
-      const options = {
-        appId: config.privyAppId,
-        storage: new LocalStorage()
-      };
-      if (config.privyClientId) {
-        options.clientId = config.privyClientId;
-      }
       privyInitialization = (async () => {
+        const { default: Privy, LocalStorage } = await loadPrivySdk();
+        const options = {
+          appId: config.privyAppId,
+          storage: new LocalStorage()
+        };
+        if (config.privyClientId) {
+          options.clientId = config.privyClientId;
+        }
         const client = new Privy(options);
         await client.initialize();
         privy = client;
@@ -1218,6 +1227,7 @@ function renderAuthorizePage(
       const authorizationCode = url.searchParams.get('privy_oauth_code');
       const stateCode = url.searchParams.get('privy_oauth_state');
       if (!authorizationCode && !stateCode) return;
+      showAuthProviders('login');
       if (!authorizationCode || !stateCode) {
         throw new Error('Sign-in returned incomplete OAuth credentials.');
       }
@@ -1254,6 +1264,20 @@ function renderAuthorizePage(
       }
     }
 
+    function showAuthProviders(intent) {
+      authEntry.hidden = true;
+      authProviders.hidden = false;
+      authHeading.textContent = intent === 'signup' ? 'Create your Rider account' : 'Log in to Rider';
+      setStatus('');
+    }
+    document.getElementById('log-in').addEventListener('click', () => showAuthProviders('login'));
+    document.getElementById('sign-up').addEventListener('click', () => showAuthProviders('signup'));
+    document.getElementById('auth-back').addEventListener('click', () => {
+      authEntry.hidden = false;
+      authProviders.hidden = true;
+      authHeading.textContent = 'Connect your Rider account';
+      setStatus('');
+    });
     googleLoginButton.addEventListener('click', () => startOAuthLogin('GOOGLE', googleLoginButton));
     appleLoginButton.addEventListener('click', () => startOAuthLogin('APPLE', appleLoginButton));
     walletRetryButton.addEventListener('click', async () => {

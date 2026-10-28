@@ -152,6 +152,28 @@ it("explains the missing Fixed amount immediately, blocks preview RPCs, and neve
   assert.equal(JSON.stringify(saved), before);
 });
 
+it("explains actual copy sizing and mode choices before any recalculation or confirmation", () => {
+  const { root, calls, saved, before } = fixture();
+  const mode = input(root, "Copy mode");
+  assert.match(root.text(), /Automatic proportional copying/);
+  assert.match(root.text(), /allocated USDC divided by verified source equity/);
+  assert.doesNotMatch(root.text(), /Rider recommended|ride_recommends/);
+  mode.value = "proportional";
+  input(root, "Proportional multiplier").value = "1.5";
+  mode.dispatch("change");
+  assert.match(root.text(), /saved 1.5x multiplier/);
+  mode.value = "fixed";
+  input(root, "Fixed margin per source entry · USDC · required").value = "2";
+  mode.dispatch("change");
+  assert.match(
+    root.text(),
+    /Use 2 USDC margin for each verified initial source position and subsequent source opening fill/,
+  );
+  assert.match(root.text(), /Reductions follow source fills proportionally/);
+  assert.equal(calls.length, 0);
+  assert.equal(JSON.stringify(saved), before);
+});
+
 it("validates decimal precision and the existing allocation bound, then sends only an explicit new preview", () => {
   const { root, calls, saved, before } = fixture();
   const mode = input(root, "Copy mode");

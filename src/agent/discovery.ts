@@ -410,6 +410,8 @@ export function conversationView(
       plan?.allocations.map((a) => ({
         ...traderRow(a.trader, analysisOptions.locale),
         amount_usdc: a.amount_usdc,
+        copy_mode_label: copyRule(a, analysisOptions).label,
+        copy_sizing: copyRule(a, analysisOptions).sizing,
         leverage_mode: a.leverage_mode ?? "cap",
         leverage_cap: a.leverage_cap,
         leverage_cap_source:

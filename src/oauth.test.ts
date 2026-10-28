@@ -66,7 +66,10 @@ it("retries a failed Privy initialization with a fresh client and deduplicates c
   );
   const script = html
     .match(/<script type="module">([\s\S]*?)<\/script>/)![1]
-    .replace(/^\s*import Privy[^\n]*\n/m, "");
+    .replace(
+      /return await import\('[^']+'\);/,
+      "return await loadTestPrivySdk();",
+    );
   let attempts = 0;
   class MockPrivy {
     async initialize() {
@@ -85,6 +88,10 @@ it("retries a failed Privy initialization with a fresh client and deduplicates c
   const context: any = {
     Privy: MockPrivy,
     LocalStorage: class {},
+    loadTestPrivySdk: async () => ({
+      default: MockPrivy,
+      LocalStorage: class {},
+    }),
     URL,
     document: { getElementById: () => element },
     window: {
@@ -151,9 +158,11 @@ function consentPage(
     create?: (input: any) => Promise<any>;
     loadFrame?: boolean;
     ping?: () => Promise<boolean>;
+    sdkError?: Error;
   } = {},
 ) {
   const elements = new Map<string, any>();
+  let sdkLoads = 0;
   const generated: any[] = [],
     completed: any[] = [],
     approved: any[] = [],
@@ -232,6 +241,11 @@ function consentPage(
     clearTimeout,
     Privy: MockPrivy,
     LocalStorage: class {},
+    loadTestPrivySdk: async () => {
+      sdkLoads++;
+      if (options.sdkError) throw options.sdkError;
+      return { default: MockPrivy, LocalStorage: class {} };
+    },
     document: {
       createElement(tag: string) {
         assert.equal(tag, "iframe");
@@ -304,7 +318,10 @@ function consentPage(
   };
   const script = html
     .match(/<script type="module">([\s\S]*?)<\/script>/)![1]
-    .replace(/^\s*import Privy[^\n]*\n/m, "")
+    .replace(
+      /return await import\('[^']+'\);/,
+      "return await loadTestPrivySdk();",
+    )
     .replace(
       "handleOAuthCallback().catch",
       "globalThis.callbackPromise = handleOAuthCallback().catch",
@@ -316,6 +333,7 @@ function consentPage(
   );
   return {
     elements,
+    sdkLoads: () => sdkLoads,
     generated,
     completed,
     approved,
@@ -338,8 +356,12 @@ function consentPage(
 it("keeps Google and Apple provider choices through authorization redirects without exposing developer fields", async () => {
   const html = await consentHtml();
   assert.doesNotMatch(html, /id="access-code"|name="access-code"|Scopes:/);
-  assert.match(html, /View your Ride account/);
-  assert.match(html, /Orders require Ride confirmation/);
+  assert.match(
+    html,
+    /id="auth-entry"[\s\S]*?>Log in<\/button>[\s\S]*?>Sign up<\/button>/,
+  );
+  assert.match(html, /id="auth-providers"[^>]* hidden/);
+  assert.doesNotMatch(html, /Connection permissions/);
   for (const provider of ["GOOGLE", "APPLE"]) {
     const store = new Map<string, string>();
     const start = consentPage(
@@ -348,10 +370,18 @@ it("keeps Google and Apple provider choices through authorization redirects with
       "https://ride.test/authorize?client_id=test-client",
     );
     await start.callback;
+    assert.equal(start.sdkLoads(), 0);
+    assert.equal(start.generated.length, 0);
+    assert.equal(start.sdkLoads(), 0);
+    await start.elements.get("log-in").listeners.click();
+    assert.equal(start.elements.get("auth-entry").hidden, true);
+    assert.equal(start.elements.get("auth-providers").hidden, false);
+    assert.equal(start.generated.length, 0);
     await start.elements
       .get(provider === "APPLE" ? "apple-login" : "google-login")
       .listeners.click();
     assert.equal(start.generated.length, 1);
+    assert.equal(start.sdkLoads(), 1);
     assert.equal(start.generated[0][0], provider.toLowerCase());
     assert.equal(
       start.generated[0][1],
@@ -384,6 +414,64 @@ it("keeps Google and Apple provider choices through authorization redirects with
     );
   }
 });
+it("lets users choose sign-up and return before contacting an identity provider", async () => {
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize",
+  );
+  await page.callback;
+  assert.equal(page.sdkLoads(), 0);
+  await page.elements.get("sign-up").listeners.click();
+  assert.equal(
+    page.elements.get("auth-heading").textContent,
+    "Create your Rider account",
+  );
+  assert.equal(page.elements.get("auth-entry").hidden, true);
+  assert.equal(page.elements.get("auth-providers").hidden, false);
+  await page.elements.get("auth-back").listeners.click();
+  assert.equal(
+    page.elements.get("auth-heading").textContent,
+    "Connect your Rider account",
+  );
+  assert.equal(page.elements.get("auth-entry").hidden, false);
+  assert.equal(page.elements.get("auth-providers").hidden, true);
+  assert.equal(page.generated.length, 0);
+  assert.equal(page.completed.length, 0);
+  assert.equal(page.approved.length, 0);
+  assert.equal(page.sdkLoads(), 0);
+});
+
+it("keeps SDK-load errors visible with provider choices and permits a deliberate retry", async () => {
+  const page = consentPage(
+    await consentHtml(),
+    new Map(),
+    "https://ride.test/authorize",
+    {
+      sdkError: Error("network fixture"),
+    },
+  );
+  await page.callback;
+  await page.elements.get("log-in").listeners.click();
+  await page.elements.get("apple-login").listeners.click();
+  assert.equal(page.elements.get("auth-providers").hidden, false);
+  assert.match(
+    page.elements.get("status").textContent,
+    /Could not load Rider sign-in/,
+  );
+  assert.equal(page.elements.get("apple-login").disabled, false);
+  assert.equal(page.elements.get("google-login").disabled, false);
+  assert.equal(page.generated.length, 0);
+  assert.equal(page.approved.length, 0);
+  await page.elements.get("google-login").listeners.click();
+  assert.equal(page.sdkLoads(), 2);
+  assert.match(
+    page.elements.get("status").textContent,
+    /Could not load Rider sign-in/,
+  );
+  assert.equal(page.redirects.length, 0);
+});
+
 it("keeps old Google callbacks working while rejecting unsupported stored providers before exchange", async () => {
   const html = await consentHtml();
   const legacy = consentPage(

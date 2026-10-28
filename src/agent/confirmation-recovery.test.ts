@@ -333,6 +333,14 @@ it("a lost handoff never reveals or enables a proposal belonging to another acco
       r.operation === "proposal" ? denied("NOT_FOUND", 404) : undefined,
   });
   assert.equal(f.node("login").hidden, false);
+  assert.match(
+    f.node("login").querySelector("p")!.textContent,
+    /Use the Ride account that created this proposal/,
+  );
+  assert.doesNotMatch(
+    f.node("login").querySelector("p")!.textContent,
+    /[\u3400-\u9fff]/,
+  );
   assert.equal(f.node("actions").hidden, true);
   assert.equal(f.rendered.length, 0);
   assert.match(f.node("status").textContent, /account that created it/);

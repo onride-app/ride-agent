@@ -304,7 +304,7 @@ it("keeps default output short with every selected trader, concrete copy rules a
     copy_mode: "proportional",
     proportional_multiplier: 1.5,
   });
-  assert.match(fixed.summary, /经核实的源开仓使用 2 USDC/);
+  assert.match(fixed.summary, /初始源仓位及后续源开仓成交使用 2 USDC/);
   assert.match(proportional.summary, /1.5 倍/);
 });
 

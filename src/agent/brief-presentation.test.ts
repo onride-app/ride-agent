@@ -40,8 +40,8 @@ const numeric = (s: string) => s.match(/-?\d+(?:\.\d+)?/g) ?? [];
 
 it("makes the normal two- and three-trader brief materially shorter than the reviewed default", () => {
   for (const [count, budget, zhLimit, enLimit] of [
-    [2, "20", 345, 850],
-    [3, "43", 395, 1000],
+    [2, "20", 400, 1000],
+    [3, "43", 450, 1150],
   ] as const) {
     const p = plan(count, budget);
     const zh = planDisplay(p, "brief", undefined, { locale: "zh" });
@@ -71,6 +71,18 @@ it("makes the normal two- and three-trader brief materially shorter than the rev
     assert.match(en.markdown, /skip below-minimum orders/);
     assert.match(zh.markdown, /组合退出/);
     assert.match(en.markdown, /Portfolio exit/);
+    assert.match(
+      en.markdown,
+      /Mode choices: automatic proportional \/ custom multiplier \/ Perps fixed USDC per entry/,
+    );
+    assert.match(
+      zh.markdown,
+      /模式可改：自动比例 \/ 比例倍率 \/ Perps 固定保证金/,
+    );
+    assert.doesNotMatch(
+      en.markdown,
+      /Ride recommends|Ride automatic|Rider recommended/,
+    );
     assert.deepEqual(numeric(en.markdown), numeric(zh.markdown));
   }
 });

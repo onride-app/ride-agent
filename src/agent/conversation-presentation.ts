@@ -242,7 +242,7 @@ function briefSetting(a: Allocation, locale?: Locale) {
           `固定 ${a.fixed_margin_usdc ?? "未设置"} USDC`,
           `Fixed ${a.fixed_margin_usdc ?? "unset"} USDC`,
         )
-      : `${mode === "proportional" ? t("比例", "Proportional") : "Ride"} ×${a.proportional_multiplier ?? 1}`;
+      : `${mode === "proportional" ? t("比例", "Proportional") : t("自动", "Auto")} ×${a.proportional_multiplier ?? 1}`;
   return `${sizing} · ${
     a.trader.market === "prediction"
       ? "1x"
@@ -387,8 +387,8 @@ export function copyRule(a: Allocation, options: AnalysisOptions = {}) {
   const sizing =
     mode === "fixed"
       ? t(
-          `每次经核实的源开仓使用 ${a.fixed_margin_usdc ?? "未设置"} USDC 保证金；减仓按源成交比例跟随。`,
-          `Use ${a.fixed_margin_usdc ?? "unset"} USDC margin for each verified source opening fill; follow reductions in proportion to source fills.`,
+          `每个核实的初始源仓位及后续源开仓成交使用 ${a.fixed_margin_usdc ?? "未设置"} USDC 保证金；减仓按源成交比例跟随。`,
+          `Use ${a.fixed_margin_usdc ?? "unset"} USDC margin for each verified initial source position and subsequent source opening fill; follow reductions in proportion to source fills.`,
         )
       : t(
           `按分配资金与源账户权益的比例缩放源仓位${multiplier === 1 ? "" : `，再乘 ${multiplier} 倍`}。`,
@@ -397,8 +397,8 @@ export function copyRule(a: Allocation, options: AnalysisOptions = {}) {
   const limits =
     a.trader.market === "perps"
       ? t(
-          `${a.leverage_cap == null ? "跟随核实的源杠杆，无额外用户上限" : `额外杠杆上限 ${a.leverage_cap}x`}，同时受交易所限制、预算和风控约束；不足最小下单额则跳过，不自动加钱或加杠杆。`,
-          `${a.leverage_cap == null ? "Follow verified source leverage without an extra user cap" : `Apply the saved ${a.leverage_cap}x extra leverage cap`}, subject to venue limits, budget and risk checks. Skip below-minimum orders without automatically adding funds or leverage.`,
+          `${a.leverage_cap == null ? "跟随核实的源杠杆，无额外用户上限" : `额外杠杆上限 ${a.leverage_cap}x`}，同时受交易所限制、预算和风控约束；较低杠杆限制和分配保证金预算会压低目标，不足最小下单额则跳过，不自动加钱或加杠杆。`,
+          `${a.leverage_cap == null ? "Follow verified source leverage without an extra user cap" : `Apply the saved ${a.leverage_cap}x extra leverage cap`}, subject to venue limits, budget and risk checks. Lower permitted leverage and the allocated margin budget can reduce targets. Skip below-minimum orders without automatically adding funds or leverage.`,
         )
       : t(
           "预测市场按对应结果仓位跟随，杠杆为 1x；受可用抵押品、预算和交易限制约束。",
@@ -411,7 +411,7 @@ export function copyRule(a: Allocation, options: AnalysisOptions = {}) {
         ? t("固定保证金", "Fixed margin")
         : mode === "proportional"
           ? t("比例跟单", "Proportional copying")
-          : t("Ride 自动比例跟单", "Ride automatic proportional copying"),
+          : t("自动比例跟单", "Automatic proportional copying"),
     sizing,
     summary: [sizing, limits].join(
       resolveLocale(options.locale) === "en" ? " " : "",
@@ -838,6 +838,12 @@ function planDisplayView(
       markdown.length,
       ...briefPlanMarkdown(plan, previous, options),
     );
+  markdown.push(
+    t(
+      "模式可改：自动比例 / 比例倍率 / Perps 固定保证金（需每笔 USDC）；修改后重新预览再确认。",
+      "Mode choices: automatic proportional / custom multiplier / Perps fixed USDC per entry. Preview edits before confirming.",
+    ),
+  );
   if (analysis) {
     markdown.push(
       `${t("分析结论：", "Analysis: ")}${analysis.conclusion}`,

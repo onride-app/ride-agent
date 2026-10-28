@@ -309,16 +309,18 @@ it("hands off a human session once to the same challenge/proposal and confines e
       proposal_id: proposal,
       expires_at: Date.now() - 1,
     });
+    const expiredHandoff = await f.post("embed-session", {
+      ticket: expiredTicket,
+      challenge,
+      proposal_id: proposal,
+    });
+    assert.equal(expiredHandoff.status, 401);
+    const expiredError = (await expiredHandoff.json()) as any;
     assert.equal(
-      (
-        await f.post("embed-session", {
-          ticket: expiredTicket,
-          challenge,
-          proposal_id: proposal,
-        })
-      ).status,
-      401,
+      expiredError.error.message,
+      "Rider sign-in handoff expired. Reopen sign-in.",
     );
+    assert.doesNotMatch(expiredError.error.message, /[\u3400-\u9fff]/);
   } finally {
     f.close();
   }

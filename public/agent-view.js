@@ -67,6 +67,25 @@ function renderProposalRiskStatus(root, data) {
     renderRiskStatus(root, current, true);
 }
 const usdc = (v) => (v == null ? "Unavailable" : `${v} USDC`);
+const copyModeLabel = (mode) =>
+  mode === "fixed"
+    ? "Fixed margin"
+    : mode === "proportional"
+      ? "Proportional copying"
+      : mode == null || mode === "ride_recommends"
+        ? "Automatic proportional copying"
+        : "Unavailable";
+function copyModeDescription(settings) {
+  const mode = settings.copy_mode ?? "ride_recommends";
+  const multiplier = settings.proportional_multiplier ?? 1;
+  const sizing =
+    mode === "fixed"
+      ? `Use ${usdc(settings.fixed_margin_usdc)} margin for each verified initial source position and subsequent source opening fill. Reductions follow source fills proportionally.`
+      : mode === "ride_recommends" || mode === "proportional"
+        ? `Scale source positions by your allocated USDC divided by verified source equity${Number(multiplier) === 1 ? "." : `, then apply the saved ${multiplier}x multiplier.`}`
+        : "Copy sizing is unavailable. Refresh this plan before confirming.";
+  return `${sizing} ${settings.trader?.market === "prediction" ? "Prediction positions follow the matching outcome at 1x." : "Follow verified source leverage, subject to any saved cap. Lower permitted leverage and the allocated margin budget can reduce targets."} Budget, trading limits and risk checks still apply; below-minimum orders are skipped.`;
+}
 const sumCash = (amounts) => {
   const n = amounts.reduce((total, v) => {
     const [whole, fraction = ""] = String(v).split(".");
@@ -116,7 +135,8 @@ function sleeveCards(
           : "Sleeve exit trigger",
         s.stop_loss_pct == null ? null : `${s.stop_loss_pct}%`,
       ),
-      row("Copy mode", s.copy_mode ?? "Rider recommended"),
+      row("Copy mode", copyModeLabel(s.copy_mode)),
+      el("p", copyModeDescription(s), "muted"),
       ...(s.copy_mode === "fixed"
         ? [row("Fixed margin per source entry", usdc(s.fixed_margin_usdc))]
         : []),
@@ -612,7 +632,7 @@ export function render(
         controls,
         "Copy mode",
         [
-          ["ride_recommends", "Rider recommended"],
+          ["ride_recommends", "Automatic proportional copying"],
           ["fixed", "Fixed margin"],
           ["proportional", "Proportional"],
         ],
@@ -654,7 +674,15 @@ export function render(
       fixed.setAttribute("aria-describedby", fixedHint.id);
       edit.setAttribute("aria-describedby", fixedHint.id);
       fixed.parentElement.append(fixedHint);
+      const copyHelp = el("p", "", "muted");
+      controls.append(copyHelp);
       const validateCopyMode = () => {
+        copyHelp.textContent = copyModeDescription({
+          ...s,
+          copy_mode: mode.value,
+          fixed_margin_usdc: fixed.value || null,
+          proportional_multiplier: multiplier.value,
+        });
         const isFixed = mode.value === "fixed";
         fixed.required = isFixed;
         fixed.disabled = !isFixed;
@@ -1254,6 +1282,12 @@ function planEditor(plan, data, callTool, start) {
       e.multiplier.disabled = e.mode.value !== "proportional";
       e.multiplier.parentElement.hidden = e.mode.value !== "proportional";
       const selected = candidates.find((t) => t.id === e.trader.value);
+      e.copyHelp.textContent = copyModeDescription({
+        trader: selected,
+        copy_mode: e.mode.value,
+        fixed_margin_usdc: e.fixed.value || null,
+        proportional_multiplier: e.multiplier.value,
+      });
       const message = isFixed
         ? fixedMarginMessage(e.fixed.value, e.amount.value, selected?.market)
         : "";
@@ -1319,7 +1353,7 @@ function planEditor(plan, data, callTool, start) {
         r,
         "Copy mode",
         [
-          ["ride_recommends", "Rider recommended"],
+          ["ride_recommends", "Automatic proportional copying"],
           ["fixed", "Fixed margin"],
           ["proportional", "Proportional"],
         ],
@@ -1359,6 +1393,8 @@ function planEditor(plan, data, callTool, start) {
     fixedHint.setAttribute("aria-live", "polite");
     fixed.setAttribute("aria-describedby", fixedHint.id);
     fixed.parentElement.append(fixedHint);
+    const copyHelp = el("p", "", "muted");
+    r.append(copyHelp);
     const editor = {
       r,
       trader,
@@ -1368,6 +1404,7 @@ function planEditor(plan, data, callTool, start) {
       mode,
       fixed,
       fixedHint,
+      copyHelp,
       multiplier,
       policy,
       emergency,
