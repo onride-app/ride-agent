@@ -32,14 +32,19 @@ async function pausedFixture(transportOnly: boolean) {
     query_timeout: 5000,
   });
   const repo = new PgRepository(database!, {
-    statementTimeoutMs: transportOnly ? 800 : 1500,
-    queryTimeoutMs: transportOnly ? 1500 : 4500,
+    statementTimeoutMs: transportOnly ? 1000 : 5000,
+    queryTimeoutMs: transportOnly ? 4000 : 8000,
   });
   await admin.query(
     "CREATE TABLE IF NOT EXISTS ride_agent_state (user_id TEXT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
   );
   const user = `paused_${randomUUID()}`;
-  const state = { ...emptyState(), fixture_padding: "x".repeat(5_551_010) };
+  // Linux Docker TCP forwarding can buffer the reported 5.55 MB entirely.
+  // Exceed those buffers so the test must reach real server ClientWrite.
+  const state = {
+    ...emptyState(),
+    fixture_padding: "x".repeat(24 * 1024 * 1024),
+  };
   await admin.query(
     "INSERT INTO ride_agent_state (user_id,state) VALUES ($1,$2)",
     [user, state],
@@ -113,19 +118,16 @@ async function pausedFixture(transportOnly: boolean) {
       stream?.resume();
     },
     async observedClientWrite() {
-      await until(
-        async () => {
-          if (!pid) return false;
-          const row = (
-            await admin.query(
-              "SELECT state,wait_event FROM pg_stat_activity WHERE pid=$1",
-              [pid],
-            )
-          ).rows[0];
-          return row?.state === "active" && row.wait_event === "ClientWrite";
-        },
-        transportOnly ? 1300 : 1400,
-      );
+      await until(async () => {
+        if (!pid) return false;
+        const row = (
+          await admin.query(
+            "SELECT state,wait_event FROM pg_stat_activity WHERE pid=$1",
+            [pid],
+          )
+        ).rows[0];
+        return row?.state === "active" && row.wait_event === "ClientWrite";
+      }, 3000);
       assert.equal(await hasLock(), true);
     },
     async close() {
@@ -158,7 +160,7 @@ it("sets bounded database and transport deadlines and rejects invalid timeout or
 });
 
 it(
-  "shutdown closes a real paused 5.5MB state read before its driver deadline and releases its row lock without running the callback",
+  "shutdown closes a real paused large state read before its driver deadline and releases its row lock without running the callback",
   { skip: !database },
   async () => {
     const f = await pausedFixture(false);
@@ -278,6 +280,84 @@ it(
     } finally {
       finish();
       await work.catch(() => {});
+      await repo.close();
+      await admin.query("DELETE FROM ride_agent_state WHERE user_id=$1", [
+        user,
+      ]);
+      await admin.end();
+    }
+  },
+);
+
+it(
+  "a checked-out socket failure during a callback rejects the transaction without an unhandled client error or a state write",
+  { skip: !database },
+  async () => {
+    const repo = new PgRepository(database!),
+      admin = new pg.Pool({ connectionString: database, query_timeout: 5000 }),
+      user = `socket_failure_${randomUUID()}`;
+    await repo.migrate();
+    let pid = 0,
+      enter!: () => void,
+      finish!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const connect = repo.pool.connect.bind(repo.pool);
+    (repo.pool as any).connect = async () => {
+      const client = await connect();
+      (repo.pool as any).connect = connect;
+      pid = (client as any).processID;
+      return client;
+    };
+    const work = repo.transact(user, async (state) => {
+      enter();
+      await gate;
+      state.preference_draft = { budget_usdc: "99" };
+    });
+    const outcome = work.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    try {
+      await entered;
+      // Only this disposable test connection in the isolated test database.
+      assert.equal(
+        (
+          await admin.query("SELECT pg_terminate_backend($1) AS terminated", [
+            pid,
+          ])
+        ).rows[0].terminated,
+        true,
+      );
+      await until(
+        async () =>
+          (
+            await admin.query("SELECT 1 FROM pg_stat_activity WHERE pid=$1", [
+              pid,
+            ])
+          ).rowCount === 0,
+      );
+      finish();
+      assert.match(
+        String(await outcome),
+        /terminating connection|connection terminated/i,
+      );
+      assert.equal(
+        (
+          await admin.query("SELECT 1 FROM ride_agent_state WHERE user_id=$1", [
+            user,
+          ])
+        ).rowCount,
+        0,
+      );
+      assert.equal(repo.pool.totalCount, 0);
+    } finally {
+      finish();
+      await outcome;
       await repo.close();
       await admin.query("DELETE FROM ride_agent_state WHERE user_id=$1", [
         user,

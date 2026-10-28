@@ -163,6 +163,13 @@ export class PgRepository implements Repository {
     }
     this.transactions.set(c, "reading");
     let failed = true;
+    let connectionError: Error | undefined;
+    const onError = (error: Error) => {
+      connectionError = error;
+    };
+    // Pool idle listeners are removed at checkout. A socket can also fail
+    // between queries while a callback awaits external evidence.
+    c.on("error", onError);
     try {
       await c.query("BEGIN");
       await c.query("SET LOCAL lock_timeout = '5s'");
@@ -179,6 +186,7 @@ export class PgRepository implements Repository {
       const s = r.rows[0].state as State;
       this.transactions.set(c, "callback");
       const out = await fn(s);
+      if (connectionError) throw connectionError;
       await c.query(
         "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
         [user, s],
@@ -191,7 +199,8 @@ export class PgRepository implements Repository {
       // unbounded ROLLBACK behind it or return that unknown session to the
       // pool. Closing the connection rolls back its uncommitted transaction.
       this.transactions.delete(c);
-      c.release(failed);
+      c.release(failed || !!connectionError);
+      c.removeListener("error", onError);
     }
   }
   async users(): Promise<string[]> {
