@@ -174,7 +174,7 @@ export class AgentRunner {
             (e) => e.status === "completed",
           )) {
             if (p.reconciliation === "complete") {
-              e.unfilled_allocations = structuredClone(e.allocations);
+              e.unfilled_allocations ??= structuredClone(e.allocations);
               e.allocations = {};
             }
           }
@@ -327,7 +327,24 @@ export class AgentRunner {
               continue;
             const trial = structuredClone(p),
               t = trial.sleeves.find((x) => x.copy_id === s.copy_id)!;
-            if (t.copy_mode === "fixed" && t.fixed_last_fill_at != null) {
+            let fixedWindowVerified = false;
+            if (
+              t.copy_mode === "fixed" &&
+              t.fixed_last_fill_at != null &&
+              (source.observed_at < t.fixed_last_fill_at ||
+                (source.observed_at === t.fixed_last_fill_at &&
+                  source.revision !== t.source_revision))
+            )
+              throw new AgentError(
+                "SOURCE_FILL_EVIDENCE_MISSING",
+                "Fixed-copy source evidence is not newer than its verified fill cursor.",
+                true,
+              );
+            if (
+              t.copy_mode === "fixed" &&
+              t.fixed_last_fill_at != null &&
+              source.observed_at > t.fixed_last_fill_at
+            ) {
               if (!adapter.sourceFills)
                 throw new AgentError(
                   "SOURCE_FILL_EVIDENCE_MISSING",
@@ -345,6 +362,7 @@ export class AgentRunner {
                   "Source fills are incomplete; fixed-copy targets remain unchanged.",
                   true,
                 );
+              fixedWindowVerified = true;
               for (const fill of fills.fills.sort(
                 (a, b) => a.at - b.at || a.id.localeCompare(b.id),
               )) {
@@ -404,6 +422,18 @@ export class AgentRunner {
               ]);
               for (const key of trackedKeys) {
                 if (sourceKeys.has(key)) continue;
+                if (
+                  fixedWindowVerified &&
+                  unadmittedSuppressedShadow(p, s, key)
+                ) {
+                  // Initial entry-deviation checks may leave a theoretical
+                  // fixed target which never became an admitted intent. A
+                  // verified flat source can retire that shadow; it is not an
+                  // owned follower close and must not fabricate a receipt.
+                  (t.source_quantities ??= {})[key] = "0";
+                  (t.fixed_targets ??= {})[key] = "0";
+                  continue;
+                }
                 const quantity = t.source_quantities?.[key];
                 if (
                   (quantity != null && !D(quantity).isZero()) ||
@@ -944,6 +974,11 @@ export class AgentRunner {
                 e.status = "superseded";
                 continue;
               }
+              if (e.expires_at <= now()) {
+                e.status = "failed";
+                e.error = "Target expired before submission";
+                continue;
+              }
             }
             // The bridge revalidates source revision, ownership, authority, price
             // deviation, live margin and Core policy immediately before signing.
@@ -1057,6 +1092,30 @@ export class AgentRunner {
       });
     }
   }
+}
+function unadmittedSuppressedShadow(
+  p: Portfolio,
+  s: Sleeve,
+  key: string,
+): boolean {
+  return (
+    s.suppressed.includes(key) &&
+    !Object.hasOwn(s.intents, key) &&
+    !Object.hasOwn(s.lots, key) &&
+    !p.executions.some(
+      (e) =>
+        e.key === key &&
+        (Object.hasOwn(e.allocations, s.copy_id) ||
+          Object.hasOwn(e.unfilled_allocations ?? {}, s.copy_id)),
+    ) &&
+    !(p.receipts ?? []).some(
+      (r) => r.copy_id === s.copy_id && r.fill.key === key,
+    ) &&
+    !(p.decisions ?? []).some(
+      (d) =>
+        d.copy_id === s.copy_id && d.key === key && d.target_quantity != null,
+    )
+  );
 }
 function checkpoint(s: State, p: Portfolio, key: string, at: number): void {
   s.checkpoints.push({

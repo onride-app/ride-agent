@@ -16,6 +16,7 @@ import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
 import { SourceFeed } from "./source-feed.js";
+import { sourceEvidenceReady } from "./source-observations.js";
 import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
 import { readSelectedPlanEvidence } from "./read-evidence.js";
 import {
@@ -1377,6 +1378,11 @@ export class CoreBridge {
       "SELECT fingerprint,payload,response FROM ride_agent_core_outbox WHERE execution_id=$1 AND user_id=$2 AND portfolio_id=$3",
       [e.id, user, p.id],
     );
+    if (!existing.rowCount && e.expires_at <= now())
+      throw new AgentError(
+        "EXECUTION_REJECTED",
+        "Target expired before submission; fresh planning is required.",
+      );
     let payload: any;
     if (existing.rowCount) {
       const row = existing.rows[0];
@@ -1453,15 +1459,47 @@ export class CoreBridge {
             "EXECUTION_REJECTED",
             "Verified leverage rules changed; recalculate the target before increasing exposure.",
           );
+        const source = await this.source(s.trader.id);
+        const currentSource = source.positions?.find(
+          (position) => position.key === intent.key,
+        );
+        // A structural source revision can stay unchanged for hours. Its old
+        // intent timestamp is not the current observation. Re-prove the same
+        // source position instead of refreshing the frozen reference price.
+        const rawQuantity = (
+          intent as typeof intent & {
+            raw_source_quantity?: string;
+          }
+        ).raw_source_quantity;
         if (
-          !fresh(intent.observed_at) ||
-          D(price).minus(intent.price).abs().div(intent.price).gt(".002")
+          !sourceEvidenceReady(source) ||
+          !currentSource ||
+          !fresh(currentSource.observed_at) ||
+          currentSource.source_revision !== intent.source_revision ||
+          source.revision !== intent.source_revision ||
+          currentSource.asset !== intent.asset ||
+          currentSource.market !== intent.market ||
+          D(currentSource.quantity).isZero() ||
+          !Number.isInteger(currentSource.source_leverage) ||
+          currentSource.source_leverage < 1 ||
+          Math.min(
+            currentSource.source_leverage,
+            s.leverage_cap ?? Number.POSITIVE_INFINITY,
+            snap.max_leverages[e.key] ?? 1,
+          ) !== intent.source_leverage ||
+          (s.leverage_mode != null &&
+            currentSource.source_leverage_verified === false) ||
+          (rawQuantity != null && !D(rawQuantity).eq(currentSource.quantity))
         )
+          throw new AgentError(
+            "EXECUTION_REJECTED",
+            "Fresh equivalent source-position evidence is required before increasing exposure.",
+          );
+        if (D(price).minus(intent.price).abs().div(intent.price).gt(".002"))
           throw new AgentError(
             "EXECUTION_REJECTED",
             "Execution price moved beyond the frozen 0.2% limit.",
           );
-        const source = await this.source(s.trader.id);
         if (s.state === "active" && source.revision !== s.source_revision)
           throw new AgentError(
             "EXECUTION_REJECTED",
@@ -1510,6 +1548,11 @@ export class CoreBridge {
         expires_at: e.expires_at,
         policy_revision: identity.policy_revision,
       };
+      if (e.expires_at <= now())
+        throw new AgentError(
+          "EXECUTION_REJECTED",
+          "Target expired during evidence checks; fresh planning is required.",
+        );
       await this.pool.query(
         "INSERT INTO ride_agent_core_outbox(execution_id,user_id,portfolio_id,fingerprint,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
         [e.id, user, p.id, e.fingerprint, payload],
