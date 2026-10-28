@@ -5,6 +5,9 @@ import { now, recommend, type Execution } from "./domain.js";
 import { AgentRunner } from "./runner.js";
 import { AgentService, fromPlan, portfolioView } from "./service.js";
 import { Cursor, MemoryRepository } from "./repository.js";
+import { CoreBridge } from "./core_bridge.js";
+import { D } from "./domain.js";
+import type { SourceFill } from "./adapter.js";
 
 const key = "perps:SOL";
 const preferences = {
@@ -269,6 +272,26 @@ for (const issue of [
     assert.equal(f.adapter.submitCount, 0);
   });
 
+it("does not clear a previously tracked foreign-dex source target merely because its history is outside the current observed scope", async () => {
+  const f = await fixture(),
+    foreignKey = "perps:xyz:OIL";
+  f.fixed.source_quantities![foreignKey] = "3";
+  f.fixed.fixed_targets![foreignKey] = "0.1";
+  const before = structuredClone(f.fixed);
+  // A scoped bridge may return no fills for this no-longer-observed dex.
+  f.adapter.sourceFills = async () => ({ complete: true, fills: [] });
+  const saved = await f.run();
+  assert.equal(saved.last_error?.code, "SOURCE_FILL_EVIDENCE_MISSING");
+  assert.deepEqual(
+    saved.sleeves[2].source_quantities,
+    before.source_quantities,
+  );
+  assert.deepEqual(saved.sleeves[2].fixed_targets, before.fixed_targets);
+  assert.equal(saved.sleeves[2].fixed_last_fill_at, before.fixed_last_fill_at);
+  assert.equal(saved.executions.length, 0);
+  assert.equal(f.adapter.submitCount, 0);
+});
+
 for (const issue of [
   "incomplete fill coverage",
   "stale source",
@@ -342,3 +365,184 @@ it("keeps suppression and the shadow target while the source position still exis
   assert.deepEqual(saved.sleeves[2].suppressed, before.suppressed);
   assert.equal(f.adapter.submitCount, 0);
 });
+
+function eightReductions(asset = key): SourceFill[] {
+  const quantities = [
+    "-80",
+    "-77",
+    "-61",
+    "-60",
+    "-42",
+    "-25",
+    "-20",
+    "-7",
+    "0",
+  ];
+  return quantities.slice(1).map((quantity, index) => ({
+    id: `opaque_${8 - index}`,
+    key: asset,
+    at: now() - 500,
+    start_quantity: quantities[index],
+    quantity: D(quantity).minus(quantities[index]).toString(),
+    price: "100",
+    fee_usdc: "0",
+    realized_usdc: "0",
+  }));
+}
+
+it("ignores eight same-time foreign-dex history fills for a native source without admitting its existing suppressed target or replaying history", async () => {
+  const f = await fixture(),
+    before = structuredClone(f.fixed);
+  const bridge = new CoreBridge(
+      "https://core.test",
+      "fixture",
+      "postgresql://localhost/unused",
+      "s".repeat(32),
+      "mainnet",
+    ),
+    stub = bridge as any;
+  const observation = {
+    observed_at: now(),
+    revision: "still-open-suppressed-native",
+    account_value_usdc: "1000",
+    complete: true,
+    perps_dexes: [""],
+    positions: [
+      {
+        key,
+        asset: "SOL",
+        market: "perps" as const,
+        quantity: "12",
+        price: "100",
+        source_entry_price: "90",
+        source_leverage: 5,
+        observed_at: now(),
+        source_revision: "still-open-suppressed-native",
+      },
+    ],
+  };
+  const originalSource = f.adapter.source.bind(f.adapter);
+  f.adapter.source = async (trader) =>
+    trader.id === f.fixed.trader.id ? observation : originalSource(trader);
+  f.adapter.snap.prices[key] = "100";
+  f.adapter.snap.max_leverages[key] = 8;
+  stub.source = async () => observation;
+  stub.resolve = async () => ({ address: "fixture-source" });
+  stub.info = async (input: any) => {
+    assert.equal(input.type, "userFillsByTime");
+    return eightReductions("perps:xyz:OIL").map((fill, index) => ({
+      coin: "xyz:OIL",
+      time: fill.at,
+      startPosition: fill.start_quantity,
+      sz: fill.quantity,
+      side: "B",
+      tid: index + 1,
+      oid: index + 20,
+      px: fill.price,
+      feeToken: "USDC",
+      fee: "0",
+      closedPnl: "0",
+    }));
+  };
+  f.adapter.sourceFills = async (trader, start, end) => {
+    const result = (await bridge.operation("source_fills", {
+      trader_id: trader.id,
+      market: "perps",
+      start_at: start,
+      end_at: end,
+    })) as { complete: boolean; fills: SourceFill[] };
+    assert.equal(result.complete, true);
+    assert.equal(result.fills.length, 0);
+    return result;
+  };
+  try {
+    const saved = await f.run();
+    assert.equal(saved.state, "active");
+    assert.equal(saved.last_error, undefined);
+    assert.equal(saved.executions.length, 0);
+    assert.equal(saved.receipts?.length ?? 0, 0);
+    assert.equal(f.adapter.submitCount, 0);
+    assert.deepEqual(saved.sleeves[2].fixed_targets, before.fixed_targets);
+    assert.deepEqual(
+      saved.sleeves[2].source_quantities,
+      before.source_quantities,
+    );
+    assert.deepEqual(saved.sleeves[2].suppressed, before.suppressed);
+    assert.deepEqual(
+      saved.sleeves[2].fixed_seen_fills,
+      before.fixed_seen_fills,
+    );
+    assert.equal(saved.sleeves[2].fixed_last_fill_at, observation.observed_at);
+  } finally {
+    await bridge.close();
+  }
+});
+
+it("accepts a unique eight-fill same-time closing chain within the supported scope without manufacturing follower fills", async () => {
+  const f = await fixture();
+  f.fixed.source_quantities![key] = "-80";
+  f.fixed.fixed_targets![key] = "-0.25";
+  f.adapter.sourceFills = async () => ({
+    complete: true,
+    fills: eightReductions(),
+  });
+  const saved = await f.run();
+  assert.equal(saved.state, "active");
+  assert.equal(saved.last_error, undefined);
+  assert.equal(saved.sleeves[2].source_quantities![key], "0");
+  assert.equal(saved.sleeves[2].fixed_targets![key], "0");
+  assert.equal(saved.sleeves[2].fixed_seen_fills?.length, 9);
+  assert.ok(saved.sleeves[2].fixed_last_fill_at! > f.fixed.fixed_last_fill_at!);
+  assert.equal(saved.executions.length, 0);
+  assert.equal(saved.receipts?.length ?? 0, 0);
+  assert.equal(f.adapter.submitCount, 0);
+});
+
+for (const issue of [
+  "incomplete",
+  "missing link",
+  "wrong start",
+  "ambiguous",
+  "wrong snapshot",
+  "malformed identity",
+])
+  it(`does not commit any fixed cursor or target from an eight-fill window that is ${issue}`, async () => {
+    const f = await fixture();
+    f.fixed.source_quantities![key] = "-80";
+    f.fixed.fixed_targets![key] = "-0.25";
+    const before = structuredClone(f.fixed),
+      fills = eightReductions();
+    if (issue === "missing link") fills.splice(3, 1);
+    if (issue === "wrong start") fills[0].start_quantity = "-100";
+    if (issue === "ambiguous")
+      fills.push({
+        ...fills[7],
+        id: "branch",
+        start_quantity: "-1",
+        quantity: "1",
+      });
+    if (issue === "wrong snapshot") fills[7].quantity = "6";
+    if (issue === "malformed identity") fills[0].key = "perps:xyz::OIL";
+    f.adapter.sourceFills = async () => ({
+      complete: issue !== "incomplete",
+      fills,
+    });
+    const saved = await f.run();
+    assert.equal(saved.state, "attention");
+    assert.equal(saved.last_error?.code, "SOURCE_FILL_EVIDENCE_MISSING");
+    assert.equal(
+      saved.sleeves[2].fixed_last_fill_at,
+      before.fixed_last_fill_at,
+    );
+    assert.deepEqual(saved.sleeves[2].fixed_targets, before.fixed_targets);
+    assert.deepEqual(
+      saved.sleeves[2].source_quantities,
+      before.source_quantities,
+    );
+    assert.deepEqual(
+      saved.sleeves[2].fixed_seen_fills,
+      before.fixed_seen_fills,
+    );
+    assert.equal(saved.executions.length, 0);
+    assert.equal(f.adapter.submitCount, 0);
+  });

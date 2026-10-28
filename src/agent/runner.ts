@@ -25,6 +25,7 @@ import type { State } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
 import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
+import { orderedSourceFills } from "./source-fill-evidence.js";
 import {
   recordPerformance,
   recordReceipt,
@@ -363,17 +364,15 @@ export class AgentRunner {
                   true,
                 );
               fixedWindowVerified = true;
-              for (const fill of fills.fills.sort(
-                (a, b) => a.at - b.at || a.id.localeCompare(b.id),
+              for (const fill of orderedSourceFills(
+                fills.fills,
+                source,
+                t.fixed_last_fill_at,
+                source.observed_at,
+                t.source_quantities ?? {},
+                t.fixed_seen_fills ?? [],
               )) {
-                if ((t.fixed_seen_fills ?? []).includes(fill.id)) continue;
-                if (fill.start_quantity == null)
-                  throw new AgentError(
-                    "SOURCE_FILL_EVIDENCE_MISSING",
-                    "A fixed-copy fill lacks its pre-trade source position.",
-                    true,
-                  );
-                const previousSource = D(fill.start_quantity),
+                const previousSource = D(fill.start_quantity!),
                   currentSource = previousSource.plus(fill.quantity),
                   previousTarget = D(t.fixed_targets?.[fill.key] ?? 0);
                 const position = source.positions.find(

@@ -271,6 +271,14 @@ it("uses mainnet source fills even for testnet followers and strips upstream ide
     address = "0x" + "a".repeat(40);
   let sourceNetwork = false;
   stub.resolve = async () => ({ address });
+  stub.source = async () => ({
+    observed_at: now(),
+    revision: "fixture",
+    account_value_usdc: "0",
+    positions: [],
+    complete: true,
+    perps_dexes: [""],
+  });
   stub.info = async (_payload: any, source: boolean) => {
     sourceNetwork = source;
     return [
@@ -279,6 +287,7 @@ it("uses mainnet source fills even for testnet followers and strips upstream ide
         oid: 2,
         time: at,
         coin: "BTC",
+        startPosition: "0",
         sz: "1",
         side: "B",
         px: "100",
