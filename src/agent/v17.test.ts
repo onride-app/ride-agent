@@ -265,7 +265,9 @@ it("new pause policy keeps reductions at 30% and exits at 70%; legacy still exit
     }
   }
 });
-it("Fixed copying adds margin for each verified entry and reduces proportionally; incomplete fills cannot add exposure", async () => {
+it("Fixed copying adds margin for each verified entry and reduces proportionally; incomplete fills cannot add exposure", async (context) => {
+  let clock = Date.now();
+  context.mock.method(Date, "now", () => clock);
   const { api, repo, adapter } = env();
   const c = adapter.pool[0];
   const p = fromPlan(
@@ -316,6 +318,8 @@ it("Fixed copying adds margin for each verified entry and reduces proportionally
       at: lastAt + i,
     })),
   });
+  // The new snapshot must follow the synthetic fills at lastAt + 1/+2.
+  clock += 1000;
   await new AgentRunner(api).tick("alice");
   await repo.transact("alice", async (state) =>
     assert.equal(
@@ -324,6 +328,7 @@ it("Fixed copying adds margin for each verified entry and reduces proportionally
     ),
   );
   adapter.sourceFills = async () => ({ complete: false, fills: [] });
+  clock += 1000;
   await new AgentRunner(api).tick("alice");
   await repo.transact("alice", async (state) =>
     assert.equal(

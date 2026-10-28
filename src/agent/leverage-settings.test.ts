@@ -288,7 +288,19 @@ it("carries 40x through the mock Core boundary and rejects a changed venue limit
     submissions = 0;
   snap.max_leverages["perps:BTC"] = 40;
   stub.perpsAccount = async () => snap;
-  stub.source = async () => ({ revision: "source_v1" });
+  stub.source = async () => ({
+    revision: "source_v1",
+    observed_at: now(),
+    account_value_usdc: "1000",
+    complete: true,
+    positions: [
+      {
+        ...p.sleeves[0].intents["perps:BTC"],
+        quantity: "5",
+        observed_at: now(),
+      },
+    ],
+  });
   stub.control = async (op: string, payload: any) => {
     if (op === "perps_policy") policies.push(payload);
   };

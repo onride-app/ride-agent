@@ -332,7 +332,15 @@ for (const [price, expected] of [
       }
       return { policy_revision: 1 };
     };
-    stub.source = async () => ({ revision: "source_v1" });
+    stub.source = async () => ({
+      revision: "source_v1",
+      observed_at: now(),
+      account_value_usdc: "1000",
+      complete: true,
+      positions: [
+        { ...p.sleeves[0].intents[key], quantity: "5", observed_at: now() },
+      ],
+    });
     const p = fromPlan(recommend(preferences, [candidate(1)]));
     p.account_id = snap.account_id;
     p.sleeves[0].source_revision = "source_v1";
