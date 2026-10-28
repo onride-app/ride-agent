@@ -106,11 +106,34 @@ export interface Repository {
 }
 export class PgRepository implements Repository {
   readonly pool: pg.Pool;
-  constructor(url: string) {
+  private readonly transactions = new Map<
+    pg.PoolClient,
+    "reading" | "callback"
+  >();
+  private closing?: Promise<void>;
+  constructor(
+    url: string,
+    timeouts: { statementTimeoutMs?: number; queryTimeoutMs?: number } = {},
+  ) {
+    const statementTimeoutMs = timeouts.statementTimeoutMs ?? 20_000;
+    const queryTimeoutMs = timeouts.queryTimeoutMs ?? 25_000;
+    if (
+      !Number.isSafeInteger(statementTimeoutMs) ||
+      statementTimeoutMs <= 0 ||
+      !Number.isSafeInteger(queryTimeoutMs) ||
+      queryTimeoutMs <= statementTimeoutMs
+    )
+      throw new RangeError(
+        "Repository query deadlines must be positive and the transport deadline must follow the database deadline.",
+      );
     this.pool = new pg.Pool({
       connectionString: url,
       max: 10,
       connectionTimeoutMillis: 5000,
+      // Bound ordinary SQL execution. PostgreSQL may defer cancellation while
+      // flushing ClientWrite; driver timeout and shutdown must close sockets.
+      statement_timeout: statementTimeoutMs,
+      query_timeout: queryTimeoutMs,
     });
   }
   async migrate(): Promise<void> {
@@ -132,7 +155,14 @@ export class PgRepository implements Repository {
     user: string,
     fn: (state: State) => Promise<T>,
   ): Promise<T> {
+    if (this.closing) throw new Error("Repository is closing");
     const c = await this.pool.connect();
+    if (this.closing) {
+      c.release(true);
+      throw new Error("Repository is closing");
+    }
+    this.transactions.set(c, "reading");
+    let failed = true;
     try {
       await c.query("BEGIN");
       await c.query("SET LOCAL lock_timeout = '5s'");
@@ -145,19 +175,23 @@ export class PgRepository implements Repository {
         "SELECT state FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
         [user],
       );
+      if (this.closing) throw new Error("Repository is closing");
       const s = r.rows[0].state as State;
+      this.transactions.set(c, "callback");
       const out = await fn(s);
       await c.query(
         "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
         [user, s],
       );
       await c.query("COMMIT");
+      failed = false;
       return out;
-    } catch (e) {
-      await c.query("ROLLBACK");
-      throw e;
     } finally {
-      c.release();
+      // A timed-out query may still be reading on the wire. Never queue an
+      // unbounded ROLLBACK behind it or return that unknown session to the
+      // pool. Closing the connection rolls back its uncommitted transaction.
+      this.transactions.delete(c);
+      c.release(failed);
     }
   }
   async users(): Promise<string[]> {
@@ -167,8 +201,20 @@ export class PgRepository implements Repository {
       )
     ).rows.map((x) => x.user_id);
   }
-  async close(): Promise<void> {
-    await this.pool.end();
+  close(): Promise<void> {
+    if (!this.closing) {
+      // Start on SIGTERM, before waiting for a runner blocked on a state read.
+      // Destroying an active query socket releases its database row locks;
+      // new transactions are forbidden. Already-entered callbacks may have
+      // external effects and must finish through the existing durable path.
+      this.closing = Promise.all([
+        this.pool.end(),
+        ...[...this.transactions]
+          .filter(([_, phase]) => phase === "reading")
+          .map(([client]) => client.end()),
+      ]).then(() => undefined);
+    }
+    return this.closing;
   }
 }
 // Test-only adapter; production startup requires PostgreSQL.

@@ -1074,12 +1074,15 @@ export class AgentRunner {
   async run(signal: AbortSignal, intervalMs = 5000): Promise<void> {
     while (!signal.aborted) {
       for (const user of await this.service.repository.users()) {
+        if (signal.aborted) break;
         try {
           await this.tick(user);
         } catch {
-          console.error("Rider monitoring cycle failed; retained for retry.");
+          if (!signal.aborted)
+            console.error("Rider monitoring cycle failed; retained for retry.");
         }
       }
+      if (signal.aborted) break;
       await new Promise<void>((resolve) => {
         const done = () => {
           clearTimeout(timer);
