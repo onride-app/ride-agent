@@ -14,6 +14,8 @@ export interface SourceSnapshot {
   account_value_usdc: string;
   positions: PositionIntent[];
   complete: boolean;
+  // Actual Perps clearinghouse scopes observed by this snapshot; "" is native.
+  perps_dexes?: string[];
 }
 export interface ActivationCheck {
   eligible: boolean;

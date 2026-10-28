@@ -17,6 +17,10 @@ import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
 import { SourceFeed } from "./source-feed.js";
 import { sourceEvidenceReady } from "./source-observations.js";
+import {
+  inObservedPerpsScope,
+  scopedSourceFills,
+} from "./source-fill-evidence.js";
 import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
 import { readSelectedPlanEvidence } from "./read-evidence.js";
 import {
@@ -252,6 +256,7 @@ export class CoreBridge {
         { type: "clearinghouseState", user: row.address },
         true,
       );
+    const perpsDexes = [""];
     if (
       process.env.RIDE_AGENT_RWA_ENABLED === "true" &&
       row.tags?.includes("category:stocks_rwa")
@@ -304,6 +309,7 @@ export class CoreBridge {
               "Source RWA scope is incomplete.",
               true,
             );
+          perpsDexes.push(observation.dex);
           state.marginSummary.accountValue = D(state.marginSummary.accountValue)
             .plus(observation.state.marginSummary.accountValue)
             .toString();
@@ -331,31 +337,34 @@ export class CoreBridge {
         true,
       );
     const at = now();
-    const positions: PositionIntent[] = state.assetPositions
+    const activePositions = state.assetPositions
       .map((item: any) => item.position)
-      .filter(
-        (x: any) =>
-          x &&
-          x.coin &&
-          (process.env.RIDE_AGENT_RWA_ENABLED === "true" ||
-            !x.coin.includes(":")) &&
-          !D(x.szi).isZero(),
+      .filter((x: any) => x && !D(x.szi).isZero());
+    if (
+      activePositions.some(
+        (x: any) => !inObservedPerpsScope(x.coin, perpsDexes),
       )
-      .map((x: any) => ({
-        key: `perps:${x.coin}`,
-        asset: x.coin,
-        market: "perps",
-        quantity: String(x.szi),
-        price: D(x.positionValue).abs().div(D(x.szi).abs()).toString(),
-        source_entry_price: x.entryPx ?? null,
-        source_leverage: Number(x.leverage?.value ?? 1),
-        source_leverage_verified:
-          x.leverage?.value != null &&
-          Number.isFinite(Number(x.leverage.value)) &&
-          Number(x.leverage.value) >= 1,
-        observed_at: at,
-        source_revision: "",
-      }));
+    )
+      throw new AgentError(
+        "SOURCE_STALE",
+        "Source positions exceed the observed Perps scopes.",
+        true,
+      );
+    const positions: PositionIntent[] = activePositions.map((x: any) => ({
+      key: `perps:${x.coin}`,
+      asset: x.coin,
+      market: "perps",
+      quantity: String(x.szi),
+      price: D(x.positionValue).abs().div(D(x.szi).abs()).toString(),
+      source_entry_price: x.entryPx ?? null,
+      source_leverage: Number(x.leverage?.value ?? 1),
+      source_leverage_verified:
+        x.leverage?.value != null &&
+        Number.isFinite(Number(x.leverage.value)) &&
+        Number(x.leverage.value) >= 1,
+      observed_at: at,
+      source_revision: "",
+    }));
     const revision = fingerprint(
       positions.map((p) => [
         p.key,
@@ -370,9 +379,8 @@ export class CoreBridge {
       revision,
       account_value_usdc: String(state.marginSummary.accountValue),
       positions,
-      complete:
-        process.env.RIDE_AGENT_RWA_ENABLED === "true" ||
-        !state.assetPositions.some((x: any) => x.position?.coin?.includes(":")),
+      perps_dexes: perpsDexes,
+      complete: true,
     };
   }
   private async profileCandles(asset: string): Promise<any[]> {
@@ -792,11 +800,22 @@ export class CoreBridge {
       );
       if (!Array.isArray(rows))
         return { events: [...result.values()], complete: false };
-      for (const row of rows)
-        result.set(
-          `${row.tid ?? row.hash ?? fingerprint(row)}:${row.time}`,
-          row,
-        );
+      for (const row of rows) {
+        const identity = `${row?.tid ?? row?.hash ?? fingerprint(row)}:${row?.time}`;
+        const previous = result.get(identity);
+        if (
+          source &&
+          type === "userFillsByTime" &&
+          previous &&
+          fingerprint(previous) !== fingerprint(row)
+        )
+          throw new AgentError(
+            "SOURCE_FILL_EVIDENCE_MISSING",
+            "Source fill identity has conflicting history.",
+            true,
+          );
+        result.set(identity, row);
+      }
       if (rows.length < 500)
         return { events: [...result.values()], complete: true };
       const next = Math.max(...rows.map((r: any) => r.time));
@@ -1804,6 +1823,13 @@ export class CoreBridge {
               "Authenticated prediction source fill history is unavailable.",
           };
         const row = await this.resolve(input.trader_id);
+        const source = await this.source(input.trader_id);
+        if (!sourceEvidenceReady(source) || !Array.isArray(source.perps_dexes))
+          throw new AgentError(
+            "SOURCE_FILL_EVIDENCE_MISSING",
+            "Observed Perps source scopes are unavailable.",
+            true,
+          );
         const history = await this.paged(
           "userFillsByTime",
           row.address,
@@ -1811,24 +1837,15 @@ export class CoreBridge {
           input.end_at,
           true,
         );
-        const valid = history.events.filter(
-          (f) => f.time >= input.start_at && f.time < input.end_at,
-        );
         return {
           complete: history.complete,
-          fills: valid.map((f) => ({
-            id: `source_${fingerprint([input.trader_id, f.tid, f.oid]).slice(0, 32)}`,
-            key: `perps:${f.coin}`,
-            start_quantity:
-              f.startPosition == null ? undefined : String(f.startPosition),
-            quantity: D(f.sz)
-              .times(f.side === "B" ? 1 : -1)
-              .toString(),
-            price: String(f.px),
-            fee_usdc: f.feeToken === "USDC" ? String(f.fee) : null,
-            realized_usdc: f.closedPnl == null ? null : String(f.closedPnl),
-            at: f.time,
-          })),
+          fills: scopedSourceFills(
+            history.events,
+            input.trader_id,
+            source.perps_dexes,
+            input.start_at,
+            input.end_at,
+          ),
         };
       }
       case "notification_status": {
