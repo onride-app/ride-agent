@@ -134,7 +134,9 @@ export class CoreBridge {
         },
         body: JSON.stringify(input),
         signal: AbortSignal.timeout(
-          operation.startsWith("perps_funding_") ? 90000 : 20000,
+          this.venueReads.accountReadTimeout(
+            operation.startsWith("perps_funding_") ? 90000 : 20000,
+          ),
         ),
         redirect: "error",
       },
@@ -869,6 +871,15 @@ export class CoreBridge {
     user: string,
     p: Portfolio | null,
     bind = false,
+  ): Promise<AccountSnapshot> {
+    return this.venueReads.observeAccount(() =>
+      this.readPerpsAccount(user, p, bind),
+    );
+  }
+  private async readPerpsAccount(
+    user: string,
+    p: Portfolio | null,
+    bind: boolean,
   ): Promise<AccountSnapshot> {
     let identity: any, accountId: string;
     const binding =

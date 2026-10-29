@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { it } from "node:test";
+import { it, type TestContext } from "node:test";
 import { VenueReads } from "./venue-reads.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 import { readCost, responseCost } from "./venue-read-cost.js";
@@ -137,6 +137,268 @@ it("retry advice includes a response-contract quarantine even when capacity is f
     .catch((e) => e);
   controller.abort();
   assert.equal((await denied).details.retry_after_ms, 60000);
+});
+
+it("gives healthy unknown-surcharge wire work time after queueing within the original 20-second account boundary", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    limit: 100,
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const ticket = await budget.acquire(
+    "account",
+    100,
+    "earlier",
+    new AbortController().signal,
+  );
+  ticket.sent();
+  ticket.settle(100);
+  ticket.release();
+  let fetches = 0;
+  const reads = new VenueReads(
+    (async () => {
+      fetches++;
+      return new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("[]")), 5),
+      );
+    }) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers },
+  );
+  await time.advance(48001);
+  const work = reads.observeAccount(() =>
+    reads.read("https://venue.test/info", { type: "userFunding", user: "a" }),
+  );
+  await time.advance(12004);
+  assert.deepEqual(await work, []);
+  assert.equal(fetches, 1);
+  assert.equal(reads.diagnostics().counts.unknown_uncertain, 0);
+  assert.equal(budget.snapshot().quarantine_ms, 0);
+});
+
+it("ends queued account work at 20 seconds without dispatch or an unknown charge", async () => {
+  const f = setup();
+  const ticket = await f.budget.acquire(
+    "account",
+    1000,
+    "earlier",
+    new AbortController().signal,
+  );
+  ticket.sent();
+  ticket.settle(1000);
+  ticket.release();
+  await f.time.advance(40000);
+  const work = f.reads
+    .observeAccount(() =>
+      f.reads.read("https://venue.test/info", {
+        type: "userFunding",
+        user: "a",
+      }),
+    )
+    .catch((e) => e);
+  await f.time.advance(20000);
+  assert.ok(
+    ["VENUE_READ_DEADLINE", "VENUE_READ_BUDGET_EXHAUSTED"].includes(
+      (await work).code,
+    ),
+  );
+  assert.equal(f.attempts.length, 0);
+  assert.equal(f.budget.snapshot().quarantine_ms, 0);
+  assert.equal(f.budget.snapshot().account_queued, 0);
+});
+
+it("caps queue plus wire at 20 seconds while a real unknown wire timeout still quarantines", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const ticket = await budget.acquire(
+    "account",
+    1000,
+    "earlier",
+    new AbortController().signal,
+  );
+  ticket.sent();
+  ticket.settle(1000);
+  ticket.release();
+  let sentAt = -1;
+  await time.advance(50000);
+  const reads = new VenueReads(
+    (async () => {
+      sentAt = time.at;
+      return new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("[]")), 11000),
+      );
+    }) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers },
+  );
+  const work = reads
+    .observeAccount(() =>
+      reads.read("https://venue.test/info", { type: "userFunding", user: "a" }),
+    )
+    .catch((e) => e);
+  await time.advance(20000);
+  assert.equal((await work).code, "VENUE_READ_DEADLINE");
+  assert.equal(sentAt, 60000);
+  assert.equal(budget.snapshot().quarantine_ms, 60000);
+  assert.equal(reads.diagnostics().counts.unknown_uncertain, 1);
+  await time.advance(2000);
+  assert.equal(
+    budget.snapshot().used,
+    1000,
+    "late healthy JSON cannot refund a genuine expired observation",
+  );
+});
+
+it("retains the 12-second wire limit for an already-sent unknown response inside a 20-second frame", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const reads = new VenueReads(
+    (async () => new Promise<Response>(() => {})) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers },
+  );
+  const work = reads
+    .observeAccount(() =>
+      reads.read("https://venue.test/info", { type: "userFunding", user: "a" }),
+    )
+    .catch((e) => e);
+  await time.advance(12000);
+  assert.equal((await work).code, "VENUE_READ_DEADLINE");
+  assert.equal(budget.snapshot().quarantine_ms, 60000);
+  assert.equal(reads.diagnostics().counts.unknown_uncertain, 1);
+  assert.equal(budget.snapshot().used, 1000);
+});
+
+it("cancels queued siblings after failure but lets an already-sent unknown response settle", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const types: string[] = [];
+  const reads = new VenueReads(
+    (async (_url, init) => {
+      const payload = JSON.parse(String(init?.body));
+      types.push(payload.type);
+      return new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("[]")), 5),
+      );
+    }) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers },
+  );
+  const cause = new Error("sibling failed");
+  const work = reads
+    .observeAccount(() =>
+      Promise.all([
+        reads.read("https://venue.test/info", {
+          type: "userFunding",
+          user: "a",
+        }),
+        reads.read("https://venue.test/info", { type: "meta" }),
+        new Promise<never>((_, reject) =>
+          time.timers.setTimeout(() => reject(cause), 1),
+        ),
+      ]),
+    )
+    .catch((e) => e);
+  await time.advance(10);
+  assert.equal(await work, cause);
+  assert.deepEqual(types, ["userFunding"]);
+  assert.equal(budget.snapshot().account_queued, 0);
+  assert.equal(budget.snapshot().used, 20);
+  assert.equal(budget.snapshot().quarantine_ms, 0);
+  assert.equal(reads.diagnostics().counts.unknown_uncertain, 0);
+});
+
+it("scope cancellation cannot cancel another caller queued for the same uncached read", async () => {
+  const f = setup(100);
+  const ticket = await f.budget.acquire(
+    "account",
+    100,
+    "earlier",
+    new AbortController().signal,
+  );
+  ticket.sent();
+  ticket.settle(100);
+  ticket.release();
+  await f.time.advance(59990);
+  const cause = new Error("first scope failed");
+  const first = f.reads
+    .observeAccount(() =>
+      Promise.all([
+        f.reads.read("https://venue.test/info", { type: "meta" }),
+        new Promise<never>((_, reject) =>
+          f.time.timers.setTimeout(() => reject(cause), 1),
+        ),
+      ]),
+    )
+    .catch((e) => e);
+  const second = f.reads.observeAccount(() =>
+    f.reads.read("https://venue.test/info", { type: "meta" }),
+  );
+  await f.time.advance(20);
+  assert.equal(await first, cause);
+  assert.deepEqual(await second, {});
+  assert.equal(f.attempts.length, 1);
+  assert.equal(f.budget.snapshot().used, 20);
+});
+
+it("an unknown hold cannot switch the owning turn before its small actual cost is refunded", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const first = await budget.acquire(
+    "account",
+    20,
+    "a",
+    new AbortController().signal,
+    true,
+  );
+  first.sent();
+  const order: string[] = [];
+  const b = budget
+    .acquire("account", 20, "b", new AbortController().signal)
+    .then((t) => {
+      order.push("b");
+      return t;
+    });
+  const a = budget
+    .acquire("account", 20, "a", new AbortController().signal)
+    .then((t) => {
+      order.push("a");
+      return t;
+    });
+  first.settle(20);
+  first.release();
+  const at = await a;
+  at.sent();
+  at.settle(20);
+  at.release();
+  await time.advance(3);
+  const bt = await b;
+  bt.sent();
+  bt.settle(20);
+  bt.release();
+  assert.deepEqual(order, ["a", "b"]);
+  assert.equal(budget.snapshot().used, 60);
+  await time.advance(60001);
+  assert.equal(budget.snapshot().used, 0);
+  assert.equal(budget.snapshot().account_active, 0);
+  assert.equal(budget.snapshot().account_queued, 0);
 });
 
 it("reserves complete documented response costs before fetch and refunds only unused surcharge", async () => {
@@ -473,7 +735,7 @@ it("unknown or malformed methods never fetch and telemetry contains no payload, 
   assert.equal(f.attempts.length, 2);
 });
 
-it("three high-DEX actual account pipelines and six sources recover complete observations across rolling windows", async (context) => {
+async function highDexObservationLoad(context: TestContext, wireMs: number) {
   const time = new FakeTime(),
     base = 1793200000000;
   context.mock.method(Date, "now", () => base + time.at);
@@ -560,7 +822,7 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
     return new Promise<Response>((resolve) =>
       time.timers.setTimeout(
         () => resolve(new Response(JSON.stringify(data))),
-        1,
+        wireMs,
       ),
     );
   }) as typeof fetch;
@@ -616,7 +878,9 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
         executions: [],
         ledger_started_at: base - 1000,
       } as any;
-    while (time.at < 130000) {
+    if (wireMs === 500) await sleep(i * 50000);
+    while (time.at < (wireMs === 500 ? 190000 : 130000)) {
+      let retryDelay = wireMs === 500 ? 150000 : 5000;
       const round = (rounds.get(user) ?? 0) + 1;
       rounds.set(user, round);
       const started = time.at;
@@ -662,6 +926,8 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
         }
         completed[i]++;
       } catch (error: any) {
+        if (wireMs === 500)
+          retryDelay = Math.max(5000, error.details?.retry_after_ms ?? 5000);
         assert.ok(
           ["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_READ_DEADLINE"].includes(
             error.code,
@@ -670,11 +936,13 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
         );
         denied[i]++;
       }
-      await sleep(5000);
+      // Realistic wire latency uses bounded offered load, not three ~16s
+      // frames every 5s from the one-slot account lane.
+      await sleep(retryDelay);
     }
   });
   const sourceLoop = (async () => {
-    while (time.at < 130000) {
+    while (time.at < (wireMs === 500 ? 190000 : 130000)) {
       await Promise.all(
         Array.from({ length: 6 }, (_, i) =>
           bridge.source(`source${i}`).then(
@@ -689,7 +957,7 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
     }
   })();
   try {
-    await time.advance(160000);
+    await time.advance(wireMs === 500 ? 350000 : 160000);
     await Promise.all([...accountLoops, sourceLoop]);
     assert.ok(
       completed.every((x) => x > 0),
@@ -721,7 +989,11 @@ it("three high-DEX actual account pipelines and six sources recover complete obs
   } finally {
     await bridge.close();
   }
-});
+}
+
+for (const wireMs of [1, 500])
+  it(`three high-DEX actual account pipelines and six sources recover complete observations at ${wireMs}ms wire latency${wireMs === 500 ? " with bounded offered load" : " under high load"}`, (context) =>
+    highDexObservationLoad(context, wireMs));
 
 it("shared metadata floods do not starve private owners and expired turns wake without new requests", async () => {
   const f = setup();
@@ -794,7 +1066,7 @@ it("shared metadata floods do not starve private owners and expired turns wake w
     smallDone = true;
     return t;
   });
-  await time.advance(2001);
+  await time.advance(10001);
   assert.equal(
     smallDone,
     true,
@@ -879,7 +1151,7 @@ it("a late owner does not inherit a large unknown reservation that is refunded t
       order.push("a");
       return t;
     });
-  await time.advance(12001);
+  await time.advance(20001);
   second.settle(20);
   second.release();
   await time.advance(5);

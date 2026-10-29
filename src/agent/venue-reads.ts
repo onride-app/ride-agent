@@ -1,4 +1,5 @@
 import { AgentError } from "./contracts.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import {
   sharedVenueReadBudget,
@@ -10,6 +11,11 @@ import {
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; value: unknown };
+type AccountReadScope = {
+  id: number;
+  until: number;
+  admission: AbortController;
+};
 type Counters = {
   calls: number;
   cache_hit: number;
@@ -69,6 +75,8 @@ export class VenueReads {
   private counts = counters();
   private byMethod = new Map<string, Counters>();
   private lastReport: number;
+  private readonly accountScope = new AsyncLocalStorage<AccountReadScope>();
+  private accountSequence = 0;
   constructor(
     private readonly fetcher: typeof fetch = (...args) => fetch(...args),
     private readonly clock = Date.now,
@@ -146,6 +154,52 @@ export class VenueReads {
       throw this.unavailable();
     }
   }
+  async observeAccount<T>(work: () => Promise<T>): Promise<T> {
+    if (this.accountScope.getStore()) return work();
+    const scope = {
+      id: ++this.accountSequence,
+      until: this.clock() + 20000,
+      admission: new AbortController(),
+    };
+    const timer = this.timers.setTimeout(
+      () => scope.admission.abort(this.accountDeadline()),
+      20000,
+    );
+    return this.accountScope.run(scope, async () => {
+      let abort!: () => void;
+      const cancelled = new Promise<never>((_, reject) => {
+        abort = () => reject(scope.admission.signal.reason);
+        scope.admission.signal.addEventListener("abort", abort, { once: true });
+      });
+      try {
+        const value = await Promise.race([work(), cancelled]);
+        this.accountReadTimeout();
+        return value;
+      } catch (error) {
+        scope.admission.abort(error);
+        throw error;
+      } finally {
+        this.timers.clearTimeout(timer);
+        scope.admission.signal.removeEventListener("abort", abort);
+      }
+    });
+  }
+  private accountDeadline() {
+    return new AgentError(
+      "VENUE_READ_DEADLINE",
+      "Complete account observation deadline expired.",
+      true,
+      503,
+    );
+  }
+  accountReadTimeout(maximum = 20000): number {
+    const scope = this.accountScope.getStore();
+    if (!scope) return maximum;
+    if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
+    const left = Math.ceil(scope.until - this.clock());
+    if (left <= 0) throw this.accountDeadline();
+    return Math.min(maximum, left);
+  }
   async read(
     url: string,
     payload: unknown,
@@ -157,9 +211,12 @@ export class VenueReads {
       const cost = readCost(payload);
       method = cost.method;
       this.count(method, lane, "calls");
+      this.accountReadTimeout();
       this.checkCooldown(method, lane);
       const key = JSON.stringify([url, payload]),
-        flightKey = `${lane}:${key}`;
+        // A failed observation may cancel only its own queued work, never a
+        // different caller that joined the same account request.
+        flightKey = `${lane}:${this.accountScope.getStore()?.id ?? "shared"}:${key}`;
       const cached = this.cache.get(key);
       if (
         ttlMs > 0 &&
@@ -183,7 +240,9 @@ export class VenueReads {
                 503,
               ),
             ),
-          this.deadlineMs,
+          this.accountReadTimeout(
+            this.accountScope.getStore() ? 20000 : this.deadlineMs,
+          ),
         );
         flight = this.perform(url, payload, lane, cost, controller.signal)
           .then((value) => {
@@ -244,18 +303,42 @@ export class VenueReads {
     let ticket: ReadTicket | undefined,
       sent = false,
       settled = false;
+    let wireTimer: unknown;
+    let wireSignal = signal;
     const user = (payload as { user?: unknown })?.user;
     const owner = typeof user === "string" && user.length ? user : undefined;
+    const scope = this.accountScope.getStore();
+    const admissionSignal = scope
+      ? AbortSignal.any([signal, scope.admission.signal])
+      : signal;
     try {
       ticket = await this.budget.acquire(
         lane,
         cost.reserve,
         owner,
-        signal,
+        admissionSignal,
         cost.unknownSurcharge,
       );
       this.checkCooldown(cost.method, lane, false);
+      if (admissionSignal.aborted) throw admissionSignal.reason;
       if (signal.aborted) throw signal.reason;
+      // Queue time belongs to the enclosing 20-second account observation.
+      // Bound HTTP/JSON work to 12 seconds after admission instead of consuming
+      // its wire window in the queue; the whole-operation boundary stays 20s.
+      const wire = new AbortController();
+      wireTimer = this.timers.setTimeout(
+        () =>
+          wire.abort(
+            new AgentError(
+              "VENUE_READ_DEADLINE",
+              "Venue wire read deadline expired before complete evidence arrived.",
+              true,
+              503,
+            ),
+          ),
+        this.accountReadTimeout(this.deadlineMs),
+      );
+      wireSignal = AbortSignal.any([signal, wire.signal]);
       ticket.sent();
       sent = true;
       this.count(cost.method, lane, "actual_fetch");
@@ -268,14 +351,14 @@ export class VenueReads {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
-            signal,
+            signal: wireSignal,
             redirect: "error",
           }),
-          signal,
+          wireSignal,
         );
       } catch {
         this.count(cost.method, lane, "transport_failure");
-        if (signal.aborted) throw signal.reason;
+        if (wireSignal.aborted) throw wireSignal.reason;
         throw new AgentError(
           "VENUE_UNAVAILABLE",
           "Venue read did not complete. Fresh account evidence is required before execution.",
@@ -309,9 +392,9 @@ export class VenueReads {
       }
       let data: unknown;
       try {
-        data = await this.abortable(response.json(), signal);
+        data = await this.abortable(response.json(), wireSignal);
       } catch {
-        if (signal.aborted) throw signal.reason;
+        if (wireSignal.aborted) throw wireSignal.reason;
         this.count(cost.method, lane, "invalid_response");
         throw new AgentError(
           "VENUE_RESPONSE_INVALID",
@@ -361,6 +444,7 @@ export class VenueReads {
         this.count(cost.method, lane, "local_cooldown_denied");
       throw error;
     } finally {
+      if (wireTimer !== undefined) this.timers.clearTimeout(wireTimer);
       if (sent && !settled) {
         this.count(cost.method, lane, "charged_weight", ticket!.reservation);
         if (cost.unknownSurcharge) {

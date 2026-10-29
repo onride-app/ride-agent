@@ -262,7 +262,7 @@ export class VenueReadBudget {
       turn &&
       (turn.served >=
         (turn.owner === "" ? Math.min(160, this.limit) : this.limit) ||
-        now - turn.started >= 12000)
+        now - turn.started >= (lane === "account" ? 20000 : 12000))
     )
       delete this.turns[lane];
     const current = this.turns[lane];
@@ -304,6 +304,10 @@ export class VenueReadBudget {
       this.prune();
       for (;;) {
         if (this.cooldownRemaining() > 0) break;
+        // An unknown response temporarily holds all free weight. Do not let
+        // that provisional hold expire/switch its owner's turn before the
+        // actual response cost is settled and the hold is refunded.
+        if (this.exclusive) break;
         const first = this.lastLane === "account" ? "source" : "account";
         const candidates = [
           this.candidate(first),
@@ -312,9 +316,8 @@ export class VenueReadBudget {
         const next = candidates.find(Boolean);
         if (!next) break;
         if (
-          this.exclusive ||
-          (next.unknownSurcharge &&
-            (this.active.account > 0 || this.active.source > 0))
+          next.unknownSurcharge &&
+          (this.active.account > 0 || this.active.source > 0)
         )
           break;
         if (
@@ -405,11 +408,10 @@ export class VenueReadBudget {
         const expiry = this.charges
           .filter((c) => c.sent && c.settled)
           .reduce((n, c) => Math.min(n, c.at + 60000), now + 60000);
-        const turnExpiry = Object.values(this.turns).reduce(
-          (n, t) =>
-            Math.min(n, t.started + 12000 > now ? t.started + 12000 : n),
-          expiry,
-        );
+        const turnExpiry = Object.entries(this.turns).reduce((n, [lane, t]) => {
+          const expires = t.started + (lane === "account" ? 20000 : 12000);
+          return Math.min(n, expires > now ? expires : n);
+        }, expiry);
         const grace = Object.values(this.turns)
           .filter((t) => now - t.lastActivity < 2)
           .reduce((n, t) => Math.min(n, t.lastActivity + 2), expiry);
