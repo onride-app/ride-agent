@@ -1241,17 +1241,18 @@ export class CoreBridge {
         (await readHistory(identity.master, p.ledger_started_at));
       coverage = fillRows.complete && fundingRows.complete && flowRows.complete;
       const oidTasks = new Map<string, string>();
-      for (const e of p.executions.filter(
-        (e) => e.task_id && e.key.startsWith("perps:"),
-      )) {
-        const status = await this.core("perps_execution", {
-          user_id: user,
-          account_id: accountId,
-          task_id: e.task_id,
-        });
-        for (const leg of status.legs ?? [])
-          if (leg.oid) oidTasks.set(String(leg.oid), e.task_id!);
-      }
+      if (fillRows.events.length)
+        for (const e of p.executions.filter(
+          (e) => e.task_id && e.key.startsWith("perps:"),
+        )) {
+          const status = await this.core("perps_execution", {
+            user_id: user,
+            account_id: accountId,
+            task_id: e.task_id,
+          });
+          for (const leg of status.legs ?? [])
+            if (leg.oid) oidTasks.set(String(leg.oid), e.task_id!);
+        }
       for (const f of fillRows.events) {
         const task = oidTasks.get(String(f.oid));
         if (!task || f.feeToken !== "USDC") {
