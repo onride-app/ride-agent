@@ -110,7 +110,7 @@ function assertPrivate(records: MonitorTimingRecord[]) {
   assert.match(records[0].tick_ref, /^[0-9a-f-]{36}$/);
 }
 
-it("separates account work, planning commit and durable notification timing without changing their order", async (t) => {
+it("separates account work, early audit publication, source planning and durable notification timing", async (t) => {
   const f = await fixture(t),
     account = deferred(),
     source = deferred(),
@@ -147,9 +147,9 @@ it("separates account work, planning commit and durable notification timing with
     return transact(user, async (state) => {
       const result = await work(state);
       if (first) {
-        order.push("plan_ready");
+        order.push("audit_ready");
         await commit.promise;
-        order.push("plan_committing");
+        order.push("audit_committing");
       }
       return result;
     });
@@ -168,23 +168,28 @@ it("separates account work, planning commit and durable notification timing with
     f.advance(300);
     account.resolve();
     await flush();
-    assert.deepEqual(order, ["account_start", "account_done"]);
+    assert.deepEqual(order, ["account_start", "account_done", "audit_ready"]);
     assert.deepEqual(
       records
         .filter((record) => record.kind === "phase")
         .map((record) => [record.phase, record.duration_ms]),
       [["account_observation", 300]],
     );
-    f.advance(900);
-    source.resolve();
-    await flush();
-    assert.equal(order.at(-1), "plan_ready");
+    assert.equal(order.at(-1), "audit_ready");
     assert.ok(
       !order.includes("notify_start"),
-      "notification may not start before the planning transaction commits",
+      "notification may not start before the audit transaction commits",
+    );
+    f.advance(500);
+    commit.resolve();
+    await flush();
+    assert.equal(order.at(-1), "audit_committing");
+    assert.ok(
+      !order.includes("notify_start"),
+      "source planning must complete before durable notifications start",
     );
     f.advance(1100);
-    commit.resolve();
+    source.resolve();
     await flush();
     assert.equal(order.at(-1), "notify_start");
     assert.equal(finished, false);
@@ -204,7 +209,8 @@ it("separates account work, planning commit and durable notification timing with
       .map((record) => [record.phase, record.duration_ms, record.outcome]),
     [
       ["account_observation", 300, "ok"],
-      ["observe_plan", 1100, "ok"],
+      ["audit_control", 500, "ok"],
+      ["observe_plan", 600, "ok"],
       ["durable_notify", 600, "ok"],
     ],
   );
@@ -281,7 +287,8 @@ it("records binding failures while preserving the caught error and draining noti
       .map((record) => [record.phase, record.duration_ms, record.outcome]),
     [
       ["account_binding", 300, "error"],
-      ["observe_plan", 300, "ok"],
+      ["audit_control", 300, "ok"],
+      ["observe_plan", 0, "ok"],
       ["durable_notify", 400, "ok"],
     ],
   );
@@ -295,7 +302,7 @@ it("records binding failures while preserving the caught error and draining noti
   assertPrivate(records);
 });
 
-it("propagates an uncaught planning transaction failure without starting the durable phase or logging its content", async (t) => {
+it("propagates an uncaught audit transaction failure without starting later phases or logging its content", async (t) => {
   const f = await fixture(t),
     original = new Error(privateMessage),
     records: MonitorTimingRecord[] = [];
@@ -317,8 +324,51 @@ it("propagates an uncaught planning transaction failure without starting the dur
     records
       .filter((record) => record.kind === "phase")
       .map((record) => [record.phase, record.duration_ms, record.outcome]),
-    [["observe_plan", 350, "error"]],
+    [["audit_control", 350, "error"]],
   );
+  assert.equal(f.adapter.notifyCount, 0);
+  assert.equal(f.adapter.submitCount, 0);
+  assertPrivate(records);
+});
+
+it("preserves the committed audit when the planning transaction fails without starting durable work or logging its content", async (t) => {
+  const f = await fixture(t),
+    original = new Error(privateMessage),
+    records: MonitorTimingRecord[] = [],
+    transact = f.repository.transact.bind(f.repository);
+  let transactions = 0;
+  f.repository.transact = async (user, work) => {
+    if (++transactions === 1) return transact(user, work);
+    f.advance(350);
+    throw original;
+  };
+  await assert.rejects(
+    runMonitorTrace(() => f.runner.tick(privateUser), {
+      clock: f.clock,
+      report: (record) => records.push(record),
+      thresholdMs: 0,
+    }),
+    (error) => error === original,
+  );
+  assert.deepEqual(
+    records
+      .filter((record) => record.kind === "phase")
+      .map((record) => [record.phase, record.duration_ms, record.outcome]),
+    [
+      ["account_observation", 0, "ok"],
+      ["audit_control", 0, "ok"],
+      ["observe_plan", 350, "error"],
+    ],
+  );
+  assert.equal(
+    transactions,
+    2,
+    "an uncaught transaction error stops before durable work",
+  );
+  const saved = await f.repository.read(privateUser);
+  assert.equal(saved.portfolios[0].snapshot?.observed_at, f.base);
+  assert.equal(saved.portfolios[0].audit_verified_at, f.base);
+  assert.ok(saved.updates.every((update) => update.notification === "pending"));
   assert.equal(f.adapter.notifyCount, 0);
   assert.equal(f.adapter.submitCount, 0);
   assertPrivate(records);

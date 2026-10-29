@@ -11,7 +11,13 @@ export const readTimers: BudgetTimers = {
     clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
-type Charge = { at: number; weight: number; sent: boolean; settled: boolean };
+type Charge = {
+  at: number;
+  lane: ReadLane;
+  weight: number;
+  sent: boolean;
+  settled: boolean;
+};
 type Waiter = {
   lane: ReadLane;
   owner: string;
@@ -96,6 +102,7 @@ export class VenueReadBudget {
   >();
   private nextObservationAt = 0;
   private recentObservationWeights: number[] = [];
+  private sourcePacingLoans = 0;
   private observations = { started: 0, completed: 0, deferred: 0, growth: 0 };
   constructor(
     options: {
@@ -126,6 +133,8 @@ export class VenueReadBudget {
       capacity: this.limit,
       window_ms: 60000,
       used: this.used(),
+      source_used: this.sourceUsed(),
+      source_pacing_loans: this.sourcePacingLoans,
       debt: Math.max(0, this.used() - this.limit),
       unknown_exclusive: this.exclusive !== undefined,
       provider_cooldown_ms: this.cooldownRemaining(),
@@ -164,8 +173,16 @@ export class VenueReadBudget {
   private used() {
     return this.charges.reduce((n, c) => n + c.weight, 0);
   }
+  private sourceUsed() {
+    return this.charges.reduce(
+      (weight, charge) =>
+        weight + (charge.lane === "source" ? charge.weight : 0),
+      0,
+    );
+  }
   // Whole observations join a FIFO before spending any venue weight. A retry
-  // keeps its place; cheap background reads cannot consume the head's capacity.
+  // keeps its place; a ready head's full capacity stays protected. Before its
+  // pacing time, bounded sources may use the limited lane-share exception.
   // No account payload or completed evidence is retained here.
   beginObservation(owner: string): AccountReadReservation {
     this.prune();
@@ -316,6 +333,22 @@ export class VenueReadBudget {
         ? 0
         : this.observation.remaining;
     return this.observationQueue.values().next().value?.demand ?? 0;
+  }
+  private canBorrowPacingWeight(waiter: Waiter) {
+    const share = Math.floor(this.limit * 0.2);
+    const head = this.observationQueue.values().next().value;
+    return (
+      waiter.lane === "source" &&
+      !waiter.unknownSurcharge &&
+      !waiter.observation &&
+      !this.observation &&
+      head !== undefined &&
+      // Cold/full-window frames must retain an entirely free budget window.
+      head.demand < this.limit &&
+      this.clock() < this.nextObservationAt &&
+      this.sourceUsed() < share &&
+      waiter.cost <= share
+    );
   }
   cooldownRemaining() {
     return Math.max(0, Math.ceil(this.providerUntil - this.clock()));
@@ -562,10 +595,16 @@ export class VenueReadBudget {
           (this.active.account > 0 || this.active.source > 0)
         )
           break;
+        const used = this.used(),
+          protectedWeight = this.protectedWeight(next.observation),
+          borrow =
+            used + next.cost + protectedWeight > this.limit &&
+            this.canBorrowPacingWeight(next),
+          protection = borrow ? 0 : protectedWeight;
         if (
           this.clock() < this.blockedUntil ||
-          this.used() + next.cost + this.protectedWeight(next.observation) >
-            this.limit
+          used + next.cost > this.limit ||
+          used + next.cost + protection > this.limit
         ) {
           // Do not endlessly backfill cheap source reads in front of a larger
           // account request. The next turn owns the next available capacity.
@@ -577,12 +616,17 @@ export class VenueReadBudget {
         next.signal.removeEventListener("abort", next.cancel);
         const charge: Charge = {
           at: this.clock(),
+          lane: next.lane,
           weight: next.unknownSurcharge
-            ? this.limit - this.used() - this.protectedWeight(next.observation)
+            ? this.limit - used - protection
             : next.cost,
           sent: false,
           settled: false,
         };
+        // One bounded request may cross the soft source share before the FIFO
+        // head's pacing time. It never predicts refunds or guarantees that the
+        // head will fit then; every paid/held charge keeps its real expiry.
+        if (borrow) this.sourcePacingLoans++;
         this.charges.push(charge);
         const frame = next.observation ? this.observation! : undefined;
         const held = frame ? Math.min(frame.remaining, charge.weight) : 0;

@@ -30,6 +30,7 @@ interface Trace {
 const traces = new AsyncLocalStorage<Trace>();
 const phases = new Set([
   "tick",
+  "audit_control",
   "observe_plan",
   "durable_notify",
   "account_observation",
@@ -171,13 +172,17 @@ export async function monitorOperation<T>(
     operations.has(name) ? name : "other",
   );
 }
-export function noteMonitorAccountAge(observedAt: number): void {
+export function noteMonitorAccountAge(
+  observedAt: number,
+  stage: "returned" | "published" = "returned",
+): void {
   const trace = traces.getStore();
   const age = Date.now() - observedAt;
   if (!trace || !Number.isFinite(age)) return;
   emit(trace, {
     kind: "account_age",
-    phase: trace.phase,
+    phase: stage === "published" ? "audit_control" : trace.phase,
+    ...(stage === "published" ? { parent_phase: "tick" } : {}),
     duration_ms: 0,
     outcome: "ok",
     account_age_ms: Math.round(Math.max(0, age)),

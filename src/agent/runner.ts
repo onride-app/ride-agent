@@ -12,6 +12,7 @@ import {
   type Portfolio,
   type Execution,
   type Sleeve,
+  type MonitorError,
   assetAllowed,
 } from "./domain.js";
 import {
@@ -49,12 +50,32 @@ export class AgentRunner {
   private async tickBody(user: string): Promise<void> {
     const { repository, adapter } = this.service;
     const transact = <T>(
-      phase: "observe_plan" | "durable_notify",
+      phase: "audit_control" | "observe_plan" | "durable_notify",
       work: (state: State) => Promise<T>,
     ) => monitorPhase(phase, () => repository.transact(user, work));
     // Planning is committed before any submission. A process crash cannot
     // erase a possibly submitted execution identifier or its frozen payload.
-    const nextVenueRetryAt = await transact("observe_plan", async (state) => {
+    const prefetches = new Map<string, ReturnType<typeof observeSources>>();
+    const startSources = (p: Portfolio) =>
+      observeSources(
+        adapter,
+        p.sleeves.filter((s) => s.state !== "closed").map((s) => s.trader),
+        (id, observation) => {
+          // Late public reads may update this bounded cache, never a state
+          // transaction that already committed or any execution cursor.
+          try {
+            if (observation.ok && sourceEvidenceReady(observation.value)) {
+              if (this.sourceTimes.size >= 2000)
+                this.sourceTimes.delete(this.sourceTimes.keys().next().value!);
+              this.sourceTimes.set(id, observation.value.observed_at);
+            }
+          } catch {
+            /* Malformed evidence cannot refresh a timestamp. */
+          }
+        },
+      );
+    const audited = await transact("audit_control", async (state) => {
+      const approved = new Map<string, { token: string; observedAt: number }>();
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
         // A rejected read already tells us when capacity can return. Starting
         // another full account pipeline every five seconds consumes scarce
@@ -62,25 +83,8 @@ export class AgentRunner {
         // This uses persisted error data, so a runner restart cannot bypass
         // the delay. Durable submission reconciliation below still runs.
         if (venueReadRetryPending(p)) continue;
-        const sources = observeSources(
-          adapter,
-          p.sleeves.filter((s) => s.state !== "closed").map((s) => s.trader),
-          (id, observation) => {
-            // Late public reads may update this bounded cache, never a state
-            // transaction that already committed or any execution cursor.
-            try {
-              if (observation.ok && sourceEvidenceReady(observation.value)) {
-                if (this.sourceTimes.size >= 2000)
-                  this.sourceTimes.delete(
-                    this.sourceTimes.keys().next().value!,
-                  );
-                this.sourceTimes.set(id, observation.value.observed_at);
-              }
-            } catch {
-              /* Malformed evidence cannot refresh a timestamp. */
-            }
-          },
-        );
+        if (!sourceReadRetryPending(p)) prefetches.set(p.id, startSources(p));
+        let auditComplete = false;
         try {
           if (!p.account_id) {
             const snap = await monitorPhase("account_binding", () =>
@@ -126,10 +130,9 @@ export class AgentRunner {
               true,
             );
           p.snapshot = snap;
-          p.last_error = undefined;
           p.audit_started_at ??= snap.observed_at;
-          if (p.state === "attention")
-            p.state = p.loss_latched ? "loss_triggered" : "active";
+          if (p.loss_latched && p.state === "attention")
+            p.state = "loss_triggered";
           for (const e of p.executions.filter(
             (e) =>
               e.task_id &&
@@ -236,7 +239,6 @@ export class AgentRunner {
             await adapter.fence(user, p);
             await adapter.cancelIncreasing(user, p);
           }
-          const plannedChanges = new Map<string, Sleeve>();
           for (const s of p.sleeves) {
             if (s.state === "closed") continue;
             if (["closing", "loss_triggered"].includes(s.state)) {
@@ -285,8 +287,105 @@ export class AgentRunner {
               }
               if (emergency) continue;
             }
+          }
+          auditComplete = true;
+        } catch (e) {
+          const err =
+            e instanceof AgentError
+              ? e
+              : new AgentError(
+                  "MONITOR_UNAVAILABLE",
+                  "Portfolio observation failed; increasing execution is suspended.",
+                  true,
+                );
+          p.state = p.loss_latched ? "loss_triggered" : "attention";
+          p.last_error = {
+            at: now(),
+            code: err.code,
+            message: err.message,
+            retryable: err.retryable,
+            read_scope: "account",
+            ...(err.details ? { details: err.details } : {}),
+          };
+          eventOnce(
+            state,
+            err.code,
+            p.id,
+            err.message,
+            err.details ? { diagnostics: err.details } : {},
+          );
+        } finally {
+          // Public collection must not keep a failed account transaction open
+          // beyond the database idle timeout. SourceFeed keeps sampling.
+          for (const sleeve of p.sleeves) {
+            const at = this.sourceTimes.get(sleeve.trader.id);
+            if (
+              at != null &&
+              fresh(at, 5000) &&
+              at > (sleeve.last_source_at ?? 0)
+            )
+              sleeve.last_source_at = at;
+          }
+        }
+        recordPerformance(state, p);
+        if (auditComplete)
+          approved.set(p.id, {
+            token: fingerprint(p),
+            observedAt: p.snapshot!.observed_at,
+          });
+      }
+      return approved;
+    });
+    for (const audit of audited.values())
+      noteMonitorAccountAge(audit.observedAt, "published");
+    const nextVenueRetryAt = await transact("observe_plan", async (state) => {
+      const accountFailures = new Set<string>();
+      for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
+        const expected = audited.get(p.id);
+        // Reacquire current state after publishing the audit. An external
+        // edit invalidates this frame, including edits without a revision bump.
+        if (expected === undefined || fingerprint(p) !== expected.token)
+          continue;
+        let sources = prefetches.get(p.id);
+        const getSources = () => (sources ??= startSources(p));
+        const publicFailures = new Set<unknown>();
+        let replayedSourceError: MonitorError | undefined;
+        const publicRead = async <T>(work: () => Promise<T>): Promise<T> => {
+          try {
+            if (sourceReadRetryPending(p)) {
+              replayedSourceError = p.source_read_error!;
+              throw new AgentError(
+                replayedSourceError.code,
+                replayedSourceError.message,
+                replayedSourceError.retryable,
+                503,
+                replayedSourceError.details,
+              );
+            }
+            return await work();
+          } catch (error) {
+            publicFailures.add(error);
+            throw error;
+          }
+        };
+        try {
+          const snap = p.snapshot!;
+          if (!fresh(snap.observed_at))
+            throw new AgentError(
+              "ACCOUNT_STALE",
+              "Account evidence expired before source planning.",
+              true,
+            );
+          if (!sourceReadRetryPending(p)) p.source_read_error = undefined;
+          const profit = pnl(p);
+          const plannedChanges = new Map<string, Sleeve>();
+          for (const s of p.sleeves) {
+            if (["closed", "closing", "loss_triggered"].includes(s.state))
+              continue;
             if (now() - (s.reviewed_at ?? 0) >= 86400_000) {
-              const updated = await adapter.profile(s.trader.id);
+              const updated = await publicRead(() =>
+                adapter.profile(s.trader.id),
+              );
               if (updated.scored_at >= s.trader.scored_at) {
                 const inactive =
                   updated.last_trade_at == null
@@ -324,12 +423,15 @@ export class AgentRunner {
               }
             }
             if (p.reconciliation !== "complete" && s.initialized) continue;
-            let observation = await sources.get(s.trader.id);
-            if (!observation.ok) throw observation.error;
+            let observation = await publicRead(async () => {
+              const value = await getSources().get(s.trader.id);
+              if (!value.ok) throw value.error;
+              return value;
+            });
             // Collection overlaps the complete account read. Its first result
             // may have expired while that read was queued or in flight.
             if (!fresh(observation.value.observed_at, 5000)) {
-              const value = await adapter.source(s.trader);
+              const value = await publicRead(() => adapter.source(s.trader));
               observation = { ok: true, value };
             }
             const source = observation.value;
@@ -394,10 +496,12 @@ export class AgentRunner {
                   "Fixed copying requires verified source fill history.",
                   true,
                 );
-              const fills = await adapter.sourceFills(
-                t.trader,
-                t.fixed_last_fill_at,
-                source.observed_at,
+              const fills = await publicRead(() =>
+                adapter.sourceFills!(
+                  t.trader,
+                  t.fixed_last_fill_at!,
+                  source.observed_at,
+                ),
               );
               if (!fills.complete)
                 throw new AgentError(
@@ -727,6 +831,9 @@ export class AgentRunner {
             }
             plannedChanges.set(s.copy_id, t);
           }
+          p.last_error = undefined;
+          if (p.state === "attention")
+            p.state = p.loss_latched ? "loss_triggered" : "active";
           if (plannedChanges.size) {
             const basket = structuredClone(p);
             for (const sleeve of basket.sleeves) {
@@ -950,6 +1057,8 @@ export class AgentRunner {
             )
               proposal.status = "completed";
           }
+          if (p.state === "closed" || !sourceReadRetryPending(p))
+            p.source_read_error = undefined;
         } catch (e) {
           const err =
             e instanceof AgentError
@@ -960,13 +1069,24 @@ export class AgentRunner {
                   true,
                 );
           p.state = p.loss_latched ? "loss_triggered" : "attention";
-          p.last_error = {
-            at: now(),
-            code: err.code,
-            message: err.message,
-            retryable: err.retryable,
-            ...(err.details ? { details: err.details } : {}),
-          };
+          p.last_error = replayedSourceError
+            ? { ...replayedSourceError }
+            : {
+                at: now(),
+                code: err.code,
+                message: err.message,
+                retryable: err.retryable,
+                read_scope: publicFailures.has(e) ? "source" : "account",
+                ...(err.details ? { details: err.details } : {}),
+              };
+          if (!publicFailures.has(e) || err.code === "VENUE_RATE_LIMITED")
+            accountFailures.add(p.id);
+          if (
+            publicFailures.has(e) &&
+            err.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+            monitorReadRetryAt(p.last_error) != null
+          )
+            p.source_read_error = p.last_error;
           eventOnce(
             state,
             err.code,
@@ -993,7 +1113,11 @@ export class AgentRunner {
         Infinity,
         ...state.portfolios
           .filter((p) => p.state !== "closed")
-          .map((p) => venueReadRetryAt(p) ?? Infinity),
+          .map((p) =>
+            !audited.has(p.id) || accountFailures.has(p.id)
+              ? (venueReadRetryAt(p) ?? Infinity)
+              : Infinity,
+          ),
       );
     });
     if (Number.isFinite(nextVenueRetryAt)) {
@@ -1165,10 +1289,13 @@ export class AgentRunner {
           entry.running = true;
           let task!: Promise<void>;
           task = Promise.resolve().then(async () => {
+            const startedAt = now();
+            let failed = false;
             try {
               if (signal.aborted) return;
               await this.tick(user);
             } catch {
+              failed = true;
               this.venueRetryAt.delete(user);
               if (!signal.aborted)
                 console.error(
@@ -1177,10 +1304,17 @@ export class AgentRunner {
             } finally {
               entry.running = false;
               const retry = this.venueRetryAt.get(user);
+              const normalDue = failed
+                ? now() + intervalMs
+                : Math.max(now(), startedAt + intervalMs);
+              // Align a final short wait instead of starting another durable
+              // cycle just before capacity returns. Long waits still reconcile.
               entry.due =
                 retry != null
-                  ? Math.min(now() + intervalMs, Math.max(now(), retry))
-                  : now() + intervalMs;
+                  ? retry - now() <= intervalMs
+                    ? Math.max(now(), retry)
+                    : normalDue
+                  : normalDue;
               if (!entry.present) users.delete(user);
               inFlight.delete(task);
               wake();
@@ -1223,6 +1357,29 @@ function venueReadRetryPending(p: Portfolio): boolean {
 }
 function venueReadRetryAt(p: Portfolio): number | undefined {
   const error = p.last_error;
+  if (
+    error?.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+    error.read_scope === "source"
+  )
+    return;
+  return monitorReadRetryAt(error);
+}
+function sourceReadRetryAt(p: Portfolio): number | undefined {
+  const error = p.source_read_error;
+  if (
+    error?.code !== "VENUE_READ_BUDGET_EXHAUSTED" ||
+    error.read_scope !== "source"
+  )
+    return;
+  return monitorReadRetryAt(error);
+}
+function sourceReadRetryPending(p: Portfolio): boolean {
+  const retryAt = sourceReadRetryAt(p);
+  return retryAt != null && now() < retryAt;
+}
+function monitorReadRetryAt(
+  error: MonitorError | undefined,
+): number | undefined {
   if (
     !error?.retryable ||
     !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(error.code)

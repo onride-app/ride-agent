@@ -201,7 +201,7 @@ it("keeps both scheduling slots usable after synchronous user failures", async (
   }
 });
 
-it("rechecks healthy users independently after completion without duplicating or overlapping discovered users", async (t) => {
+it("rechecks healthy users on a start-based cadence without duplicating or overlapping discovered users", async (t) => {
   const time = new SchedulerClock(t),
     f = fixture(["slow", "healthy", "healthy"]),
     slow = deferred(),
@@ -226,18 +226,92 @@ it("rechecks healthy users independently after completion without duplicating or
     await time.advance(3000);
     firstHealthy.resolve();
     await flush();
-    await time.advance(4999);
+    await time.advance(1999);
     assert.deepEqual(calls.get("healthy"), [0]);
     await time.advance(1);
-    assert.deepEqual(calls.get("healthy"), [0, 8000]);
+    assert.deepEqual(calls.get("healthy"), [0, 5000]);
     await time.advance(10000);
-    assert.deepEqual(calls.get("healthy"), [0, 8000, 13000, 18000]);
+    assert.deepEqual(calls.get("healthy"), [0, 5000, 10000, 15000]);
     assert.deepEqual(calls.get("slow"), [0]);
     assert.equal(maximumPerUser, 1);
   } finally {
     f.controller.abort();
     slow.resolve();
     firstHealthy.resolve();
+    await running;
+  }
+  assert.equal(time.events.size, 0);
+});
+
+it("starts the next normal tick immediately after a long tick drains without overlapping the same user", async (t) => {
+  const time = new SchedulerClock(t),
+    f = fixture(["alice"]),
+    first = deferred(),
+    starts: number[] = [];
+  let active = 0,
+    maximum = 0;
+  f.runner.tick = async () => {
+    starts.push(time.at);
+    maximum = Math.max(maximum, ++active);
+    if (starts.length === 1) await first.promise;
+    else f.controller.abort();
+    active--;
+  };
+  const running = f.runner.run(f.controller.signal);
+  try {
+    await flush();
+    await time.advance(12000);
+    assert.deepEqual(starts, [0]);
+    first.resolve();
+    await running;
+    assert.deepEqual(starts, [0, 12000]);
+    assert.equal(maximum, 1);
+    assert.equal(active, 0);
+  } finally {
+    f.controller.abort();
+    first.resolve();
+    await running;
+  }
+  assert.equal(time.events.size, 0);
+});
+
+it("backs off from completion after an uncaught long tick instead of immediately repeating it", async (t) => {
+  const time = new SchedulerClock(t),
+    f = fixture(["alice"]),
+    failure = deferred(),
+    starts: number[] = [];
+  let active = 0,
+    maximum = 0;
+  t.mock.method(console, "error", () => {});
+  f.runner.tick = async () => {
+    starts.push(time.at);
+    maximum = Math.max(maximum, ++active);
+    try {
+      if (starts.length === 1) {
+        await failure.promise;
+        throw new Error("fixture delayed database failure");
+      }
+      f.controller.abort();
+    } finally {
+      active--;
+    }
+  };
+  const running = f.runner.run(f.controller.signal);
+  try {
+    await flush();
+    await time.advance(12000);
+    failure.resolve();
+    await flush();
+    await time.advance(4999);
+    assert.deepEqual(starts, [0]);
+    await time.advance(1);
+    await running;
+    assert.deepEqual(starts, [0, 17000]);
+    assert.equal(maximum, 1);
+    assert.equal(active, 0);
+  } finally {
+    f.controller.abort();
+    failure.resolve();
     await running;
   }
   assert.equal(time.events.size, 0);
@@ -585,8 +659,8 @@ it("clears an elapsed retry after an uncaught transaction error and backs off wi
   let transactions = 0;
   f.repository.transact = async (user, work) => {
     transactions++;
-    if (transactions === 1) return transact(user, work);
-    if (transactions === 2) await failure.promise;
+    if (transactions <= 2) return transact(user, work);
+    if (transactions === 3) await failure.promise;
     // Bound a regression's immediate retries so this test reports failure
     // instead of leaving an infinite microtask loop in the test runner.
     if (transactions > 6) f.controller.abort();
@@ -609,15 +683,15 @@ it("clears an elapsed retry after an uncaught transaction error and backs off wi
     failure.resolve();
     await flush();
     await flush();
-    assert.equal(transactions, 2);
+    assert.equal(transactions, 3);
     assert.equal(logs.length, 1);
     await time.advance(4999);
-    assert.equal(transactions, 2);
-    await time.advance(1);
     assert.equal(transactions, 3);
+    await time.advance(1);
+    assert.equal(transactions, 4);
     assert.equal(logs.length, 2);
     await time.advance(4999);
-    assert.equal(transactions, 3);
+    assert.equal(transactions, 4);
     assert.deepEqual(accounts, [0]);
   } finally {
     f.controller.abort();

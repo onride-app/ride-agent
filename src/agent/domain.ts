@@ -255,15 +255,18 @@ export interface Execution {
   reserve_usdc: string;
   error: string | null;
 }
+export interface MonitorError {
+  at: number;
+  code: string;
+  message: string;
+  retryable: boolean;
+  details?: import("./contracts.js").ErrorDetails;
+  read_scope?: "account" | "source";
+}
 export interface Portfolio {
   target_blocker?: TargetBlocker;
-  last_error?: {
-    at: number;
-    code: string;
-    message: string;
-    retryable: boolean;
-    details?: import("./contracts.js").ErrorDetails;
-  };
+  last_error?: MonitorError;
+  source_read_error?: MonitorError;
   activation_check?: {
     at: number;
     eligible: boolean | null;

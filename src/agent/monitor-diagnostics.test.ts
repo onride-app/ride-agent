@@ -144,3 +144,18 @@ test("monitor timings suppress fast phases and remain silent outside a monitor t
     0,
   );
 });
+
+test("publication age is labeled only after the caller has committed the audit", async () => {
+  const records: MonitorTimingRecord[] = [];
+  await runMonitorTrace(
+    async () => {
+      await monitorPhase("audit_control", async () => {});
+      noteMonitorAccountAge(Date.now() - 500, "published");
+    },
+    { report: (record) => records.push(record) },
+  );
+  const age = records.find((record) => record.kind === "account_age")!;
+  assert.equal(age.phase, "audit_control");
+  assert.equal(age.parent_phase, "tick");
+  assert.ok(age.account_age_ms! >= 500);
+});
