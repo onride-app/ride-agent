@@ -7,6 +7,7 @@ import {
   type BudgetTimers,
   type ReadLane,
   type ReadTicket,
+  type AccountReadReservation,
   VenueReadBudget,
 } from "./venue-read-budget.js";
 
@@ -15,6 +16,10 @@ type AccountReadScope = {
   id: number;
   until: number;
   admission: AbortController;
+  owner?: string;
+  reservation?: AccountReadReservation;
+  admissionError?: unknown;
+  observedAt?: number;
 };
 type Counters = {
   calls: number;
@@ -157,12 +162,13 @@ export class VenueReads {
       throw this.unavailable();
     }
   }
-  async observeAccount<T>(work: () => Promise<T>): Promise<T> {
+  async observeAccount<T>(work: () => Promise<T>, owner?: string): Promise<T> {
     if (this.accountScope.getStore()) return work();
-    const scope = {
+    const scope: AccountReadScope = {
       id: ++this.accountSequence,
       until: this.clock() + 20000,
       admission: new AbortController(),
+      owner,
     };
     const timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -174,9 +180,11 @@ export class VenueReads {
         abort = () => reject(scope.admission.signal.reason);
         scope.admission.signal.addEventListener("abort", abort, { once: true });
       });
+      let complete = false;
       try {
         const value = await Promise.race([work(), cancelled]);
         this.accountReadTimeout();
+        complete = true;
         return value;
       } catch (error) {
         scope.admission.abort(error);
@@ -184,8 +192,12 @@ export class VenueReads {
       } finally {
         this.timers.clearTimeout(timer);
         scope.admission.signal.removeEventListener("abort", abort);
+        scope.reservation?.close(complete);
       }
     });
+  }
+  accountObservedAt(): number {
+    return this.accountScope.getStore()?.observedAt ?? this.clock();
   }
   private accountDeadline() {
     return new AgentError(
@@ -217,6 +229,17 @@ export class VenueReads {
       this.accountReadTimeout();
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       this.checkCooldown(method, lane);
+      const scope = this.accountScope.getStore();
+      if (scope?.owner && !scope.reservation) {
+        if (scope.admissionError) throw scope.admissionError;
+        try {
+          scope.reservation = this.budget.beginObservation(scope.owner);
+        } catch (error) {
+          scope.admissionError = error;
+          this.count(method, lane, "local_budget_denied");
+          throw error;
+        }
+      }
       const key = JSON.stringify([url, payload]),
         // A failed observation may cancel only its own queued work, never a
         // different caller that joined the same account request.
@@ -228,6 +251,8 @@ export class VenueReads {
         Math.min(cached.until, cached.at + ttlMs) > this.clock()
       ) {
         this.count(method, lane, "cache_hit");
+        if (scope && method === "allMids")
+          scope.observedAt = Math.min(scope.observedAt ?? cached.at, cached.at);
         return structuredClone(cached.value);
       }
       if (cached) this.cache.delete(key);
@@ -325,6 +350,7 @@ export class VenueReads {
         owner,
         admissionSignal,
         cost.unknownSurcharge,
+        scope?.reservation,
       );
       this.checkCooldown(cost.method, lane, false);
       if (admissionSignal.aborted) throw admissionSignal.reason;
@@ -347,6 +373,7 @@ export class VenueReads {
       );
       wireSignal = AbortSignal.any([requestSignal, wire.signal]);
       ticket.sent();
+      if (scope) scope.observedAt ??= this.clock();
       sent = true;
       this.count(cost.method, lane, "actual_fetch");
       this.count(cost.method, lane, "reserved_weight", ticket.reservation);

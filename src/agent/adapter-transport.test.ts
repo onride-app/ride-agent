@@ -10,6 +10,44 @@ import { recommend } from "./domain.js";
 import { candidate, snapshot } from "./fixtures.js";
 import { fromPlan } from "./service.js";
 
+class TransportClock {
+  at = 0;
+  sequence = 0;
+  events = new Map<number, { at: number; run(): void }>();
+  timeouts: number[] = [];
+  schedule(run: () => void, milliseconds: number) {
+    this.events.set(++this.sequence, { at: this.at + milliseconds, run });
+  }
+  timeout = (milliseconds: number) => {
+    this.timeouts.push(milliseconds);
+    const controller = new AbortController();
+    this.schedule(
+      () => controller.abort(new Error("fixture transport timeout")),
+      milliseconds,
+    );
+    return controller.signal;
+  };
+  async advance(milliseconds: number) {
+    const flush = async () => {
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+    };
+    const end = this.at + milliseconds;
+    await flush();
+    for (;;) {
+      const next = [...this.events]
+        .filter(([, event]) => event.at <= end)
+        .sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+      if (!next) break;
+      this.at = next[1].at;
+      this.events.delete(next[0]);
+      next[1].run();
+      await flush();
+    }
+    this.at = end;
+    await flush();
+  }
+}
+
 async function loopback<T>(
   app: Express,
   work: (adapter: BridgeAdapter) => Promise<T>,
@@ -288,4 +326,98 @@ it("preserves typed JSON failure codes and validated Core details", async () => 
       },
     );
   });
+});
+
+for (const operation of ["account", "preflight", "bind"] as const)
+  it(`lets ${operation} return its typed 20-second observation failure before transport expires`, async (t) => {
+    const clock = new TransportClock();
+    t.mock.method(AbortSignal, "timeout", clock.timeout);
+    t.mock.method(
+      globalThis,
+      "fetch",
+      async (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          const signal = init?.signal;
+          signal?.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+          clock.schedule(
+            () =>
+              resolve(
+                Response.json(
+                  {
+                    error: {
+                      code: "VENUE_READ_BUDGET_EXHAUSTED",
+                      message: "Local fixture capacity unavailable.",
+                      retryable: true,
+                      details: { retry_after_ms: 30_000 },
+                    },
+                  },
+                  { status: 503 },
+                ),
+              ),
+            20_100,
+          );
+        }),
+    );
+    const adapter = new BridgeAdapter(
+      "https://bridge.fixture",
+      "fixture-token",
+    );
+    const pending = adapter[operation]("fixture-user", portfolio()).catch(
+      (error) => error,
+    );
+    await clock.advance(21_000);
+    const error = await pending;
+    assert.ok(error instanceof AgentError);
+    assert.equal(error.code, "VENUE_READ_BUDGET_EXHAUSTED");
+    assert.equal(error.details?.retry_after_ms, 30_000);
+    assert.deepEqual(clock.timeouts, [25_000]);
+  });
+
+it("bounds account JSON decoding by the same complete transport deadline", async (t) => {
+  const clock = new TransportClock();
+  t.mock.method(AbortSignal, "timeout", clock.timeout);
+  const response = Response.json(snapshot());
+  t.mock.method(response, "json", () => new Promise(() => {}));
+  t.mock.method(globalThis, "fetch", async () => response);
+  const adapter = new BridgeAdapter("https://bridge.fixture", "fixture-token");
+  let settled = false;
+  let result: unknown;
+  void adapter.account("fixture-user", portfolio()).then(
+    (value) => {
+      settled = true;
+      result = value;
+    },
+    (error) => {
+      settled = true;
+      result = error;
+    },
+  );
+  await clock.advance(24_999);
+  assert.equal(settled, false);
+  await clock.advance(1);
+  assert.equal(
+    settled,
+    true,
+    "a successful header must not leave JSON decoding unbounded",
+  );
+  assert.ok(result instanceof AgentError);
+  assert.equal(result.code, "EXECUTOR_UNAVAILABLE");
+  assert.deepEqual(clock.timeouts, [25_000]);
+});
+
+it("keeps submission and funding transport limits unchanged", async (t) => {
+  const clock = new TransportClock();
+  t.mock.method(AbortSignal, "timeout", clock.timeout);
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({ task_id: "task_fixture" }),
+  );
+  const adapter = new BridgeAdapter("https://bridge.fixture", "fixture-token");
+  const p = portfolio();
+  await adapter.submit("fixture-user", p, p.executions[0]);
+  await adapter.fundingOperation("quote", "fixture-user", {
+    deposit_id: "fixture_deposit",
+  });
+  assert.deepEqual(clock.timeouts, [20_000, 90_000]);
 });

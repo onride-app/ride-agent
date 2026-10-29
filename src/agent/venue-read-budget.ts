@@ -22,6 +22,22 @@ type Waiter = {
   reject(error: Error): void;
   cancel(): void;
   budgetBlocked: boolean;
+  observation?: AccountReadReservation;
+};
+export interface AccountReadReservation {
+  readonly id: number;
+  close(complete?: boolean): void;
+}
+type Observation = {
+  ticket: AccountReadReservation;
+  owner: string;
+  remaining: number;
+  committed: number;
+  peak: number;
+  pending: number;
+  closed: boolean;
+  complete: boolean;
+  grew: boolean;
 };
 type Owner = {
   served: number;
@@ -67,6 +83,17 @@ export class VenueReadBudget {
   private exclusive?: Charge;
   private providerUntil = 0;
   private turnSequence = 0;
+  private observationSequence = 0;
+  private observation?: Observation;
+  private observationQueue = new Map<
+    string,
+    { demand: number; seen: number }
+  >();
+  private observationPlans = new Map<
+    string,
+    { demand: number; seen: number }
+  >();
+  private observations = { started: 0, completed: 0, deferred: 0, growth: 0 };
   constructor(
     options: {
       limit?: number;
@@ -104,10 +131,16 @@ export class VenueReadBudget {
       source_active: this.active.source,
       account_queued: this.queues.account.length,
       source_queued: this.queues.source.length,
+      observation_active: this.observation !== undefined,
+      observation_queued: this.observationQueue.size,
+      observation_reserved: this.observation?.remaining ?? 0,
+      observations: { ...this.observations },
     };
   }
   private prune() {
     const now = this.clock();
+    for (const [key, entry] of this.observationQueue)
+      if (entry.seen <= now - 120000) this.observationQueue.delete(key);
     this.charges = this.charges.filter(
       (c) => !c.sent || !c.settled || c.at > now - 60000,
     );
@@ -123,6 +156,108 @@ export class VenueReadBudget {
   }
   private used() {
     return this.charges.reduce((n, c) => n + c.weight, 0);
+  }
+  // Whole observations join a FIFO before spending any venue weight. A retry
+  // keeps its place; cheap background reads cannot consume the head's capacity.
+  // No account payload or completed evidence is retained here.
+  beginObservation(owner: string): AccountReadReservation {
+    this.prune();
+    const now = this.clock();
+    for (const [key, entry] of this.observationPlans)
+      if (entry.seen < now - 600000) this.observationPlans.delete(key);
+    if (this.cooldownRemaining() > 0) throw this.coolingDown();
+    let entry = this.observationQueue.get(owner);
+    if (!entry) {
+      if (
+        this.observationQueue.size >= 256 ||
+        (this.observationPlans.size >= 2048 &&
+          !this.observationPlans.has(owner))
+      )
+        throw this.denied(true);
+      entry = {
+        demand: this.observationPlans.get(owner)?.demand ?? this.limit,
+        seen: now,
+      };
+      this.observationQueue.set(owner, entry);
+    }
+    entry.seen = now;
+    const first = this.observationQueue.keys().next().value;
+    if (this.observation || first !== owner) {
+      this.observations.deferred++;
+      this.pump();
+      throw this.observationDeferred(1000);
+    }
+    if (this.exclusive) {
+      this.observations.deferred++;
+      throw this.observationDeferred(1000);
+    }
+    if (now < this.blockedUntil || this.used() + entry.demand > this.limit) {
+      this.observations.deferred++;
+      const error = this.denied(true, entry.demand);
+      this.pump();
+      throw error;
+    }
+    this.observationQueue.delete(owner);
+    const ticket: AccountReadReservation = {
+      id: ++this.observationSequence,
+      close: (complete = false) => {
+        if (this.observation?.ticket !== ticket) return;
+        this.observation.closed = true;
+        this.observation.complete = complete;
+        this.finishObservation();
+      },
+    };
+    this.observation = {
+      ticket,
+      owner,
+      remaining: entry.demand,
+      committed: 0,
+      peak: 0,
+      pending: 0,
+      closed: false,
+      complete: false,
+      grew: false,
+    };
+    this.observations.started++;
+    return ticket;
+  }
+  private observationDeferred(retry: number) {
+    return new AgentError(
+      "VENUE_READ_BUDGET_EXHAUSTED",
+      "Complete account observation is queued before venue reads begin.",
+      true,
+      503,
+      { retry_after_ms: retry },
+    );
+  }
+  private finishObservation() {
+    const frame = this.observation;
+    if (!frame?.closed || frame.pending) return;
+    // Include a metadata miss margin. An expanding scope/history raises the
+    // high-water mark before admission and fails closed if it cannot fit.
+    const previous =
+      this.observationPlans.get(frame.owner)?.demand ??
+      (frame.complete ? 0 : this.limit);
+    this.observationPlans.set(frame.owner, {
+      demand: Math.min(
+        this.limit,
+        Math.max(120, previous, frame.peak + 20, frame.grew ? previous * 2 : 0),
+      ),
+      seen: this.clock(),
+    });
+    const queued = this.observationQueue.get(frame.owner);
+    if (queued) queued.demand = this.observationPlans.get(frame.owner)!.demand;
+    if (frame.complete) this.observations.completed++;
+    if (frame.grew) this.observations.growth++;
+    this.observation = undefined;
+    this.pump();
+  }
+  private protectedWeight(observation?: AccountReadReservation) {
+    if (this.observation)
+      return this.observation.ticket === observation
+        ? 0
+        : this.observation.remaining;
+    return this.observationQueue.values().next().value?.demand ?? 0;
   }
   cooldownRemaining() {
     return Math.max(0, Math.ceil(this.providerUntil - this.clock()));
@@ -191,6 +326,7 @@ export class VenueReadBudget {
     owner: string | undefined,
     signal: AbortSignal,
     unknownSurcharge = false,
+    observation?: AccountReadReservation,
   ): Promise<ReadTicket> {
     if (this.cooldownRemaining() > 0) return Promise.reject(this.coolingDown());
     if (
@@ -201,6 +337,19 @@ export class VenueReadBudget {
       this.queues.account.length + this.queues.source.length >= 256
     )
       return Promise.reject(this.denied(true));
+    if (
+      observation &&
+      (this.observation?.ticket !== observation || this.observation.closed)
+    )
+      return Promise.reject(this.observationDeferred(1000));
+    if (observation) {
+      const frame = this.observation!;
+      frame.peak = Math.max(frame.peak, frame.committed + cost);
+      if (cost > frame.remaining && this.used() + cost > this.limit) {
+        frame.grew = true;
+        return Promise.reject(this.denied(true, cost));
+      }
+    }
     const ownerKey = owner ?? "";
     {
       const owners = this.owners[lane];
@@ -227,6 +376,7 @@ export class VenueReadBudget {
         resolve,
         reject,
         budgetBlocked: false,
+        observation,
         cancel: () => {},
       };
       waiter.cancel = () => {
@@ -249,7 +399,12 @@ export class VenueReadBudget {
     this.pump();
   }
   private candidate(lane: ReadLane): Waiter | undefined {
-    const queue = this.queues[lane];
+    const queue =
+      lane === "account" && this.observation
+        ? this.queues.account.filter(
+            (w) => w.observation === this.observation!.ticket,
+          )
+        : this.queues[lane];
     if (!queue.length || this.active[lane] >= this.slots) return;
     const now = this.clock(),
       turn = this.turns[lane];
@@ -308,7 +463,13 @@ export class VenueReadBudget {
           this.candidate(first),
           this.candidate(first === "account" ? "source" : "account"),
         ];
-        const next = candidates.find(Boolean);
+        const next =
+          candidates.find(
+            (w) =>
+              w &&
+              w.observation === this.observation?.ticket &&
+              this.observation !== undefined,
+          ) ?? candidates.find(Boolean);
         if (!next) break;
         if (
           next.unknownSurcharge &&
@@ -317,7 +478,8 @@ export class VenueReadBudget {
           break;
         if (
           this.clock() < this.blockedUntil ||
-          this.used() + next.cost > this.limit
+          this.used() + next.cost + this.protectedWeight(next.observation) >
+            this.limit
         ) {
           // Do not endlessly backfill cheap source reads in front of a larger
           // account request. The next turn owns the next available capacity.
@@ -329,11 +491,22 @@ export class VenueReadBudget {
         next.signal.removeEventListener("abort", next.cancel);
         const charge: Charge = {
           at: this.clock(),
-          weight: next.unknownSurcharge ? this.limit - this.used() : next.cost,
+          weight: next.unknownSurcharge
+            ? this.limit - this.used() - this.protectedWeight(next.observation)
+            : next.cost,
           sent: false,
           settled: false,
         };
         this.charges.push(charge);
+        const frame = next.observation ? this.observation! : undefined;
+        const held = frame ? Math.min(frame.remaining, charge.weight) : 0;
+        const measured = next.unknownSurcharge ? next.cost : charge.weight;
+        if (frame) {
+          frame.remaining -= held;
+          frame.committed += measured;
+          frame.peak = Math.max(frame.peak, frame.committed);
+          frame.pending++;
+        }
         this.active[next.lane]++;
         this.lastLane = next.lane;
         const turn = this.turns[next.lane];
@@ -353,6 +526,10 @@ export class VenueReadBudget {
           this.owners[next.lane].get(next.owner)!.pending -= reservation;
           if (next.unknownSurcharge)
             this.blockedUntil = Math.max(this.blockedUntil, charge.at + 60000);
+          if (frame && next.unknownSurcharge) {
+            frame.committed += charge.weight - measured;
+            frame.peak = Math.max(frame.peak, frame.committed);
+          }
         };
         next.resolve({
           reservation,
@@ -375,6 +552,11 @@ export class VenueReadBudget {
             charge.weight = weight;
             charge.settled = true;
             charge.at = this.clock();
+            if (frame) {
+              frame.committed += weight - measured;
+              frame.remaining += Math.max(0, held - weight);
+              frame.peak = Math.max(frame.peak, frame.committed);
+            }
             this.owners[next.lane].get(next.owner)!.served -= refund;
             this.owners[next.lane].get(next.owner)!.pending -= reservation;
             if (turn) turn.served -= refund;
@@ -390,10 +572,18 @@ export class VenueReadBudget {
               this.owners[next.lane].get(next.owner)!.served -= charge.weight;
               this.owners[next.lane].get(next.owner)!.pending -= reservation;
               if (turn) turn.served -= charge.weight;
+              if (frame) {
+                frame.committed -= measured;
+                frame.remaining += held;
+              }
             }
             this.active[next.lane]--;
             if (this.exclusive === charge) this.exclusive = undefined;
             if (turn) turn.lastActivity = this.clock();
+            if (frame) {
+              frame.pending--;
+              this.finishObservation();
+            }
             this.pump();
           },
         });
@@ -410,6 +600,10 @@ export class VenueReadBudget {
         const grace = Object.values(this.turns)
           .filter((t) => now - t.lastActivity < 2)
           .reduce((n, t) => Math.min(n, t.lastActivity + 2), expiry);
+        const interestExpiry = [...this.observationQueue.values()].reduce(
+          (n, e) => Math.min(n, e.seen + 120000),
+          expiry,
+        );
         this.wake = this.timers.setTimeout(
           () => this.pump(),
           Math.max(
@@ -418,6 +612,7 @@ export class VenueReadBudget {
               expiry,
               turnExpiry,
               grace,
+              interestExpiry,
               this.blockedUntil > now ? this.blockedUntil : expiry,
             ) - now,
           ),

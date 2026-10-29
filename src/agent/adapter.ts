@@ -161,6 +161,35 @@ function validBridgeResponse(operation: string, data: unknown): boolean {
   );
 }
 
+function transportUnavailable(): AgentError {
+  return new AgentError(
+    "EXECUTOR_UNAVAILABLE",
+    "Execution boundary did not respond; pending submissions remain unresolved.",
+    true,
+    503,
+  );
+}
+
+async function withBridgeDeadline<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    void work.catch(() => {});
+    throw signal.reason;
+  }
+  let abort!: () => void;
+  const cancelled = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await Promise.race([work, cancelled]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
 // Private, authenticated execution boundary. It holds Core S2S identity, never
 // signing secrets. Its responses are normalized; machine routes cannot confirm.
 export class BridgeAdapter implements VenueAdapter {
@@ -187,35 +216,38 @@ export class BridgeAdapter implements VenueAdapter {
     if (!token) throw new Error("Missing executor service token");
   }
   private async call<T>(operation: string, input: unknown): Promise<T> {
+    // The complete account observation is bounded at 20s inside the bridge.
+    // Leave transport margin for its typed failure and retry hint to arrive.
+    const signal = AbortSignal.timeout(
+      operation.startsWith("funding_")
+        ? 90000
+        : ["account", "preflight", "bind"].includes(operation)
+          ? 25000
+          : 20000,
+    );
     let response: Response;
     try {
-      response = await fetch(
-        new URL(`/internal/agent/${operation}`, this.url),
-        {
+      response = await withBridgeDeadline(
+        fetch(new URL(`/internal/agent/${operation}`, this.url), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.token}`,
           },
           body: JSON.stringify(bridgeInput(input)),
-          signal: AbortSignal.timeout(
-            operation.startsWith("funding_") ? 90000 : 20000,
-          ),
+          signal,
           redirect: "error",
-        },
+        }),
+        signal,
       );
     } catch {
-      throw new AgentError(
-        "EXECUTOR_UNAVAILABLE",
-        "Execution boundary did not respond; pending submissions remain unresolved.",
-        true,
-        503,
-      );
+      throw transportUnavailable();
     }
     let data: unknown;
     try {
-      data = await response.json();
+      data = await withBridgeDeadline(response.json(), signal);
     } catch {
+      if (signal.aborted) throw transportUnavailable();
       throw invalidBridgeResponse(response);
     }
     if (record(data) && "error" in data) {

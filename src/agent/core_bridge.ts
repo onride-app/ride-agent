@@ -872,8 +872,22 @@ export class CoreBridge {
     p: Portfolio | null,
     bind = false,
   ): Promise<AccountSnapshot> {
-    return this.venueReads.observeAccount(() =>
-      this.readPerpsAccount(user, p, bind),
+    return this.venueReads.observeAccount(
+      () => this.readPerpsAccount(user, p, bind),
+      fingerprint([
+        user,
+        this.network,
+        p?.venue_accounts?.perps ?? p?.account_id,
+        bind,
+        Boolean(p?.ledger_started_at),
+        [
+          ...new Set(
+            (p?.sleeves ?? [])
+              .flatMap((s) => s.trader.assets)
+              .filter((asset) => asset.includes(":")),
+          ),
+        ].sort(),
+      ]),
     );
   }
   private async readPerpsAccount(
@@ -1208,7 +1222,7 @@ export class CoreBridge {
       venue_accounts: { perps: accountId },
       available_by_market: { perps: available },
       available_by_scope: scopedAvailable,
-      observed_at: now(),
+      observed_at: this.venueReads.accountObservedAt(),
       account_value_usdc: accountValue,
       available_usdc: available,
       dedicated:

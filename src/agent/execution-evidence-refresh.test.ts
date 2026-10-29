@@ -84,6 +84,61 @@ function execution(
     error: null,
   };
 }
+
+for (const outcome of [
+  "fresh",
+  "still stale",
+  "account expired",
+  "stale position",
+])
+  it(`refreshes a source that aged during the account read: ${outcome}`, async (t) => {
+    let clock = 1793200000000;
+    t.mock.method(Date, "now", () => clock);
+    const f = await runnerFixture();
+    const before = structuredClone((await f.read()).sleeves[0].intents);
+    let reads = 0;
+    f.adapter.source = async () => {
+      reads++;
+      if (reads === 2 && outcome === "account expired") clock += 25000;
+      const value = source();
+      if (reads === 2) {
+        if (outcome === "still stale") {
+          value.observed_at -= 6000;
+          value.positions[0].observed_at -= 6000;
+        }
+        if (outcome === "stale position")
+          value.positions[0].observed_at -= 6000;
+      }
+      return value;
+    };
+    f.adapter.account = async () => {
+      // observeSources already captured its first result before this wait.
+      await Promise.resolve();
+      clock += 20000;
+      return { ...snapshot(), observed_at: clock - 10000 };
+    };
+    await f.runner.tick("alice");
+    const saved = await f.read();
+    assert.equal(reads, 2);
+    assert.equal(f.adapter.submitCount, outcome === "fresh" ? 1 : 0);
+    if (outcome !== "fresh") assert.deepEqual(saved.sleeves[0].intents, before);
+    else {
+      assert.equal(
+        saved.sleeves[0].intents[key].quantity,
+        before[key].quantity,
+      );
+      assert.equal(saved.sleeves[0].intents[key].price, before[key].price);
+    }
+    if (outcome === "fresh") {
+      assert.equal(saved.last_error, undefined);
+      assert.equal(saved.sleeves[0].last_source_at, clock);
+    } else {
+      assert.equal(
+        saved.last_error?.code,
+        outcome === "account expired" ? "ACCOUNT_STALE" : "SOURCE_STALE",
+      );
+    }
+  });
 function bridgeFixture() {
   const bridge = new CoreBridge(
     "https://core.test",

@@ -306,13 +306,31 @@ export class AgentRunner {
               }
             }
             if (p.reconciliation !== "complete" && s.initialized) continue;
-            const observation = await sources.get(s.trader.id);
+            let observation = await sources.get(s.trader.id);
             if (!observation.ok) throw observation.error;
+            // Collection overlaps the complete account read. Its first result
+            // may have expired while that read was queued or in flight.
+            if (!fresh(observation.value.observed_at, 5000)) {
+              const value = await adapter.source(s.trader);
+              observation = { ok: true, value };
+            }
             const source = observation.value;
-            if (!sourceEvidenceReady(source))
+            if (
+              !sourceEvidenceReady(source) ||
+              !fresh(source.observed_at, 5000) ||
+              source.positions.some(
+                (position) => !fresh(position.observed_at, 5000),
+              )
+            )
               throw new AgentError(
                 "SOURCE_STALE",
                 "Source coverage or equity is incomplete.",
+                true,
+              );
+            if (!fresh(snap.observed_at))
+              throw new AgentError(
+                "ACCOUNT_STALE",
+                "Account evidence expired while refreshing the source observation.",
                 true,
               );
             s.last_source_at = source.observed_at;
@@ -943,7 +961,12 @@ export class AgentRunner {
           // beyond the database idle timeout. SourceFeed keeps sampling.
           for (const sleeve of p.sleeves) {
             const at = this.sourceTimes.get(sleeve.trader.id);
-            if (at != null && fresh(at)) sleeve.last_source_at = at;
+            if (
+              at != null &&
+              fresh(at, 5000) &&
+              at > (sleeve.last_source_at ?? 0)
+            )
+              sleeve.last_source_at = at;
           }
         }
         recordPerformance(state, p);
@@ -1078,26 +1101,85 @@ export class AgentRunner {
     });
   }
   async run(signal: AbortSignal, intervalMs = 5000): Promise<void> {
-    while (!signal.aborted) {
-      for (const user of await this.service.repository.users()) {
-        if (signal.aborted) break;
-        try {
-          await this.tick(user);
-        } catch {
-          if (!signal.aborted)
-            console.error("Rider monitoring cycle failed; retained for retry.");
+    const users = new Map<
+        string,
+        { due: number; running: boolean; present: boolean }
+      >(),
+      inFlight = new Set<Promise<void>>();
+    let nextDiscovery = 0,
+      wake = () => {};
+    try {
+      while (!signal.aborted) {
+        if (now() >= nextDiscovery) {
+          const discovered = new Set(await this.service.repository.users());
+          nextDiscovery = now() + intervalMs;
+          for (const [user, entry] of users) {
+            entry.present = discovered.has(user);
+            if (!entry.present && !entry.running) users.delete(user);
+          }
+          for (const user of discovered)
+            if (!users.has(user))
+              users.set(user, { due: now(), running: false, present: true });
         }
+        while (!signal.aborted && inFlight.size < 2) {
+          // Keep a slow user's transaction from delaying every other user.
+          // Oldest due time wins; Map order breaks ties without overlapping
+          // callbacks for the same user or bypassing tick's PostgreSQL lock.
+          const ready = [...users].filter(
+            ([, entry]) =>
+              entry.present && !entry.running && entry.due <= now(),
+          );
+          ready.sort((a, b) => a[1].due - b[1].due);
+          const next = ready[0];
+          if (!next) break;
+          const [user, entry] = next;
+          entry.running = true;
+          let task!: Promise<void>;
+          task = Promise.resolve().then(async () => {
+            try {
+              if (signal.aborted) return;
+              await this.tick(user);
+            } catch {
+              if (!signal.aborted)
+                console.error(
+                  "Rider monitoring cycle failed; retained for retry.",
+                );
+            } finally {
+              entry.running = false;
+              entry.due = now() + intervalMs;
+              if (!entry.present) users.delete(user);
+              inFlight.delete(task);
+              wake();
+            }
+          });
+          inFlight.add(task);
+        }
+        if (signal.aborted) break;
+        const nextDue = Math.min(
+          nextDiscovery,
+          ...[...users.values()]
+            .filter(
+              (entry) => inFlight.size < 2 && entry.present && !entry.running,
+            )
+            .map((entry) => entry.due),
+        );
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer);
+            signal.removeEventListener("abort", done);
+            wake = () => {};
+            resolve();
+          };
+          const timer = setTimeout(done, Math.max(0, nextDue - now()));
+          wake = done;
+          signal.addEventListener("abort", done, { once: true });
+          if (signal.aborted) done();
+        });
       }
-      if (signal.aborted) break;
-      await new Promise<void>((resolve) => {
-        const done = () => {
-          clearTimeout(timer);
-          signal.removeEventListener("abort", done);
-          resolve();
-        };
-        const timer = setTimeout(done, intervalMs);
-        signal.addEventListener("abort", done, { once: true });
-      });
+    } finally {
+      // Shutdown stops admission immediately and preserves durable completion
+      // of transactions and external-effect reconciliation already in flight.
+      await Promise.all(inFlight);
     }
   }
 }
