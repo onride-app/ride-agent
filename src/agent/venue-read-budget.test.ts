@@ -94,6 +94,51 @@ function setup(limit = 1000, fetcher?: typeof fetch) {
   return { time, budget, reads, attempts, reports };
 }
 
+it("retry advice waits for enough expiring weight to fit the denied reservation", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    limit: 130,
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const charge = async (weight: number) => {
+    const ticket = await budget.acquire(
+      "account",
+      weight,
+      "a",
+      new AbortController().signal,
+    );
+    ticket.sent();
+    ticket.settle(weight);
+    ticket.release();
+  };
+  await charge(2);
+  await time.advance(10000);
+  await charge(120);
+  await time.advance(10000);
+  const controller = new AbortController();
+  const denied = budget
+    .acquire("account", 60, "a", controller.signal)
+    .catch((e) => e);
+  controller.abort();
+  const error = await denied;
+  assert.equal(error.code, "VENUE_READ_BUDGET_EXHAUSTED");
+  // The first charge expires in 40s, but only the 120-weight expiry in 50s
+  // leaves room for this 60-weight request.
+  assert.equal(error.details.retry_after_ms, 50000);
+});
+
+it("retry advice includes a response-contract quarantine even when capacity is free", async () => {
+  const f = setup();
+  f.budget.quarantine();
+  const controller = new AbortController();
+  const denied = f.budget
+    .acquire("account", 2, "a", controller.signal)
+    .catch((e) => e);
+  controller.abort();
+  assert.equal((await denied).details.retry_after_ms, 60000);
+});
+
 it("reserves complete documented response costs before fetch and refunds only unused surcharge", async () => {
   const time = new FakeTime(),
     budget = new VenueReadBudget({

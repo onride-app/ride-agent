@@ -43,6 +43,12 @@ export class AgentRunner {
     // erase a possibly submitted execution identifier or its frozen payload.
     await repository.transact(user, async (state) => {
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
+        // A rejected read already tells us when capacity can return. Starting
+        // another full account pipeline every five seconds consumes scarce
+        // weight on partial observations before it can possibly finish.
+        // This uses persisted error data, so a runner restart cannot bypass
+        // the delay. Durable submission reconciliation below still runs.
+        if (venueReadRetryPending(p)) continue;
         const sources = observeSources(
           adapter,
           p.sleeves.filter((s) => s.state !== "closed").map((s) => s.trader),
@@ -1094,6 +1100,24 @@ export class AgentRunner {
       });
     }
   }
+}
+function venueReadRetryPending(p: Portfolio): boolean {
+  const error = p.last_error;
+  if (
+    !error?.retryable ||
+    !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(error.code)
+  )
+    return false;
+  const delay = error.details?.retry_after_ms;
+  return (
+    Number.isSafeInteger(error.at) &&
+    error.at <= now() &&
+    typeof delay === "number" &&
+    Number.isSafeInteger(delay) &&
+    delay > 0 &&
+    delay <= 60000 &&
+    now() - error.at < delay
+  );
 }
 function unadmittedSuppressedShadow(
   p: Portfolio,

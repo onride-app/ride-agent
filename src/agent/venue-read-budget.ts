@@ -161,10 +161,23 @@ export class VenueReadBudget {
   noteSuccess() {
     if (this.cooldownRemaining() === 0) this.providerFailures = 0;
   }
-  private denied(budget: boolean) {
-    const next = this.charges
+  private denied(budget: boolean, cost = 1) {
+    const at = this.clock();
+    this.prune();
+    let remaining = this.used();
+    let next = at;
+    // Expiring one cheap request may still leave no room for this request's
+    // full reservation. Advise the first expiry that can admit its whole cost,
+    // not the first expiry in the window (which caused premature retries).
+    for (const charge of this.charges
       .filter((c) => c.sent && c.settled)
-      .reduce((n, c) => Math.min(n, c.at + 60000), this.clock() + 60000);
+      .sort((a, b) => a.at - b.at)) {
+      if (remaining + cost <= this.limit) break;
+      remaining -= charge.weight;
+      next = charge.at + 60000;
+    }
+    if (remaining + cost > this.limit) next = at + 60000;
+    next = Math.max(next, this.blockedUntil);
     return new AgentError(
       budget ? "VENUE_READ_BUDGET_EXHAUSTED" : "VENUE_READ_DEADLINE",
       budget
@@ -173,10 +186,7 @@ export class VenueReadBudget {
       true,
       503,
       {
-        retry_after_ms: Math.min(
-          60000,
-          Math.max(1, Math.ceil(next - this.clock())),
-        ),
+        retry_after_ms: Math.min(60000, Math.max(1, Math.ceil(next - at))),
       },
     );
   }
@@ -229,7 +239,7 @@ export class VenueReadBudget {
         if (index < 0) return;
         this.queues[lane].splice(index, 1);
         signal.removeEventListener("abort", waiter.cancel);
-        reject(this.denied(waiter.budgetBlocked));
+        reject(this.denied(waiter.budgetBlocked, waiter.cost));
         this.pump();
       };
       this.queues[lane].push(waiter);
