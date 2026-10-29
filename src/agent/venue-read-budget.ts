@@ -66,7 +66,6 @@ export class VenueReadBudget {
   private blockedUntil = 0;
   private exclusive?: Charge;
   private providerUntil = 0;
-  private providerFailures = 0;
   private turnSequence = 0;
   constructor(
     options: {
@@ -140,14 +139,13 @@ export class VenueReadBudget {
     );
   }
   note429(retryMs: number) {
-    this.providerFailures = Math.min(5, this.providerFailures + 1);
+    // A provider 429 proves that its shared IP window is unavailable even if
+    // our process-local ledger has room. Do not probe after only 1–16 seconds,
+    // or treat an unrelated in-flight success as a reset of that whole window.
+    const providerWait = Number.isFinite(retryMs) ? Math.max(0, retryMs) : 0;
     this.providerUntil = Math.max(
       this.providerUntil,
-      this.clock() +
-        Math.max(
-          Math.min(60000, 1000 * 2 ** (this.providerFailures - 1)),
-          retryMs,
-        ),
+      this.clock() + Math.max(60000, providerWait),
     );
     for (const lane of ["account", "source"] as const) {
       for (const waiter of this.queues[lane]) {
@@ -157,9 +155,6 @@ export class VenueReadBudget {
       this.queues[lane] = [];
     }
     this.pump();
-  }
-  noteSuccess() {
-    if (this.cooldownRemaining() === 0) this.providerFailures = 0;
   }
   private denied(budget: boolean, cost = 1) {
     const at = this.clock();

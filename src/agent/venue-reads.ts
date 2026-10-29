@@ -60,6 +60,7 @@ export interface VenueReadOptions {
   budget?: VenueReadBudget;
   timers?: BudgetTimers;
   deadlineMs?: number;
+  signal?: AbortSignal;
   report?: (record: Record<string, unknown>) => void;
 }
 
@@ -71,6 +72,7 @@ export class VenueReads {
   private readonly budget: VenueReadBudget;
   private readonly timers: BudgetTimers;
   private readonly deadlineMs: number;
+  private readonly callerSignal?: AbortSignal;
   private readonly report: NonNullable<VenueReadOptions["report"]>;
   private counts = counters();
   private byMethod = new Map<string, Counters>();
@@ -88,6 +90,7 @@ export class VenueReads {
     this.budget = options.budget ?? sharedVenueReadBudget;
     this.timers = options.timers ?? readTimers;
     this.deadlineMs = options.deadlineMs ?? 12000;
+    this.callerSignal = options.signal;
     if (
       !Number.isSafeInteger(this.deadlineMs) ||
       this.deadlineMs < 1 ||
@@ -212,6 +215,7 @@ export class VenueReads {
       method = cost.method;
       this.count(method, lane, "calls");
       this.accountReadTimeout();
+      if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       this.checkCooldown(method, lane);
       const key = JSON.stringify([url, payload]),
         // A failed observation may cancel only its own queued work, never a
@@ -308,9 +312,12 @@ export class VenueReads {
     const user = (payload as { user?: unknown })?.user;
     const owner = typeof user === "string" && user.length ? user : undefined;
     const scope = this.accountScope.getStore();
-    const admissionSignal = scope
-      ? AbortSignal.any([signal, scope.admission.signal])
+    const requestSignal = this.callerSignal
+      ? AbortSignal.any([signal, this.callerSignal])
       : signal;
+    const admissionSignal = scope
+      ? AbortSignal.any([requestSignal, scope.admission.signal])
+      : requestSignal;
     try {
       ticket = await this.budget.acquire(
         lane,
@@ -338,7 +345,7 @@ export class VenueReads {
           ),
         this.accountReadTimeout(this.deadlineMs),
       );
-      wireSignal = AbortSignal.any([signal, wire.signal]);
+      wireSignal = AbortSignal.any([requestSignal, wire.signal]);
       ticket.sent();
       sent = true;
       this.count(cost.method, lane, "actual_fetch");
@@ -423,9 +430,9 @@ export class VenueReads {
           actual - ticket.reservation,
         );
       }
-      this.budget.noteSuccess();
       return data;
     } catch (error) {
+      if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       if (
         error instanceof AgentError &&
         error.code === "VENUE_READ_BUDGET_EXHAUSTED"

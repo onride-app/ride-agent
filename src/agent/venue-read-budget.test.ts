@@ -666,6 +666,154 @@ for (const problem of ["transport", "malformed", "deadline"])
     assert.equal((await denied).code, "VENUE_READ_BUDGET_EXHAUSTED");
   });
 
+it("a caller deadline cancels queued admission without sending or charging a new read", async () => {
+  const f = setup();
+  const ticket = await f.budget.acquire(
+    "account",
+    1000,
+    "prior",
+    new AbortController().signal,
+  );
+  ticket.sent();
+  ticket.settle(1000);
+  ticket.release();
+  const controller = new AbortController();
+  let calls = 0;
+  const reads = new VenueReads(
+    (async () => {
+      calls++;
+      return Response.json({});
+    }) as typeof fetch,
+    f.time.clock,
+    2,
+    {
+      budget: f.budget,
+      timers: f.time.timers,
+      signal: controller.signal,
+    },
+  );
+  const work = reads
+    .read("https://venue.test/info", { type: "meta" })
+    .catch((e) => e);
+  await f.time.advance(5);
+  const cause = new Error("caller deadline");
+  controller.abort(cause);
+  await flush();
+  assert.equal(await work, cause);
+  assert.equal(calls, 0);
+  assert.equal(f.budget.snapshot().used, 1000);
+  assert.equal(f.budget.snapshot().account_queued, 0);
+});
+
+it("a caller deadline also bounds in-flight JSON without publishing a late value", async () => {
+  const f = setup();
+  const controller = new AbortController();
+  const reads = new VenueReads(
+    (async () =>
+      new Response(new ReadableStream({ start() {} }))) as typeof fetch,
+    f.time.clock,
+    2,
+    {
+      budget: f.budget,
+      timers: f.time.timers,
+      signal: controller.signal,
+    },
+  );
+  const work = reads
+    .read("https://venue.test/info", { type: "meta" })
+    .catch((e) => e);
+  await f.time.advance(5);
+  const cause = new Error("caller deadline");
+  controller.abort(cause);
+  await flush();
+  assert.equal(await work, cause);
+  assert.equal(f.budget.snapshot().used, 20);
+  assert.equal(f.budget.snapshot().account_active, 0);
+});
+
+for (const retryAfter of [undefined, "2"]) {
+  it(`a 429 with ${retryAfter ?? "no"} Retry-After stops both lanes for a full minute`, async () => {
+    const time = new FakeTime();
+    const budget = new VenueReadBudget({
+      clock: time.clock,
+      timers: time.timers,
+    });
+    let calls = 0;
+    const fetcher = (async () => {
+      calls++;
+      return calls === 1
+        ? new Response("", {
+            status: 429,
+            headers: retryAfter ? { "retry-after": retryAfter } : {},
+          })
+        : new Response("{}");
+    }) as typeof fetch;
+    const a = new VenueReads(fetcher, time.clock, 2, {
+      budget,
+      timers: time.timers,
+    });
+    const b = new VenueReads(fetcher, time.clock, 2, {
+      budget,
+      timers: time.timers,
+    });
+    const error = await time.resolve(
+      a.read("https://venue.test/info", { type: "allMids" }).catch((e) => e),
+    );
+    assert.equal(error.code, "VENUE_RATE_LIMITED");
+    assert.equal(error.details.retry_after_ms, 60000);
+    await time.advance(59999 - time.at);
+    await assert.rejects(
+      b.read("https://venue.test/info", { type: "meta" }, 0, "source"),
+      { code: "VENUE_RATE_LIMITED" },
+    );
+    assert.equal(
+      calls,
+      1,
+      "neither lane may probe into the rejected IP quota window",
+    );
+    await time.advance(1);
+    await time.resolve(
+      b.read("https://venue.test/info", { type: "meta" }, 0, "source"),
+    );
+    assert.equal(calls, 2);
+  });
+}
+
+it("a late successful response cannot reopen a quota window rejected by 429", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  let calls = 0;
+  const fetcher = (async (_url, init) => {
+    calls++;
+    const type = JSON.parse(String(init?.body)).type;
+    if (type === "meta")
+      return new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("{}")), 1500),
+      );
+    return new Response("", { status: 429 });
+  }) as typeof fetch;
+  const reads = new VenueReads(fetcher, time.clock, 2, {
+    budget,
+    timers: time.timers,
+  });
+  const slowSuccess = reads.read("https://venue.test/info", { type: "meta" });
+  const limited = reads
+    .read("https://venue.test/info", { type: "allMids" }, 0, "source")
+    .catch((e) => e);
+  await time.advance(2000);
+  assert.equal((await limited).code, "VENUE_RATE_LIMITED");
+  assert.deepEqual(await slowSuccess, {});
+  await assert.rejects(
+    reads.read("https://venue.test/info", { type: "allMids" }),
+    { code: "VENUE_RATE_LIMITED" },
+  );
+  assert.equal(calls, 2);
+  assert.equal(budget.snapshot().provider_cooldown_ms, 58000);
+});
+
 it("shares long Retry-After across instances and hosts while serializing a bounded wire retry hint", async () => {
   const time = new FakeTime(),
     budget = new VenueReadBudget({ clock: time.clock, timers: time.timers });

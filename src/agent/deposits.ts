@@ -3,6 +3,7 @@ import { Contract, JsonRpcProvider, FetchRequest, id as eventId } from "ethers";
 import { AgentError } from "./contracts.js";
 import { cash, D, uid, now } from "./domain.js";
 import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
+import { VenueReads } from "./venue-reads.js";
 
 export interface Deposit {
   id: string;
@@ -54,6 +55,7 @@ export class DepositReads {
     private core: (operation: string, input: unknown) => Promise<any>,
     private network: "mainnet" | "testnet",
     private request = fetch,
+    private venueReads = new VenueReads(request),
   ) {}
   private async bridge(path: string, body?: unknown): Promise<any> {
     const response = await this.request(`${bridgeUrl}/${path}`, {
@@ -148,23 +150,20 @@ export class DepositReads {
   }
   private async tradingInfo(type: string, user: string): Promise<any> {
     try {
-      const response = await this.request("https://api.hyperliquid.xyz/info", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type, user }),
-        signal: AbortSignal.timeout(12000),
-        redirect: "error",
-      });
-      if (!response.ok)
-        throw new AgentError(
-          "TRADING_BALANCE_UNAVAILABLE",
-          "Trading balance could not be verified. Retry the status read; do not repeat a transfer.",
-          true,
-          503,
-        );
-      return await response.json();
+      return await this.venueReads.read(
+        this.network === "mainnet"
+          ? "https://api.hyperliquid.xyz/info"
+          : "https://api.hyperliquid-testnet.xyz/info",
+        { type, user },
+      );
     } catch (error) {
-      if (error instanceof AgentError) throw error;
+      // Keep the funding balance error contract for failed/invalid transport,
+      // but preserve shared admission and cooldown hints for callers.
+      if (
+        error instanceof AgentError &&
+        !["VENUE_UNAVAILABLE", "VENUE_RESPONSE_INVALID"].includes(error.code)
+      )
+        throw error;
       throw new AgentError(
         "TRADING_BALANCE_UNAVAILABLE",
         "Trading balance could not be verified. Retry the status read; do not repeat a transfer.",

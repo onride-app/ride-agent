@@ -1766,16 +1766,22 @@ export class CoreBridge {
         return new DepositReads(
           (op, input) => this.core(op, input),
           this.network,
+          fetch,
+          this.venueReads,
         ).options();
       case "deposit_address":
         return new DepositReads(
           (op, input) => this.core(op, input),
           this.network,
+          fetch,
+          this.venueReads,
         ).address(input.user_id, input.input, input.portfolio_id);
       case "deposit_status": {
         const status = await new DepositReads(
           (op, input) => this.core(op, input),
           this.network,
+          fetch,
+          this.venueReads,
         ).status(input.deposit, input.user_id);
         if (input.deposit.provider === "polymarket_bridge") {
           const balance = await this.prediction.fundingBalance(input.user_id);

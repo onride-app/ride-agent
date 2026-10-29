@@ -195,7 +195,7 @@ it("shares Retry-After cooldown across source/account lanes without retry storms
       key: "account",
     }),
     (e: any) =>
-      e.code === "VENUE_RATE_LIMITED" && e.details.retry_after_ms === 5000,
+      e.code === "VENUE_RATE_LIMITED" && e.details.retry_after_ms === 60000,
   );
   await assert.rejects(
     reads.read(
@@ -208,6 +208,21 @@ it("shares Retry-After cooldown across source/account lanes without retry storms
   );
   assert.equal(count, 1);
   clock += 5001;
+  await assert.rejects(
+    reads.read(
+      "https://venue.test/info",
+      { type: "clearinghouseState", key: "source" },
+      0,
+      "source",
+    ),
+    /cooling down/,
+  );
+  assert.equal(
+    count,
+    1,
+    "a short Retry-After cannot reopen the shared minute window",
+  );
+  clock += 55000;
   await reads.read(
     "https://venue.test/info",
     { type: "clearinghouseState", key: "source" },

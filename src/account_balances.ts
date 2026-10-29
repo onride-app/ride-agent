@@ -1,5 +1,6 @@
 import { D, cash, fingerprint } from "./agent/domain.js";
 import { AgentError } from "./agent/contracts.js";
+import { VenueReads } from "./agent/venue-reads.js";
 
 const address = (v: unknown): v is string =>
   typeof v === "string" && /^0x[a-fA-F0-9]{40}$/.test(v);
@@ -33,9 +34,16 @@ export async function readAccountBalances(
   graphql: string,
   token: string,
   request: typeof fetch = fetch,
+  venueReads?: VenueReads,
 ) {
   // Pagination and wallet reads share one deadline, below the widget tool timeout.
   const deadline = AbortSignal.timeout(22000);
+  const publicVenueReads =
+    venueReads ??
+    new VenueReads(request, Date.now, 2, {
+      deadlineMs: 10000,
+      signal: deadline,
+    });
   const query = async (document: string, embedded = false) => {
     const response = await request(graphql, {
       method: "POST",
@@ -63,11 +71,7 @@ export async function readAccountBalances(
     return response.json() as Promise<any>;
   };
   const info = (body: unknown) =>
-    publicJson("https://api.hyperliquid.xyz/info", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    publicVenueReads.read("https://api.hyperliquid.xyz/info", body);
   const me = (
     await query(
       "query RideBalanceIdentity { me { id username proxyWalletAddress legacyProxyWalletAddress } }",
