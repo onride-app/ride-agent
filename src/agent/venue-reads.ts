@@ -18,6 +18,7 @@ type AccountReadScope = {
   admission: AbortController;
   owner?: string;
   reservation?: AccountReadReservation;
+  reservationPromise?: Promise<AccountReadReservation>;
   admissionError?: unknown;
   observedAt?: number;
 };
@@ -222,6 +223,55 @@ export class VenueReads {
     if (left <= 0) throw this.accountDeadline();
     return Math.min(maximum, left);
   }
+  private async reserveObservation(
+    scope: AccountReadScope,
+  ): Promise<AccountReadReservation> {
+    // A near-ready FIFO slot should not be lost to a complete monitor cycle's
+    // reconciliation and commit work. Wait only before the first venue read,
+    // for at most one second in total, inside the original account deadline.
+    // No frame or provisional weight is held while waiting; every recheck must
+    // pass the same whole-observation admission gate again.
+    const until = Math.min(scope.until, this.clock() + 1000);
+    const signal = this.callerSignal
+      ? AbortSignal.any([scope.admission.signal, this.callerSignal])
+      : scope.admission.signal;
+    let deferred: unknown;
+    for (;;) {
+      if (signal.aborted) throw signal.reason;
+      this.accountReadTimeout();
+      if (deferred && this.clock() > until) throw deferred;
+      try {
+        return this.budget.beginObservation(scope.owner!);
+      } catch (error) {
+        const retry =
+          error instanceof AgentError &&
+          error.code === "VENUE_READ_BUDGET_EXHAUSTED"
+            ? error.details?.retry_after_ms
+            : undefined;
+        if (
+          typeof retry !== "number" ||
+          !Number.isSafeInteger(retry) ||
+          retry < 1 ||
+          retry > until - this.clock()
+        )
+          throw error;
+        deferred = error;
+        await new Promise<void>((resolve, reject) => {
+          const cancel = () => {
+            this.timers.clearTimeout(timer);
+            signal.removeEventListener("abort", cancel);
+            reject(signal.reason);
+          };
+          const timer = this.timers.setTimeout(() => {
+            signal.removeEventListener("abort", cancel);
+            resolve();
+          }, retry);
+          signal.addEventListener("abort", cancel, { once: true });
+          if (signal.aborted) cancel();
+        });
+      }
+    }
+  }
   async read(
     url: string,
     payload: unknown,
@@ -240,13 +290,26 @@ export class VenueReads {
       if (scope?.owner && !scope.reservation) {
         if (scope.admissionError) throw scope.admissionError;
         try {
-          scope.reservation = this.budget.beginObservation(scope.owner);
+          scope.reservationPromise ??= this.reserveObservation(scope);
+          scope.reservation = await scope.reservationPromise;
         } catch (error) {
           scope.admissionError = error;
-          this.count(method, lane, "local_budget_denied");
+          if (error instanceof AgentError) {
+            if (error.code === "VENUE_READ_BUDGET_EXHAUSTED")
+              this.count(method, lane, "local_budget_denied");
+            else if (error.code === "VENUE_READ_DEADLINE")
+              this.count(method, lane, "local_deadline_denied");
+            else if (error.code === "VENUE_RATE_LIMITED")
+              this.count(method, lane, "local_cooldown_denied");
+          }
           throw error;
         }
       }
+      // Admission may now yield even when the gate was immediately ready.
+      // Revalidate before returning cached metadata as well as before dispatch.
+      this.accountReadTimeout();
+      if (this.callerSignal?.aborted) throw this.callerSignal.reason;
+      this.checkCooldown(method, lane);
       const key = JSON.stringify([url, payload]),
         // A failed observation may cancel only its own queued work, never a
         // different caller that joined the same account request.

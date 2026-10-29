@@ -33,6 +33,21 @@ This is a bounded fairness exception, not a guarantee that real public fees
 cannot delay a later account observation. Ordinary admission retains its
 existing rules rather than gaining a separate hard public-lane limit.
 
+Before the first venue request, a complete account observation may now wait
+locally for a valid short budget hint. The cumulative wait is at most one
+second, inside the original 20-second account scope; longer or invalid hints
+return the existing typed error immediately. Parallel first reads share one
+admission promise. Every wakeup checks cancellation, the original scope
+boundary, the fixed local-wait boundary, FIFO order, provider cooldown and full
+real capacity again. No frame or provisional weight is held during that wait.
+Admission is revalidated before even cached metadata can be returned.
+
+This avoids losing a near-ready slot to an entire subsequent reconciliation
+cycle. Account pacing still starts from actual admission, and source reads keep
+their original deadlines. Financial timestamps remain the earliest actual
+evidence time, excluding the local queue wait. Idle time grants no pacing
+credit; neither unknown-response charges nor completed evidence are refunded.
+
 ## Monitor transaction boundaries
 
 The monitor separates account publication from public-source planning:
@@ -105,3 +120,47 @@ this change.
 The limiter is process-local. Multiple pods or other callers sharing the venue
 IP still require fleet-level coordination; these fixes do not establish a
 shared distributed budget or monitor lease.
+
+## Hosted follow-up on 2026-10-29
+
+At revision `6b29e41`, all 812 isolated-PostgreSQL tests, 53 functional
+checks, type verification, package verification and the exact-revision CI run
+passed. The hosted acceptance still failed the unchanged 30-second snapshot
+requirement. After a bridge-only static outbound assignment and redeployment
+of the same tested build, five complete warm quota windows had genuine reads
+and no 429, deadline or transport failures. This is an observed recovery, not
+proof of a dedicated address or the earlier external 429's cause; the platform
+may share static outbound addresses, and the new bridge's live outbound hash
+could not be checked because management SSH failed.
+
+The complete eight-minute observation retained all 96 samples. Both original
+anonymized portfolios produced at least 15 new complete snapshots, but their
+maximum published ages were 31.543 and 28.735 seconds. Around the failure, the
+first portfolio's financial timestamps were 29.036 seconds apart; publication
+latency can carry that gap across the 30-second limit. A nearby anonymous audit
+published at age 2.591 seconds, including a 499 ms database commit. Its owner is
+not logged, so that timing cannot be assigned conclusively to the failing
+portfolio. Earlier failed windows remain evidence and are not discarded after
+recovery. Lark stays DOING while this production acceptance is incomplete.
+
+## Bounded admission wait validation
+
+The account side of the sustained-load fixture now uses real
+`VenueReads.observeAccount`, `read`, cancellation and financial evidence
+stamps, as its public source side already did. It retains the six 300 ms venue
+stages, full 164 actual weight per frame, exclusive unknown funding before
+bounded history, complete history reservations, original source and account
+deadlines, and the existing durable reconciliation workload. Added read,
+commit and private-Core delays remain inside their actual transaction or
+observation boundaries. A synthetic publication tail of about 3.5 seconds
+covers the measured hosted upper tail without attributing its unmeasured
+contributors to Core.
+
+All 21 load cases passed: 18 production-policy cases and three diagnostic
+controls. Production-policy published age stayed at or below 28.53 seconds,
+rolling actual weight at or below 948, and both source cursors continued
+advancing. The original three phase variants reached 26.4 seconds. A separate
+old-fast-gate comparison also passed, so this is regression coverage and a
+phase-specific improvement, not a reproduced hosted failure turning green.
+The whole local isolated-PostgreSQL suite passed 849 tests with zero skips.
+These results do not replace the next complete hosted acceptance window.

@@ -10,11 +10,7 @@ import { AgentRunner } from "./runner.js";
 import { AgentService, fromPlan } from "./service.js";
 import { SourceFeed } from "./source-feed.js";
 import { VenueReads } from "./venue-reads.js";
-import {
-  VenueReadBudget,
-  type BudgetTimers,
-  type AccountReadReservation,
-} from "./venue-read-budget.js";
+import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 
 async function flush() {
   for (let i = 0; i < 140; i++) await Promise.resolve();
@@ -89,11 +85,25 @@ class Clock {
 const horizon = 360000,
   warmup = 120000,
   base = 1793200000000;
+type PublicationLatency = {
+  readMs: number | readonly number[];
+  commitMs: number | readonly number[];
+  coreMs: number | readonly number[];
+  auditOnly?: boolean;
+  syntheticUpperTail?: boolean;
+};
+const latencyAt = (value: number | readonly number[], at: number) =>
+  typeof value === "number" ? value : value[at % value.length];
 async function sustained(
   t: TestContext,
   finishBasedControl: boolean,
   borrowPolicy: "off" | "strict200" | "production" = "off",
   slowPhase = 0,
+  publicationLatency: PublicationLatency = {
+    readMs: 0,
+    commitMs: 0,
+    coreMs: 0,
+  },
 ) {
   const time = new Clock(t, base),
     repository = new MemoryRepository(),
@@ -148,6 +158,7 @@ async function sustained(
     user: string;
     at: number;
     observed: number;
+    venueComplete: number;
     complete: number;
   }[] = [];
   const deferrals: {
@@ -270,7 +281,22 @@ async function sustained(
     const count = phaseCounts.get(user) ?? 0;
     phaseCounts.set(user, count + 1);
     const start = time.at;
-    const result = await transact(user, work);
+    const commitMs =
+      !publicationLatency.auditOnly || count % 3 === 0
+        ? latencyAt(publicationLatency.commitMs, Math.floor(count / 3))
+        : 0;
+    const readMs =
+      !publicationLatency.auditOnly || count % 3 === 0
+        ? latencyAt(publicationLatency.readMs, Math.floor(count / 3))
+        : 0;
+    const result = await transact(user, async (state) => {
+      // These delays remain inside the real transaction lock, including on
+      // failed admission ticks: a slow read/commit cannot be bypassed by retry.
+      if (readMs) await time.sleep(readMs);
+      const result = await work(state);
+      if (commitMs) await time.sleep(commitMs);
+      return result;
+    });
     phaseSpans.push({
       user,
       phase: ["audit_control", "observe_plan", "durable_notify"][count % 3],
@@ -287,6 +313,15 @@ async function sustained(
       assert.ok(
         financialTimes.has(p.snapshot!.observed_at),
         "only an entire completed metered frame may be published",
+      );
+      const frame = frames.find(
+        (value) => value.observed === p.snapshot!.observed_at - base,
+      );
+      assert.ok(frame);
+      assert.equal(
+        time.at - frame.complete,
+        commitMs,
+        "a financial snapshot becomes visible only after its real transaction commit delay",
       );
       commits
         .get(user)!
@@ -316,46 +351,101 @@ async function sustained(
     return result;
   };
 
-  async function wire(
-    lane: "account" | "source",
-    reserve: number,
-    actual: number,
-    signal: AbortSignal,
-    ms: number,
-    owner: string,
-    observation?: AccountReadReservation,
-    frame?: number,
-    unknown = false,
-  ) {
-    const ticket = await budget.acquire(
-      lane,
-      reserve,
-      owner,
-      signal,
-      unknown,
-      observation,
-    );
-    try {
-      if (signal.aborted) throw signal.reason;
-      ticket.sent();
-      const at = time.at;
-      provider.push({ at, weight: actual, frame });
+  type AccountFrame = { id: number; firstWire?: number };
+  const accountContext = new AsyncLocalStorage<AccountFrame>();
+  const accountReads = new VenueReads(
+    (async (_url, init) => {
+      const payload = JSON.parse(String(init?.body)) as { type: string };
+      const frame = accountContext.getStore();
+      assert.ok(frame, "account dispatch must belong to a real observation");
+      frame.firstWire ??= time.at;
+      const weight = ["clearinghouseState", "spotClearinghouseState"].includes(
+        payload.type,
+      )
+        ? 2
+        : 20;
+      provider.push({ at: time.at, weight, frame: frame.id });
       assert.ok(
         budget.snapshot().used <= 1000,
-        "every provider dispatch requires a complete reservation",
+        "every real account dispatch requires its complete reservation",
       );
-      await time.sleep(ms, signal);
-      ticket.settle(actual);
-      return at;
-    } finally {
-      ticket.release();
-    }
-  }
-
+      await time.sleep(300, init?.signal ?? undefined);
+      return new Response(
+        JSON.stringify(
+          ["userFunding", "userFillsByTime", "openOrders"].includes(
+            payload.type,
+          )
+            ? []
+            : payload.type === "userAbstraction"
+              ? "standard"
+              : {},
+        ),
+      );
+    }) as typeof fetch,
+    now,
+    2,
+    { budget, timers: time.timers, report: () => {} },
+  );
   adapter.account = async (user, p) => {
-    let reservation: AccountReadReservation;
+    const frame: AccountFrame = { id: ++frameSequence };
+    const attemptedAt = time.at;
     try {
-      reservation = budget.beginObservation(`whole-frame:${user}`);
+      return await accountContext.run(frame, () =>
+        accountReads.observeAccount(async () => {
+          const read = (type: string) =>
+            accountReads.read("https://fixture.invalid/info", {
+              type,
+              user: p.account_id,
+            });
+          // The first actual mode read contributes weight, never financial age.
+          await read("userAbstraction");
+          await Promise.all([
+            read("clearinghouseState"),
+            read("spotClearinghouseState"),
+          ]);
+          await read("userFunding"); // Unknown hold settles fully before siblings.
+          await Promise.all([read("userFillsByTime"), read("openOrders")]);
+          await Promise.all([read("meta"), read("spotMeta")]);
+          await Promise.all([read("perpDexs"), read("userAbstraction")]);
+          const venueComplete = time.at;
+          const coreMs = latencyAt(
+            publicationLatency.coreMs,
+            Math.floor(((phaseCounts.get(user) ?? 1) - 1) / 3),
+          );
+          if (coreMs)
+            await time.sleep(coreMs, accountReads.accountReadSignal());
+          assert.equal(
+            provider
+              .filter((request) => request.frame === frame.id)
+              .reduce((n, request) => n + request.weight, 0),
+            164,
+          );
+          assert.ok(time.at - attemptedAt <= 20000);
+          assert.ok(frame.firstWire !== undefined);
+          const observed = accountReads.accountObservedAt();
+          assert.equal(
+            observed,
+            base + frame.firstWire + 300,
+            "the financial timestamp must come from the first actual financial dispatch after the mode guard",
+          );
+          financialTimes.add(observed);
+          completedFrames++;
+          frames.push({
+            id: frame.id,
+            user,
+            at: frame.firstWire,
+            observed: observed - base,
+            venueComplete,
+            complete: time.at,
+          });
+          return {
+            ...snapshot(),
+            account_id: p.account_id!,
+            venue_accounts: p.venue_accounts,
+            observed_at: observed,
+          };
+        }, `whole-frame:${user}`),
+      );
     } catch (error) {
       const state = budget.snapshot();
       deferrals.push({
@@ -370,72 +460,6 @@ async function sustained(
         active: state.observation_active,
       });
       throw error;
-    }
-    const controller = new AbortController();
-    const id = ++frameSequence,
-      started = time.at;
-    const deadline = time.timers.setTimeout(
-      () =>
-        controller.abort(
-          new AgentError(
-            "VENUE_READ_DEADLINE",
-            "fixture complete frame deadline",
-            true,
-            503,
-          ),
-        ),
-      20000,
-    );
-    const read = (reserve: number, actual = reserve, unknown = false) =>
-      wire(
-        "account",
-        reserve,
-        actual,
-        controller.signal,
-        300,
-        user,
-        reservation,
-        id,
-        unknown,
-      );
-    let complete = false;
-    try {
-      await read(20); // Mode guard contributes cost, not a financial timestamp.
-      const [financial] = await Promise.all([read(2), read(2)]);
-      await read(20, 20, true); // Unknown funding must finish before bounded siblings.
-      await Promise.all([read(120, 20), read(20)]);
-      await Promise.all([read(20), read(20)]);
-      await Promise.all([read(20), read(20)]);
-      assert.equal(
-        provider
-          .filter((request) => request.frame === id)
-          .reduce((n, request) => n + request.weight, 0),
-        164,
-      );
-      assert.ok(time.at - started <= 20000);
-      complete = true;
-      completedFrames++;
-      const observed = base + financial;
-      financialTimes.add(observed);
-      frames.push({
-        id,
-        user,
-        at: started,
-        observed: financial,
-        complete: time.at,
-      });
-      return {
-        ...snapshot(),
-        account_id: p.account_id!,
-        venue_accounts: p.venue_accounts,
-        observed_at: observed,
-      };
-    } catch (error) {
-      controller.abort(error);
-      throw error;
-    } finally {
-      time.timers.clearTimeout(deadline);
-      reservation.close(complete);
     }
   };
 
@@ -709,10 +733,14 @@ async function sustained(
     steadyCommits.every((values) => values.length >= 5),
     "both owners must repeatedly publish complete audits",
   );
+  const financialToPublishedMs = steadyCommits.map((values) =>
+    Math.max(...values.map((value) => value.at - value.observed)),
+  );
   assert.ok(
     frames.every(
       (frame) =>
-        frame.complete - frame.at >= 1500 && frame.complete - frame.at <= 2000,
+        frame.venueComplete - frame.at >= 1500 &&
+        frame.venueComplete - frame.at <= 2000,
     ),
     "each completed account frame must retain the requested 1.5–2 second wire workload",
   );
@@ -760,7 +788,9 @@ async function sustained(
     finishBasedControl,
     borrowPolicy,
     slowPhase,
+    publicationLatency,
     maximumAge,
+    financialToPublishedMs,
     providerMaximum,
     completedFrames,
     published: steadyCommits.map((values) => values.length),
@@ -883,3 +913,54 @@ for (const slowPhase of [0, 1, 2])
 it("records the old finish-plus-five cadence as a diagnostic control without imposing its result", async (t) => {
   await sustained(t, true);
 });
+
+// These retain the original venue, source, deadline, and C-reconciliation
+// workload while covering the measured 2.3–2.7 second A publication tail.
+for (const publicationLatency of [
+  { readMs: 100, commitMs: 600, coreMs: 200 },
+  { readMs: 150, commitMs: 400, coreMs: 500 },
+  { readMs: 200, commitMs: 800, coreMs: 400 },
+  // Declared round-robin inputs avoid choosing a favorable seed. A-only DB
+  // latency preserves the original already-measured B/C workload separately.
+  {
+    readMs: [100, 150, 200],
+    commitMs: [400, 600, 800],
+    coreMs: [200, 400, 500],
+    auditOnly: true,
+  },
+  // Hosted A publication reached 3.484s, but its separate contributors were
+  // not measured. This independent 1.2s tail is a synthetic upper envelope,
+  // not evidence that private Core itself took 1.2s. Financial stamps stay
+  // at the original read; 1.5s venue tail + 1.2s Core + 0.8s commit = 3.5s.
+  {
+    readMs: [100, 150, 200],
+    commitMs: 800,
+    coreMs: 1200,
+    auditOnly: true,
+    syntheticUpperTail: true,
+  },
+])
+  for (const slowPhase of [0, 1, 2])
+    it(`keeps financial evidence fresh with read ${publicationLatency.readMs}ms commit ${publicationLatency.commitMs}ms Core ${publicationLatency.coreMs}ms and initial slow phase ${slowPhase}`, async (t) => {
+      const report = await sustained(
+        t,
+        false,
+        "production",
+        slowPhase,
+        publicationLatency,
+      );
+      assert.ok(
+        report.maximumAge.every((age) => age < 30000),
+        JSON.stringify(report),
+      );
+      assert.ok(
+        report.steadyCursorTimes.every((values) => values.length >= 3),
+        "source freshness cannot be achieved by permanently starving Fixed history: " +
+          JSON.stringify(report),
+      );
+      assert.ok(
+        report.cursorTailMs.every((age) => age <= 60000),
+        "both source cursors must still advance in the final rolling-budget window: " +
+          JSON.stringify(report),
+      );
+    });
