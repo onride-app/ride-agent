@@ -976,11 +976,10 @@ export class AgentRunner {
         Infinity,
         ...state.portfolios
           .filter((p) => p.state !== "closed")
-          .map((p) => venueReadRetryAt(p) ?? Infinity)
-          .filter((at) => at > now()),
+          .map((p) => venueReadRetryAt(p) ?? Infinity),
       );
     });
-    if (nextVenueRetryAt > now() && Number.isFinite(nextVenueRetryAt)) {
+    if (Number.isFinite(nextVenueRetryAt)) {
       if (this.venueRetryAt.size >= 2000)
         this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
       this.venueRetryAt.set(user, nextVenueRetryAt);
@@ -1153,6 +1152,7 @@ export class AgentRunner {
               if (signal.aborted) return;
               await this.tick(user);
             } catch {
+              this.venueRetryAt.delete(user);
               if (!signal.aborted)
                 console.error(
                   "Rider monitoring cycle failed; retained for retry.",
@@ -1161,8 +1161,8 @@ export class AgentRunner {
               entry.running = false;
               const retry = this.venueRetryAt.get(user);
               entry.due =
-                retry != null && retry > now()
-                  ? Math.min(now() + intervalMs, retry)
+                retry != null
+                  ? Math.min(now() + intervalMs, Math.max(now(), retry))
                   : now() + intervalMs;
               if (!entry.present) users.delete(user);
               inFlight.delete(task);
