@@ -204,6 +204,21 @@ export class SourceFeed {
     if (next) next.resolve();
     else this.active--;
   }
+  private retryDelay(error: unknown): number {
+    if (
+      !(error instanceof AgentError) ||
+      error.retryable !== true ||
+      !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(error.code)
+    )
+      return this.retryCooldownMs;
+    const delay = error.details?.retry_after_ms;
+    return typeof delay === "number" &&
+      Number.isSafeInteger(delay) &&
+      delay > 0 &&
+      delay <= 60_000
+      ? Math.max(this.retryCooldownMs, delay)
+      : this.retryCooldownMs;
+  }
   private async perform(id: string): Promise<SourceSnapshot> {
     await this.acquire();
     try {
@@ -236,7 +251,7 @@ export class SourceFeed {
       if (!this.closed && current)
         current.failure = {
           error,
-          retryAt: this.clock() + this.retryCooldownMs,
+          retryAt: this.clock() + this.retryDelay(error),
         };
       throw error;
     } finally {

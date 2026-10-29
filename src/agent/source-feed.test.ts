@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import type { SourceSnapshot } from "./adapter.js";
+import { AgentError } from "./contracts.js";
 import { SourceFeed, type SourceFeedOptions } from "./source-feed.js";
 
 const initialTime = 1_700_000_000_000;
@@ -436,4 +437,86 @@ it("a known failure cannot be hidden by a previous frame that appears fresh afte
     assert.equal(calls, 3);
     await assert.rejects(feed.read("a"), error => error === failure);
   } finally { feed.close(); }
+});
+
+it("honors bounded venue retry hints for polling and reads without hiding failure or delaying another source", async () => {
+  for (const [code, delay] of [
+    ["VENUE_READ_BUDGET_EXHAUSTED", 30_000],
+    ["VENUE_RATE_LIMITED", 60_000],
+  ] as const) {
+    const time = fakeTime(), calls = new Map<string, number>();
+    let failing = false;
+    const failure = new AgentError(code, "fixture", true, 503, { retry_after_ms: delay });
+    const feed = new SourceFeed(async id => {
+      calls.set(id, (calls.get(id) ?? 0) + 1);
+      if (id === "a" && failing) throw failure;
+      return snapshot(time.clock(), `${id}_${calls.get(id)}`);
+    }, time);
+    try {
+      const old = await feed.read("a");
+      time.advance(5001);
+      failing = true;
+      await feed.pollOnce();
+      await feed.read("b");
+      assert.equal(calls.get("a"), 2);
+      for (const elapsed of [5000, delay - 5001]) {
+        time.advance(elapsed);
+        time.tick();
+        await feed.pollOnce();
+        // Explicit reads renew interest even during a 60s venue cooldown.
+        await assert.rejects(feed.read("a"), error => error === failure);
+        assert.equal(calls.get("a"), 2, code);
+        assert.equal((await feed.read("b")).complete, true);
+      }
+      assert.ok((calls.get("b") ?? 0) >= 2);
+      time.advance(1);
+      failing = false;
+      time.tick();
+      await feed.pollOnce();
+      const latest = await feed.read("a");
+      assert.equal(calls.get("a"), 3);
+      assert.equal(latest.observed_at, time.clock());
+      assert.notEqual(latest.revision, old.revision);
+      assert.deepEqual(time.intervals, [5000]);
+      time.advance(5000);
+      await feed.pollOnce();
+      assert.equal(calls.get("a"), 3);
+      time.advance(1);
+      await feed.pollOnce();
+      assert.equal(calls.get("a"), 4);
+    } finally { feed.close(); }
+  }
+});
+
+it("ignores untrusted or invalid retry hints and never shortens the configured failure cooldown", async () => {
+  const venue = (hint: unknown, code = "VENUE_READ_BUDGET_EXHAUSTED", retryable = true) =>
+    new AgentError(code, "fixture", retryable, 503, { retry_after_ms: hint as number });
+  const cases = [
+    ...[undefined, null, 0, -1, 1.5, NaN, Infinity, 60_001, Number.MAX_SAFE_INTEGER + 1, "60000"]
+      .map(hint => ({ error: venue(hint), cooldown: 5000 })),
+    { error: venue(60_000, "SOURCE_STALE"), cooldown: 5000 },
+    { error: venue(60_000, "VENUE_READ_DEADLINE"), cooldown: 5000 },
+    { error: venue(60_000, "VENUE_RATE_LIMITED", false), cooldown: 5000 },
+    { error: venue(60_000, "VENUE_RATE_LIMITED", "true" as unknown as boolean), cooldown: 5000 },
+    { error: { code: "VENUE_RATE_LIMITED", retryable: true, details: { retry_after_ms: 60_000 } }, cooldown: 5000 },
+    { error: new Error("fixture"), cooldown: 5000 },
+    { error: venue(1), cooldown: 5000 },
+    { error: venue(1), cooldown: 8000 },
+  ];
+  for (const { error, cooldown } of cases) {
+    const time = fakeTime();
+    let calls = 0;
+    const feed = new SourceFeed(async () => { calls++; throw error; }, { ...time, retryCooldownMs: cooldown });
+    try {
+      await assert.rejects(feed.read("a"), actual => actual === error);
+      time.advance(cooldown - 1);
+      time.tick();
+      await feed.pollOnce();
+      await assert.rejects(feed.read("a"), actual => actual === error);
+      assert.equal(calls, 1);
+      time.advance(1);
+      await feed.pollOnce();
+      assert.equal(calls, 2);
+    } finally { feed.close(); }
+  }
 });

@@ -1,0 +1,11 @@
+# Source sampling respects bounded venue retry hints
+
+The runner already respected persisted venue budget/rate-limit retry hints, but the independent public source sampler still retried every five seconds after every failure. A valid 30- or 60-second venue wait could therefore start another partial source pipeline after only five seconds. Deterministic regressions reproduced both the sampler retry and its use alongside a failing follower account.
+
+`SourceFeed` now extends a failed source's cooldown only for a retryable `AgentError` with code `VENUE_READ_BUDGET_EXHAUSTED` or `VENUE_RATE_LIMITED` and a numeric safe-integer `retry_after_ms` from 1 through 60000. The delay is the greater of that hint and the existing configured cooldown. Unknown error shapes, other codes including `VENUE_READ_DEADLINE`, non-retryable errors, and malformed or out-of-range hints keep the original cooldown.
+
+Only the failed interest's `retryAt` calculation changes. The original error remains visible during the wait; last-good data cannot hide it. Normal five-second polling, five-second freshness, observation timestamps, interest expiration, source concurrency, provider budgets, account observation and risk checks remain unchanged. The hint specifies the earliest retry; an existing poll or on-demand read triggers the next fetch, without adding a new wake timer.
+
+Regression coverage verifies no new source fetch from polling or explicit reads before the hint boundary, a new observation at that boundary, progress for a separate source, unchanged freshness after recovery, preservation of the original minimum cooldown, and invalid/untrusted hints. A runner integration verifies that source recovery leaves an independently failing follower account in attention with its old snapshot/audit and no submission.
+
+Local validation: isolated PostgreSQL full tests 632/632 with no skips, source/feed integration tests 24/24, functional journeys 53/53, typecheck/build and package verification passed. Parent and independent child source reviews found no blocking issue. These tests do not establish production scheduling or customer execution recovery; the earlier `47677b3` read-only receipt still showed budget/deadline pressure despite recent complete snapshot updates.

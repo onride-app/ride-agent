@@ -6,6 +6,7 @@ import { candidate, FakeAdapter } from "./fixtures.js";
 import { Cursor, MemoryRepository } from "./repository.js";
 import { AgentRunner } from "./runner.js";
 import { AgentService, fromPlan, portfolioView } from "./service.js";
+import { SourceFeed } from "./source-feed.js";
 
 type FixtureSource = Awaited<ReturnType<FakeAdapter["source"]>>;
 
@@ -218,6 +219,41 @@ it("records verified zero-equity flat observations even when follower account re
   assert.ok(observed.sleeves[0].last_source_at != null);
   assert.equal(observed.sleeves[0].initialized, false);
   assert.equal(adapter.submitCount, 0);
+});
+
+it("source retry cooldown and later recovery never mark a failed follower account observation successful", async t => {
+  let at = Date.now(), sourceCalls = 0, sourceFails = true;
+  t.mock.method(Date, "now", () => at);
+  const { adapter, p } = ownedPosition();
+  p.snapshot = structuredClone(adapter.snap);
+  p.audit_verified_at = at;
+  const original = structuredClone(p);
+  const sourceError = new AgentError("VENUE_READ_BUDGET_EXHAUSTED", "fixture", true, 503, { retry_after_ms: 60_000 });
+  const feed = new SourceFeed(async () => {
+    sourceCalls++;
+    if (sourceFails) throw sourceError;
+    return flatSource();
+  }, { clock: () => at, timers: { setInterval: () => 1, clearInterval: () => {} } });
+  adapter.source = async trader => (await feed.read(trader.id)) as FixtureSource;
+  adapter.account = async () => { throw new AgentError("ACCOUNT_STALE", "fixture", true, 503); };
+  try {
+    let observed = await runFixture(adapter, p);
+    assert.equal(sourceCalls, 1);
+    at += 5000;
+    observed = await runFixture(adapter, observed);
+    assert.equal(sourceCalls, 1);
+    sourceFails = false;
+    at += 55_000;
+    observed = await runFixture(adapter, observed);
+    assert.equal(sourceCalls, 2);
+    assert.equal((await feed.read(p.sleeves[0].trader.id)).observed_at, at);
+    assert.equal(observed.state, "attention");
+    assert.equal(observed.last_error?.code, "ACCOUNT_STALE");
+    assert.deepEqual(observed.snapshot, original.snapshot);
+    assert.equal(observed.audit_verified_at, original.audit_verified_at);
+    assert.deepEqual(observed.executions, original.executions);
+    assert.equal(adapter.submitCount, 0);
+  } finally { feed.close(); }
 });
 
 it("keeps fixed-copy fill coverage required for an initialized zero-equity flat source", async () => {
