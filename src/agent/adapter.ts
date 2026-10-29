@@ -1,5 +1,6 @@
 import { AgentError, errorDetails } from "./contracts.js";
 import { isPlanReadEvidence, type PlanReadEvidence } from "./read-evidence.js";
+import { monitorOperation } from "./monitor-diagnostics.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -216,6 +217,11 @@ export class BridgeAdapter implements VenueAdapter {
     if (!token) throw new Error("Missing executor service token");
   }
   private async call<T>(operation: string, input: unknown): Promise<T> {
+    return monitorOperation(operation, () =>
+      this.performCall<T>(operation, input),
+    );
+  }
+  private async performCall<T>(operation: string, input: unknown): Promise<T> {
     // The complete account observation is bounded at 20s inside the bridge.
     // Leave transport margin for its typed failure and retry hint to arrive.
     const signal = AbortSignal.timeout(

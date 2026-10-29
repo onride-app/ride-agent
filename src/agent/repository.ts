@@ -2,6 +2,7 @@ import pg from "pg";
 import { randomBytes, timingSafeEqual, createHmac } from "node:crypto";
 import type { Plan, Portfolio } from "./domain.js";
 import { AgentError, type Preferences } from "./contracts.js";
+import { monitorPhase } from "./monitor-diagnostics.js";
 
 export interface Proposal {
   id: string;
@@ -178,20 +179,24 @@ export class PgRepository implements Repository {
         "INSERT INTO ride_agent_state(user_id,state) VALUES($1,$2) ON CONFLICT DO NOTHING",
         [user, emptyState()],
       );
-      const r = await c.query(
-        "SELECT state FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
-        [user],
+      const r = await monitorPhase("db_state_read", () =>
+        c.query(
+          "SELECT state FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
+          [user],
+        ),
       );
       if (this.closing) throw new Error("Repository is closing");
       const s = r.rows[0].state as State;
       this.transactions.set(c, "callback");
-      const out = await fn(s);
+      const out = await monitorPhase("db_callback", () => fn(s));
       if (connectionError) throw connectionError;
-      await c.query(
-        "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
-        [user, s],
-      );
-      await c.query("COMMIT");
+      await monitorPhase("db_commit", async () => {
+        await c.query(
+          "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
+          [user, s],
+        );
+        await c.query("COMMIT");
+      });
       failed = false;
       return out;
     } finally {

@@ -27,6 +27,11 @@ import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
 import { orderedSourceFills } from "./source-fill-evidence.js";
 import {
+  runMonitorTrace,
+  monitorPhase,
+  noteMonitorAccountAge,
+} from "./monitor-diagnostics.js";
+import {
   recordPerformance,
   recordReceipt,
   recordDecision,
@@ -39,10 +44,17 @@ export class AgentRunner {
   private venueRetryAt = new Map<string, number>();
   constructor(private service: AgentService) {}
   async tick(user: string): Promise<void> {
+    return runMonitorTrace(() => this.tickBody(user));
+  }
+  private async tickBody(user: string): Promise<void> {
     const { repository, adapter } = this.service;
+    const transact = <T>(
+      phase: "observe_plan" | "durable_notify",
+      work: (state: State) => Promise<T>,
+    ) => monitorPhase(phase, () => repository.transact(user, work));
     // Planning is committed before any submission. A process crash cannot
     // erase a possibly submitted execution identifier or its frozen payload.
-    const nextVenueRetryAt = await repository.transact(user, async (state) => {
+    const nextVenueRetryAt = await transact("observe_plan", async (state) => {
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
         // A rejected read already tells us when capacity can return. Starting
         // another full account pipeline every five seconds consumes scarce
@@ -71,7 +83,9 @@ export class AgentRunner {
         );
         try {
           if (!p.account_id) {
-            const snap = await adapter.bind(user, p);
+            const snap = await monitorPhase("account_binding", () =>
+              adapter.bind(user, p),
+            );
             if (
               !snap.dedicated ||
               !snap.eligible ||
@@ -101,7 +115,10 @@ export class AgentRunner {
               "Configuration activated; entries are evaluated separately.",
             );
           }
-          const snap = await adapter.account(user, p);
+          const snap = await monitorPhase("account_observation", () =>
+            adapter.account(user, p),
+          );
+          noteMonitorAccountAge(snap.observed_at);
           if (!fresh(snap.observed_at) || !snap.eligible || !snap.dedicated)
             throw new AgentError(
               "ACCOUNT_STALE",
@@ -984,7 +1001,7 @@ export class AgentRunner {
         this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
       this.venueRetryAt.set(user, nextVenueRetryAt);
     } else this.venueRetryAt.delete(user);
-    await repository.transact(user, async (state) => {
+    await transact("durable_notify", async (state) => {
       for (const p of state.portfolios)
         for (const e of p.executions.filter(
           (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
