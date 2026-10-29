@@ -352,7 +352,8 @@ export class VenueReadBudget {
   private denied(budget: boolean, cost = 1) {
     const at = this.clock();
     this.prune();
-    let remaining = this.used();
+    const used = this.used();
+    let remaining = used;
     let next = at;
     // Expiring one cheap request may still leave no room for this request's
     // full reservation. Advise the first expiry that can admit its whole cost,
@@ -365,6 +366,22 @@ export class VenueReadBudget {
       next = charge.at + 60000;
     }
     if (remaining + cost > this.limit) next = at + 60000;
+    // An unsettled reservation can still refund unused response weight (or
+    // be released before sending). Use that optimistic floor only to advise
+    // a local recheck; admission continues to count every held charge.
+    // Uncertain sent requests are settled at their retained weight and must
+    // wait for the real rolling expiry, just like known completed requests.
+    const pendingWeight = this.charges.reduce(
+      (sum, charge) => sum + (charge.settled ? 0 : charge.weight),
+      0,
+    );
+    if (
+      budget &&
+      pendingWeight > 0 &&
+      used + cost > this.limit &&
+      used - pendingWeight + cost <= this.limit
+    )
+      next = Math.min(next, at + 1000);
     next = Math.max(next, this.blockedUntil);
     return new AgentError(
       budget ? "VENUE_READ_BUDGET_EXHAUSTED" : "VENUE_READ_DEADLINE",
