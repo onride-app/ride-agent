@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { it, type TestContext } from "node:test";
-import { FakeAdapter } from "./fixtures.js";
+import { FakeAdapter, candidate, snapshot } from "./fixtures.js";
+import { AgentError } from "./contracts.js";
+import { recommend } from "./domain.js";
 import { Cursor, MemoryRepository } from "./repository.js";
 import { AgentRunner } from "./runner.js";
-import { AgentService } from "./service.js";
+import { AgentService, fromPlan } from "./service.js";
 
 function deferred() {
   let resolve!: () => void;
@@ -47,16 +49,17 @@ class SchedulerClock {
 }
 function fixture(users: string[]) {
   const repository = new MemoryRepository();
+  const adapter = new FakeAdapter();
   repository.users = async () => users;
   const runner = new AgentRunner(
     new AgentService(
       repository,
-      new FakeAdapter(),
+      adapter,
       "https://ride.test",
       new Cursor("s".repeat(32)),
     ),
   );
-  return { repository, runner, controller: new AbortController() };
+  return { repository, adapter, runner, controller: new AbortController() };
 }
 
 it("checks a healthy user while the first user's account read is blocked, and drains that read on abort", async () => {
@@ -258,4 +261,59 @@ it("does not enter a user callback when aborted during user discovery", async ()
   discovery.resolve();
   await running;
   assert.equal(started, 0);
+});
+
+it("wakes a persisted short venue retry at its due time while preserving the normal notification cadence", async (t) => {
+  const time = new SchedulerClock(t),
+    f = fixture(["alice"]),
+    calls: number[] = [];
+  const p = fromPlan(
+    recommend(
+      {
+        budget_usdc: "20",
+        market: "perps",
+        assets: [],
+        allow_altcoins: true,
+        loss_trigger_pct: 10,
+        risk_tolerance: "medium",
+        portfolio_kind: "single",
+        basket_size: 1,
+      },
+      [candidate(1)],
+    ),
+  );
+  p.account_id = snapshot().account_id;
+  p.state = "active";
+  p.initial_equity = "500";
+  p.ledger_started_at = -1000;
+  await f.repository.transact("alice", async (state) => {
+    state.portfolios.push(p);
+  });
+  f.adapter.account = async () => {
+    calls.push(time.at);
+    throw new AgentError(
+      "VENUE_READ_BUDGET_EXHAUSTED",
+      "frame pacing",
+      true,
+      503,
+      { retry_after_ms: 1250 },
+    );
+  };
+  const running = f.runner.run(f.controller.signal);
+  try {
+    await flush();
+    await flush();
+    assert.deepEqual(calls, [0]);
+    await time.advance(1249);
+    assert.deepEqual(calls, [0]);
+    await time.advance(1);
+    await flush();
+    assert.deepEqual(calls, [0, 1250]);
+    await time.advance(1250);
+    await flush();
+    assert.deepEqual(calls, [0, 1250, 2500]);
+  } finally {
+    f.controller.abort();
+    await running;
+  }
 });

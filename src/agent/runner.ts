@@ -36,12 +36,13 @@ import {
 
 export class AgentRunner {
   private sourceTimes = new Map<string, number>();
+  private venueRetryAt = new Map<string, number>();
   constructor(private service: AgentService) {}
   async tick(user: string): Promise<void> {
     const { repository, adapter } = this.service;
     // Planning is committed before any submission. A process crash cannot
     // erase a possibly submitted execution identifier or its frozen payload.
-    await repository.transact(user, async (state) => {
+    const nextVenueRetryAt = await repository.transact(user, async (state) => {
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
         // A rejected read already tells us when capacity can return. Starting
         // another full account pipeline every five seconds consumes scarce
@@ -971,7 +972,19 @@ export class AgentRunner {
         }
         recordPerformance(state, p);
       }
+      return Math.min(
+        Infinity,
+        ...state.portfolios
+          .filter((p) => p.state !== "closed")
+          .map((p) => venueReadRetryAt(p) ?? Infinity)
+          .filter((at) => at > now()),
+      );
     });
+    if (nextVenueRetryAt > now() && Number.isFinite(nextVenueRetryAt)) {
+      if (this.venueRetryAt.size >= 2000)
+        this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
+      this.venueRetryAt.set(user, nextVenueRetryAt);
+    } else this.venueRetryAt.delete(user);
     await repository.transact(user, async (state) => {
       for (const p of state.portfolios)
         for (const e of p.executions.filter(
@@ -1146,7 +1159,11 @@ export class AgentRunner {
                 );
             } finally {
               entry.running = false;
-              entry.due = now() + intervalMs;
+              const retry = this.venueRetryAt.get(user);
+              entry.due =
+                retry != null && retry > now()
+                  ? Math.min(now() + intervalMs, retry)
+                  : now() + intervalMs;
               if (!entry.present) users.delete(user);
               inFlight.delete(task);
               wake();
@@ -1184,22 +1201,26 @@ export class AgentRunner {
   }
 }
 function venueReadRetryPending(p: Portfolio): boolean {
+  const retryAt = venueReadRetryAt(p);
+  return retryAt != null && now() < retryAt;
+}
+function venueReadRetryAt(p: Portfolio): number | undefined {
   const error = p.last_error;
   if (
     !error?.retryable ||
     !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(error.code)
   )
-    return false;
+    return;
   const delay = error.details?.retry_after_ms;
-  return (
+  if (
     Number.isSafeInteger(error.at) &&
     error.at <= now() &&
     typeof delay === "number" &&
     Number.isSafeInteger(delay) &&
     delay > 0 &&
-    delay <= 60000 &&
-    now() - error.at < delay
-  );
+    delay <= 60000
+  )
+    return error.at + delay;
 }
 function unadmittedSuppressedShadow(
   p: Portfolio,

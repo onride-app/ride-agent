@@ -11,7 +11,7 @@ import {
   VenueReadBudget,
 } from "./venue-read-budget.js";
 
-type Entry = { at: number; until: number; value: unknown };
+type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
 type AccountReadScope = {
   id: number;
   until: number;
@@ -199,6 +199,13 @@ export class VenueReads {
   accountObservedAt(): number {
     return this.accountScope.getStore()?.observedAt ?? this.clock();
   }
+  accountReadSignal(): AbortSignal {
+    return (
+      this.accountScope.getStore()?.admission.signal ??
+      this.callerSignal ??
+      new AbortController().signal
+    );
+  }
   private accountDeadline() {
     return new AgentError(
       "VENUE_READ_DEADLINE",
@@ -252,12 +259,16 @@ export class VenueReads {
       ) {
         this.count(method, lane, "cache_hit");
         if (scope && method === "allMids")
-          scope.observedAt = Math.min(scope.observedAt ?? cached.at, cached.at);
+          scope.observedAt = Math.min(
+            scope.observedAt ?? cached.evidenceAt,
+            cached.evidenceAt,
+          );
         return structuredClone(cached.value);
       }
       if (cached) this.cache.delete(key);
       let flight = this.flights.get(flightKey);
       if (!flight) {
+        const evidence: { at?: number } = {};
         const controller = new AbortController();
         const timer = this.timers.setTimeout(
           () =>
@@ -273,7 +284,14 @@ export class VenueReads {
             this.accountScope.getStore() ? 20000 : this.deadlineMs,
           ),
         );
-        flight = this.perform(url, payload, lane, cost, controller.signal)
+        flight = this.perform(
+          url,
+          payload,
+          lane,
+          cost,
+          controller.signal,
+          evidence,
+        )
           .then((value) => {
             if (controller.signal.aborted) throw controller.signal.reason;
             if (ttlMs > 0) {
@@ -281,6 +299,7 @@ export class VenueReads {
                 this.cache.delete(this.cache.keys().next().value!);
               this.cache.set(key, {
                 at: this.clock(),
+                evidenceAt: evidence.at ?? this.clock(),
                 value: structuredClone(value),
                 until: this.clock() + ttlMs,
               });
@@ -328,6 +347,7 @@ export class VenueReads {
     lane: ReadLane,
     cost: ReturnType<typeof readCost>,
     signal: AbortSignal,
+    evidence: { at?: number },
   ): Promise<unknown> {
     let ticket: ReadTicket | undefined,
       sent = false,
@@ -373,7 +393,18 @@ export class VenueReads {
       );
       wireSignal = AbortSignal.any([requestSignal, wire.signal]);
       ticket.sent();
-      if (scope) scope.observedAt ??= this.clock();
+      evidence.at = this.clock();
+      if (
+        scope &&
+        [
+          "clearinghouseState",
+          "spotClearinghouseState",
+          "allMids",
+          "frontendOpenOrders",
+          "openOrders",
+        ].includes(cost.method)
+      )
+        scope.observedAt ??= this.clock();
       sent = true;
       this.count(cost.method, lane, "actual_fetch");
       this.count(cost.method, lane, "reserved_weight", ticket.reservation);

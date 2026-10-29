@@ -15,6 +15,7 @@ import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
+import { VenueOrderSnapshots } from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
 import { sourceEvidenceReady } from "./source-observations.js";
 import {
@@ -48,6 +49,7 @@ const required = (key: string) => {
 };
 export class CoreBridge {
   private venueReads = new VenueReads();
+  private orderSnapshots: VenueOrderSnapshots;
   private sourceFeed = new SourceFeed((id) => this.readSource(id));
   private pool: pg.Pool;
   private prediction: PredictionVenue;
@@ -69,6 +71,7 @@ export class CoreBridge {
     private salt: string,
     private network: "testnet" | "mainnet",
   ) {
+    this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
     this.prediction = new PredictionVenue(
       this.pool,
@@ -911,13 +914,64 @@ export class CoreBridge {
       identity = await this.core("perps_wallet", { user_id: user });
       accountId = `account_${fingerprint([user, this.network]).slice(0, 32)}`;
     }
-    const [state, orders, mids, meta, abstraction] = await Promise.all([
-      this.info({ type: "clearinghouseState", user: identity.master }),
-      this.info({ type: "frontendOpenOrders", user: identity.master }),
-      this.info({ type: "allMids" }),
-      this.info({ type: "meta" }),
-      this.info({ type: "userAbstraction", user: identity.master }),
-    ]);
+    const abstraction = await this.info({
+        type: "userAbstraction",
+        user: identity.master,
+      }),
+      mode = perpsAccountMode(abstraction),
+      readHistory = (address: string, start: number, end = now()) =>
+        Promise.all([
+          this.paged("userFunding", address, start, end),
+          this.paged("userFillsByTime", address, start, end),
+          this.paged("userNonFundingLedgerUpdates", address, start, end),
+        ]).then(([funding, fills, flows]) => [fills, funding, flows] as const),
+      financialPrefix =
+        mode === "unified" &&
+        process.env.RIDE_AGENT_UNIFIED_ENABLED === "true" &&
+        binding != null &&
+        !!p?.ledger_started_at &&
+        !bind &&
+        !(p?.sleeves ?? []).some((s) =>
+          s.trader.assets.some((asset) => asset.includes(":")),
+        );
+    let state: any, orders: any, mids: any, meta: any, spotPrefix: any;
+    let savedHistory: Awaited<ReturnType<typeof readHistory>> | undefined;
+    if (financialPrefix) {
+      [state, mids, spotPrefix] = await Promise.all([
+        this.info({ type: "clearinghouseState", user: identity.master }),
+        this.info({ type: "allMids" }),
+        this.info({ type: "spotClearinghouseState", user: identity.master }),
+      ]);
+      if (
+        !state.marginSummary?.accountValue ||
+        !Array.isArray(state.assetPositions)
+      )
+        throw new AgentError(
+          "ACCOUNT_STALE",
+          "Account observations are incomplete.",
+          true,
+        );
+      unifiedUsdc(spotPrefix);
+      // The financial values above are the ones returned in this frame.
+      // Cover them with one history fence before admitting expensive rules
+      // and foreign-scope guards. Their success is still mandatory below.
+      savedHistory = await readHistory(
+        identity.master,
+        p!.ledger_started_at!,
+        now(),
+      );
+      [orders, meta] = await Promise.all([
+        this.info({ type: "frontendOpenOrders", user: identity.master }),
+        this.info({ type: "meta" }),
+      ]);
+    } else {
+      [state, orders, mids, meta] = await Promise.all([
+        this.info({ type: "clearinghouseState", user: identity.master }),
+        this.info({ type: "frontendOpenOrders", user: identity.master }),
+        this.info({ type: "allMids" }),
+        this.info({ type: "meta" }),
+      ]);
+    }
     if (
       !state.marginSummary?.accountValue ||
       !Array.isArray(state.assetPositions) ||
@@ -929,7 +983,6 @@ export class CoreBridge {
         "Account observations are incomplete.",
         true,
       );
-    const mode = perpsAccountMode(abstraction);
     if (
       mode === "unsupported" ||
       (mode === "unified" && process.env.RIDE_AGENT_UNIFIED_ENABLED !== "true")
@@ -942,7 +995,12 @@ export class CoreBridge {
     let available = String(state.withdrawable);
     if (mode === "unified") {
       const [spot, dexAbstraction, dexes] = await Promise.all([
-        this.info({ type: "spotClearinghouseState", user: identity.master }),
+        financialPrefix
+          ? spotPrefix
+          : this.info({
+              type: "spotClearinghouseState",
+              user: identity.master,
+            }),
         this.info({ type: "userDexAbstraction", user: identity.master }),
         this.info({ type: "perpDexs" }),
       ]);
@@ -968,19 +1026,50 @@ export class CoreBridge {
           "Complete Perps market scopes are unavailable.",
           true,
         );
+      const foreignDexes = dexes.slice(1).map((dex: any) => dex.name as string);
+      let freshScopes:
+        | { orders: Map<string, unknown[]>; states: Map<string, unknown> }
+        | undefined;
+      try {
+        freshScopes = await this.orderSnapshots.readAccount(
+          identity.master,
+          foreignDexes,
+          this.venueReads.accountReadSignal(),
+        );
+      } catch {
+        // A failed live snapshot keeps the complete, budgeted REST sweep.
+      }
+      this.venueReads.accountReadTimeout();
+      if (
+        !(freshScopes?.orders instanceof Map) ||
+        !(freshScopes.states instanceof Map) ||
+        foreignDexes.some(
+          (dex: string) =>
+            !Array.isArray(freshScopes!.orders.get(dex)) ||
+            !Array.isArray(
+              (freshScopes!.states.get(dex) as { assetPositions?: unknown })
+                ?.assetPositions,
+            ),
+        )
+      )
+        freshScopes = undefined;
       await Promise.all(
         dexes.slice(1).map(async (dex: any) => {
           const [other, pending] = await Promise.all([
-            this.info({
-              type: "clearinghouseState",
-              user: identity.master,
-              dex: dex.name,
-            }),
-            this.info({
-              type: "frontendOpenOrders",
-              user: identity.master,
-              dex: dex.name,
-            }),
+            (freshScopes?.states.get(dex.name) as
+              | { assetPositions: { position?: { szi?: string } }[] }
+              | undefined) ??
+              this.info({
+                type: "clearinghouseState",
+                user: identity.master,
+                dex: dex.name,
+              }),
+            freshScopes?.orders.get(dex.name) ??
+              this.info({
+                type: "frontendOpenOrders",
+                user: identity.master,
+                dex: dex.name,
+              }),
           ]);
           if (!Array.isArray(other?.assetPositions) || !Array.isArray(pending))
             throw new AgentError(
@@ -1116,6 +1205,17 @@ export class CoreBridge {
         account_id: accountId,
       });
     }
+    if (
+      mode === "standard" &&
+      perpsAccountMode(
+        await this.info({ type: "userAbstraction", user: identity.master }),
+      ) !== mode
+    )
+      throw new AgentError(
+        "ACCOUNT_STALE",
+        "Account mode changed during the balance observation.",
+        true,
+      );
     const positions = Object.fromEntries(
         state.assetPositions.map((x: any) => [
           `perps:${x.position.coin}`,
@@ -1136,15 +1236,9 @@ export class CoreBridge {
       flows: AccountSnapshot["flows"] = [],
       coverage = true;
     if (p?.ledger_started_at) {
-      const [fillRows, fundingRows, flowRows] = await Promise.all([
-        this.paged("userFillsByTime", identity.master, p.ledger_started_at),
-        this.paged("userFunding", identity.master, p.ledger_started_at),
-        this.paged(
-          "userNonFundingLedgerUpdates",
-          identity.master,
-          p.ledger_started_at,
-        ),
-      ]);
+      const [fillRows, fundingRows, flowRows] =
+        savedHistory ??
+        (await readHistory(identity.master, p.ledger_started_at));
       coverage = fillRows.complete && fundingRows.complete && flowRows.complete;
       const oidTasks = new Map<string, string>();
       for (const e of p.executions.filter(

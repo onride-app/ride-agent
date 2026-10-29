@@ -320,3 +320,69 @@ it("an unsettled unknown source response defers a learned account briefly instea
   assert.equal(budget.snapshot().used, 20);
   resumed.close();
 });
+
+it("paces whole observations by real charged weight without treating an unknown provisional hold as consumption", async () => {
+  const { time, budget } = setup();
+  const first = budget.beginObservation("a");
+  const ticket = await time.resolve(
+    budget.acquire("account", 20, "a", signal(), true, first),
+  );
+  ticket.sent();
+  ticket.settle(20);
+  ticket.release();
+  first.close(true);
+  let retry = 0;
+  assert.throws(
+    () => budget.beginObservation("a"),
+    (error: any) => {
+      retry = error.details.retry_after_ms;
+      assert.ok(retry > 1000 && retry < 2000);
+      return error.code === "VENUE_READ_BUDGET_EXHAUSTED";
+    },
+  );
+  assert.equal(budget.snapshot().used, 20);
+  await time.advance(retry);
+  const next = budget.beginObservation("a");
+  next.close();
+});
+
+it("shrinks a fallback footprint only after three complete smaller observations without refunding real costs", async () => {
+  const { time, budget } = setup();
+  const first = budget.beginObservation("a");
+  await charge(budget, time, 400, 400, first);
+  first.close(true);
+  for (let i = 0; i < 3; i++) {
+    await time.advance(60001);
+    const frame = budget.beginObservation("a");
+    assert.ok(budget.snapshot().observation_reserved >= 420);
+    await charge(budget, time, 20, 20, frame);
+    frame.close(true);
+    assert.equal(budget.snapshot().used, 20);
+  }
+  await time.advance(60001);
+  const next = budget.beginObservation("a");
+  assert.equal(budget.snapshot().observation_reserved, 120);
+  next.close();
+});
+
+it("queues a bounded history sibling behind a temporary unknown hold without inventing frame growth", async () => {
+  const { time, budget } = setup();
+  const frame = budget.beginObservation("a");
+  const unknown = await time.resolve(
+    budget.acquire("account", 20, "a", signal(), true, frame),
+  );
+  unknown.sent();
+  const sibling = budget.acquire("account", 120, "a", signal(), false, frame);
+  await time.advance(5);
+  assert.equal(budget.snapshot().account_queued, 1);
+  unknown.settle(20);
+  unknown.release();
+  const bounded = await time.resolve(sibling);
+  bounded.sent();
+  bounded.settle(20);
+  bounded.release();
+  frame.close(true);
+  assert.equal(budget.snapshot().used, 40);
+  assert.equal(budget.snapshot().observations.growth, 0);
+  assert.equal(budget.snapshot().quarantine_ms, 0);
+});

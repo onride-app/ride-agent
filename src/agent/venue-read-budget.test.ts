@@ -883,7 +883,11 @@ it("unknown or malformed methods never fetch and telemetry contains no payload, 
   assert.equal(f.attempts.length, 2);
 });
 
-async function highDexObservationLoad(context: TestContext, wireMs: number, mode: "unified" | "rwa" = "unified") {
+async function highDexObservationLoad(
+  context: TestContext,
+  wireMs: number,
+  mode: "unified" | "rwa" = "unified",
+) {
   const time = new FakeTime(),
     base = 1793200000000;
   context.mock.method(Date, "now", () => base + time.at);
@@ -917,7 +921,9 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
   const sourceSuccessTimes: number[][] = Array.from({ length: 6 }, () => []);
   const horizon = wireMs === 500 ? 650000 : 500000,
     warmup = wireMs === 500 ? 200000 : 140000;
-  let sourceComplete = 0, sourceHistoryComplete = 0, sourceHistoryDenied = 0;
+  let sourceComplete = 0,
+    sourceHistoryComplete = 0,
+    sourceHistoryDenied = 0;
   const fetcher = (async (_url, init) => {
     const p = JSON.parse(String(init?.body));
     let data: unknown;
@@ -925,7 +931,12 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
       case "clearinghouseState":
         data = {
           marginSummary: {
-            accountValue: p.user.startsWith("source") || (mode === "rwa" && !p.dex) ? "100" : mode === "rwa" ? "10" : "0",
+            accountValue:
+              p.user.startsWith("source") || (mode === "rwa" && !p.dex)
+                ? "100"
+                : mode === "rwa"
+                  ? "10"
+                  : "0",
           },
           withdrawable: "0",
           assetPositions: [],
@@ -1030,7 +1041,14 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
       p = {
         account_id: user,
         venue_accounts: { perps: user },
-        sleeves: mode === "rwa" ? [{ trader: { market: "perps", assets: ["rwa0:BTC", "rwa1:BTC"] } }] : [],
+        sleeves:
+          mode === "rwa"
+            ? [
+                {
+                  trader: { market: "perps", assets: ["rwa0:BTC", "rwa1:BTC"] },
+                },
+              ]
+            : [],
         executions: [],
         ledger_started_at: base - 1000,
       } as any;
@@ -1042,25 +1060,48 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
       try {
         const snap = await bridge.perpsAccount(user, p);
         assert.equal(snap.coverage_complete, true);
-        assert.ok(snap.observed_at >= base + started - 1000,
-          "only the existing one-second public price cache may predate this account frame");
+        assert.ok(
+          snap.observed_at >= base + started - 1000,
+          "only the existing one-second public price cache may predate this account frame",
+        );
         assert.ok(snap.observed_at < base + time.at);
         assert.ok(base + time.at - snap.observed_at <= 20000);
-        assert.equal(snap.account_value_usdc, mode === "unified" ? "100.000000" : "120");
+        assert.equal(
+          snap.account_value_usdc,
+          mode === "unified" ? "100.000000" : "120",
+        );
         durations.push(time.at - started);
         assert.ok(
           time.at - started <= 20000,
           "complete account evidence must arrive inside the existing bridge transport deadline",
         );
         const calls = trace.filter((x) => x.user === user && x.round === round);
-        assert.ok(calls.every(x => x.at >= started), "private account evidence must be fetched during this attempt");
-        for (const type of ["clearinghouseState", "frontendOpenOrders", "userAbstraction"])
-          assert.ok(calls.some(x => x.type === type && !x.dex), "native account evidence must be fetched during every complete attempt");
+        assert.ok(
+          calls.every((x) => x.at >= started),
+          "private account evidence must be fetched during this attempt",
+        );
+        for (const type of [
+          "clearinghouseState",
+          "frontendOpenOrders",
+          "userAbstraction",
+        ])
+          assert.ok(
+            calls.some((x) => x.type === type && !x.dex),
+            "native account evidence must be fetched during every complete attempt",
+          );
         if (mode === "unified")
-          assert.ok(calls.some(x => x.type === "spotClearinghouseState"), "unified spot collateral must not be reused from an old frame");
-        assert.ok(snap.observed_at <= base + Math.min(...calls.map(x => x.at)) + wireMs,
-          "snapshot freshness must use its earliest actual response rather than stamp the end of the frame");
-        for (const dex of mode === "unified" ? Array.from({ length: 10 }, (_, j) => `dex${j}`) : ["rwa0", "rwa1"])
+          assert.ok(
+            calls.some((x) => x.type === "spotClearinghouseState"),
+            "unified spot collateral must not be reused from an old frame",
+          );
+        assert.ok(
+          snap.observed_at <=
+            base + Math.min(...calls.map((x) => x.at)) + wireMs,
+          "snapshot freshness must use its earliest actual response rather than stamp the end of the frame",
+        );
+        for (const dex of mode === "unified"
+          ? Array.from({ length: 10 }, (_, j) => `dex${j}`)
+          : ["rwa0", "rwa1"])
           for (const type of ["clearinghouseState", "frontendOpenOrders"])
             assert.ok(
               calls.some((x) => x.type === type && x.dex === dex),
@@ -1086,11 +1127,19 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
               start_at: base - 1000,
               end_at: observation.observed_at,
             })) as { complete: boolean };
-            assert.equal(history.complete, true,
-              "the fixed source history must complete without advancing a fabricated cursor");
+            assert.equal(
+              history.complete,
+              true,
+              "the fixed source history must complete without advancing a fabricated cursor",
+            );
             sourceHistoryComplete++;
           } catch (error: any) {
-            assert.ok(["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_READ_DEADLINE"].includes(error.code), String(error));
+            assert.ok(
+              ["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_READ_DEADLINE"].includes(
+                error.code,
+              ),
+              String(error),
+            );
             sourceHistoryDenied++;
           }
         }
@@ -1140,22 +1189,36 @@ async function highDexObservationLoad(context: TestContext, wireMs: number, mode
     );
     assert.ok(sourceComplete >= 6);
     if (wireMs === 500)
-      assert.ok(sourceSuccessTimes.every(times => times.some(at => at >= warmup)),
-        "bounded offered load must let every public source owner progress after the cold account warmup");
-    const steady = successTimes.map(times => times.filter(at => at >= warmup));
-    assert.ok(steady.every(times => times.length >= 2), JSON.stringify({ warmup, steady, denied }));
-    const steadyGaps = steady.map(times => {
-      const bounded = [warmup, ...times.filter(at => at <= horizon), horizon];
+      assert.ok(
+        sourceSuccessTimes.every((times) => times.some((at) => at >= warmup)),
+        "bounded offered load must let every public source owner progress after the cold account warmup",
+      );
+    const steady = successTimes.map((times) =>
+      times.filter((at) => at >= warmup),
+    );
+    assert.ok(
+      steady.every((times) => times.length >= 2),
+      JSON.stringify({ warmup, steady, denied }),
+    );
+    const steadyGaps = steady.map((times) => {
+      const bounded = [warmup, ...times.filter((at) => at <= horizon), horizon];
       return Math.max(0, ...bounded.slice(1).map((at, j) => at - bounded[j]));
     });
-    assert.ok(steadyGaps.every(gap => gap <= 180000), JSON.stringify({ steady, steadyGaps }));
-    if (wireMs === 500) assert.ok(sourceHistoryComplete > 0, "bounded offered load must leave the fixed source history live");
+    assert.ok(
+      steadyGaps.every((gap) => gap <= 180000),
+      JSON.stringify({ steady, steadyGaps }),
+    );
+    if (wireMs === 500)
+      assert.ok(
+        sourceHistoryComplete > 0,
+        "bounded offered load must leave the fixed source history live",
+      );
     context.diagnostic(
       JSON.stringify({
         completed,
         denied,
         sourceComplete,
-        sourceOwnerCompletions: sourceSuccessTimes.map(times => times.length),
+        sourceOwnerCompletions: sourceSuccessTimes.map((times) => times.length),
         sourceHistoryComplete,
         sourceHistoryDenied,
         mode,
@@ -1183,7 +1246,7 @@ for (const wireMs of [1, 500])
   it(`three high-DEX actual account pipelines progress against six competing sources at ${wireMs}ms wire latency${wireMs === 500 ? " with bounded offered load" : " under high load"}`, (context) =>
     highDexObservationLoad(context, wireMs));
 
-it("three standard accounts with every configured RWA scope and mandatory history keep progressing at 500ms wire latency", context =>
+it("three standard accounts with every configured RWA scope and mandatory history keep progressing at 500ms wire latency", (context) =>
   highDexObservationLoad(context, 500, "rwa"));
 
 it("shared metadata floods do not starve private owners and expired turns wake without new requests", async () => {
@@ -1357,4 +1420,82 @@ it("a late owner does not inherit a large unknown reservation that is refunded t
   at.release();
   assert.deepEqual(order, ["b", "a"]);
   assert.equal(budget.snapshot().used, 80);
+});
+
+it("dates financial evidence from its actual dispatch instead of an earlier mode guard or the completed frame", async () => {
+  const time = new FakeTime();
+  const budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const reads = new VenueReads(
+    (async () =>
+      new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("{}")), 500),
+      )) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers, report: () => {} },
+  );
+  const work = reads.observeAccount(async () => {
+    await reads.read("https://venue.test/info", {
+      type: "userAbstraction",
+      user: "a",
+    });
+    await reads.read("https://venue.test/info", {
+      type: "clearinghouseState",
+      user: "a",
+    });
+    return reads.accountObservedAt();
+  });
+  await time.advance(1000);
+  assert.equal(await work, 500);
+});
+
+it("retains a cached price's original dispatch evidence time while preserving its response-based TTL", async () => {
+  const time = new FakeTime(),
+    budget = new VenueReadBudget({ clock: time.clock, timers: time.timers });
+  let attempts = 0;
+  const reads = new VenueReads(
+    (async () => {
+      attempts++;
+      return new Promise<Response>((resolve) =>
+        time.timers.setTimeout(() => resolve(new Response("{}")), 500),
+      );
+    }) as typeof fetch,
+    time.clock,
+    2,
+    { budget, timers: time.timers, report: () => {} },
+  );
+  const first = reads.read(
+    "https://venue.test/info",
+    { type: "allMids" },
+    1000,
+    "source",
+  );
+  await time.advance(500);
+  await first;
+  await time.advance(100);
+  const observed = await reads.observeAccount(async () => {
+    await reads.read("https://venue.test/info", { type: "allMids" }, 1000);
+    return reads.accountObservedAt();
+  });
+  assert.equal(observed, 0);
+  assert.equal(attempts, 1);
+  await time.advance(899);
+  await reads.read("https://venue.test/info", { type: "allMids" }, 1000);
+  assert.equal(
+    attempts,
+    1,
+    "the existing TTL still begins at response completion",
+  );
+  await time.advance(1);
+  const expired = reads.read(
+    "https://venue.test/info",
+    { type: "allMids" },
+    1000,
+  );
+  await time.advance(500);
+  await expired;
+  assert.equal(attempts, 2);
 });

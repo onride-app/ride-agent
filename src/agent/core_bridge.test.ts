@@ -14,6 +14,7 @@ it("preflights real unified cash, preserves Standard and rejects shared DEX expo
     "mainnet",
   );
   const stub = bridge as any;
+  stub.orderSnapshots = { readAccount: async () => undefined };
   const previous = process.env.RIDE_AGENT_UNIFIED_ENABLED;
   const previousRwa = process.env.RIDE_AGENT_RWA_ENABLED;
   let mode = "unifiedAccount",

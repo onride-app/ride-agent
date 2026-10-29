@@ -38,6 +38,7 @@ type Observation = {
   closed: boolean;
   complete: boolean;
   grew: boolean;
+  started: number;
 };
 type Owner = {
   served: number;
@@ -91,8 +92,10 @@ export class VenueReadBudget {
   >();
   private observationPlans = new Map<
     string,
-    { demand: number; seen: number }
+    { demand: number; seen: number; peaks: number[] }
   >();
+  private nextObservationAt = 0;
+  private recentObservationWeights: number[] = [];
   private observations = { started: 0, completed: 0, deferred: 0, growth: 0 };
   constructor(
     options: {
@@ -134,6 +137,10 @@ export class VenueReadBudget {
       observation_active: this.observation !== undefined,
       observation_queued: this.observationQueue.size,
       observation_reserved: this.observation?.remaining ?? 0,
+      observation_pacing_ms: Math.max(
+        0,
+        Math.ceil(this.nextObservationAt - this.clock()),
+      ),
       observations: { ...this.observations },
     };
   }
@@ -185,7 +192,18 @@ export class VenueReadBudget {
     if (this.observation || first !== owner) {
       this.observations.deferred++;
       this.pump();
-      throw this.observationDeferred(1000);
+      throw this.observationDeferred(
+        Math.min(
+          60000,
+          Math.max(1000, Math.ceil(this.nextObservationAt - now)),
+        ),
+      );
+    }
+    if (now < this.nextObservationAt) {
+      this.observations.deferred++;
+      throw this.observationDeferred(
+        Math.min(60000, Math.max(1, Math.ceil(this.nextObservationAt - now))),
+      );
     }
     if (this.exclusive) {
       this.observations.deferred++;
@@ -217,8 +235,18 @@ export class VenueReadBudget {
       closed: false,
       complete: false,
       grew: false,
+      started: now,
     };
     this.observations.started++;
+    if (this.recentObservationWeights.length) {
+      const weight =
+        this.recentObservationWeights.reduce((sum, value) => sum + value, 0) /
+        this.recentObservationWeights.length;
+      this.nextObservationAt = Math.max(
+        this.nextObservationAt,
+        now + Math.ceil((weight * 60000) / (this.limit * 0.8)),
+      );
+    }
     return ticket;
   }
   private observationDeferred(retry: number) {
@@ -238,13 +266,43 @@ export class VenueReadBudget {
     const previous =
       this.observationPlans.get(frame.owner)?.demand ??
       (frame.complete ? 0 : this.limit);
+    const peaks = frame.complete
+      ? [
+          ...(this.observationPlans.get(frame.owner)?.peaks ?? []),
+          frame.peak,
+        ].slice(-3)
+      : [];
     this.observationPlans.set(frame.owner, {
       demand: Math.min(
         this.limit,
-        Math.max(120, previous, frame.peak + 20, frame.grew ? previous * 2 : 0),
+        Math.max(
+          120,
+          peaks.length < 3 ? previous : 0,
+          frame.peak + 20,
+          ...peaks.map((peak) => peak + 20),
+          frame.grew ? previous * 2 : 0,
+        ),
       ),
       seen: this.clock(),
+      peaks,
     });
+    // Spread complete frames rather than spending a minute's capacity in a
+    // short burst followed by stale snapshots. Actual sent weight determines
+    // pacing; bounded/unknown provisional holds never manufacture a delay.
+    // Leave twenty percent for public sources and independent account reads.
+    if (frame.complete)
+      this.recentObservationWeights = [
+        ...this.recentObservationWeights,
+        Math.min(this.limit, frame.committed),
+      ].slice(-5);
+    const pacedWeight = this.recentObservationWeights.length
+      ? this.recentObservationWeights.reduce((sum, weight) => sum + weight, 0) /
+        this.recentObservationWeights.length
+      : Math.min(this.limit, frame.committed);
+    this.nextObservationAt = Math.max(
+      this.nextObservationAt,
+      frame.started + Math.ceil((pacedWeight * 60000) / (this.limit * 0.8)),
+    );
     const queued = this.observationQueue.get(frame.owner);
     if (queued) queued.demand = this.observationPlans.get(frame.owner)!.demand;
     if (frame.complete) this.observations.completed++;
@@ -345,7 +403,11 @@ export class VenueReadBudget {
     if (observation) {
       const frame = this.observation!;
       frame.peak = Math.max(frame.peak, frame.committed + cost);
-      if (cost > frame.remaining && this.used() + cost > this.limit) {
+      if (
+        !this.exclusive &&
+        cost > frame.remaining &&
+        this.used() + cost > this.limit
+      ) {
         frame.grew = true;
         return Promise.reject(this.denied(true, cost));
       }
@@ -405,7 +467,14 @@ export class VenueReadBudget {
             (w) => w.observation === this.observation!.ticket,
           )
         : this.queues[lane];
-    if (!queue.length || this.active[lane] >= this.slots) return;
+    // A reserved complete frame may use two bounded wire reads concurrently.
+    // The same weighted ledger still reserves every request before dispatch;
+    // unknown surcharges retain their global exclusive gate.
+    const slots =
+      lane === "account" && this.observation
+        ? Math.max(2, this.slots)
+        : this.slots;
+    if (!queue.length || this.active[lane] >= slots) return;
     const now = this.clock(),
       turn = this.turns[lane];
     if (
