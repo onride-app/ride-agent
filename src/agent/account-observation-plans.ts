@@ -111,8 +111,9 @@ export class AccountObservationPlans implements ObservationPlanStore {
       const connected = await Promise.race([connecting, aborted]);
       const result = await Promise.race([
         (async () => {
-          await connected.query("BEGIN ISOLATION LEVEL READ COMMITTED");
-          await connected.query("SET LOCAL statement_timeout = '20s'");
+          await connected.query(
+            "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL statement_timeout = '20s'",
+          );
           const value = await work(connected);
           if (bounded.aborted || connectionError) throw costPlanUnavailable();
           await connected.query("COMMIT");
@@ -162,17 +163,21 @@ export class AccountObservationPlans implements ObservationPlanStore {
     owner: string,
   ): Promise<ObservationPlanHint & { busy: boolean; currentMs: number }> {
     const result = await client.query(
-      `SELECT contract,generation::text,dirty,demand,peaks,
+      `WITH locked AS MATERIALIZED (SELECT contract,generation::text,dirty,demand,peaks,
       floor(extract(epoch FROM learned_at)*1000)::text AS learned_ms,
       floor(extract(epoch FROM lease_until)*1000)::text AS lease_ms
-      FROM ride_agent_account_cost_plans WHERE owner_key=$1 FOR UPDATE`,
+      FROM ride_agent_account_cost_plans WHERE owner_key=$1 FOR UPDATE)
+      SELECT locked.*,floor(extract(epoch FROM clock_timestamp())*1000)::text AS current_ms FROM locked`,
       [owner],
     );
-    // Evaluate wall time only after obtaining the row lock. An expression in
-    // the locking SELECT could otherwise have been computed before its wait.
-    const timestamp = await client.query(
-      "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::text AS current_ms",
-    );
+    // The materialized row must pass FOR UPDATE (including its wait/EPQ)
+    // before the outer projection evaluates the wall clock. An empty result
+    // has no projection, so retain the independent clock query in that case.
+    const timestamp = result.rows.length
+      ? result
+      : await client.query(
+          "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::text AS current_ms",
+        );
     const millis = (value: unknown): number =>
       typeof value === "string" &&
       /^[1-9][0-9]*$/.test(value) &&
@@ -244,10 +249,11 @@ export class AccountObservationPlans implements ObservationPlanStore {
       throw costPlanUnavailable();
     const started = performance.now();
     return this.transaction(signal, async (client) => {
-      await client.query(
-        `INSERT INTO ride_agent_account_cost_plans (owner_key,contract) VALUES($1,$2) ON CONFLICT DO NOTHING`,
-        [owner, ACCOUNT_OBSERVATION_COST_CONTRACT],
-      );
+      if (typeof expected?.generation !== "string")
+        await client.query(
+          `INSERT INTO ride_agent_account_cost_plans (owner_key,contract) VALUES($1,$2) ON CONFLICT DO NOTHING`,
+          [owner, ACCOUNT_OBSERVATION_COST_CONTRACT],
+        );
       const current = await this.locked(client, owner);
       const expectedGeneration =
         expected?.generation === null ? "0" : expected?.generation;
