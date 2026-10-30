@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { it } from "node:test";
 import pg from "pg";
@@ -8,6 +9,25 @@ import { AccountObservationPlans } from "./account-observation-plans.js";
 
 const database = process.env.RIDE_AGENT_TEST_DATABASE_URL;
 const options = { skip: !database, timeout: 35000 };
+
+function captureHttpResponse(request: Promise<Response>) {
+  // IPC/PG checks can outlive a rejected transport. Capture immediately, but
+  // preserve its original error for the strict HTTP assertion below.
+  return request.then(
+    (response) => ({ ok: true as const, response }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+}
+
+async function assertHttpSuccess(
+  pending: ReturnType<typeof captureHttpResponse>,
+) {
+  const outcome = await pending;
+  if (!outcome.ok) throw outcome.error;
+  assert.equal(outcome.response.status, 200);
+  assert.deepEqual(await outcome.response.json(), { ok: true });
+}
+
 const script = `
 import http from 'node:http';
 import { AccountObservationPlans } from './src/agent/account-observation-plans.ts';
@@ -18,11 +38,16 @@ import { drainBridge } from './src/agent/bridge-shutdown.ts';
 const bridge = new CoreBridge('https://core.test','fixture',process.env.RIDE_AGENT_TEST_DATABASE_URL,'s'.repeat(32),'mainnet');
 const store = new AccountObservationPlans(bridge.pool);
 await store.migrate();
+let releaseWire;
+process.on('message',message=>{
+  if(message?.type==='release_wire'){
+    const release=releaseWire;releaseWire=undefined;release?.();
+  }
+});
 const reads = new VenueReads(async (_url,init)=>{
   const payload=JSON.parse(String(init.body));
   if(payload.type==='userFillsByTime'){
-    process.send({type:'wire'});
-    await new Promise(resolve=>setTimeout(resolve,250));
+    await new Promise(resolve=>{releaseWire=resolve;process.send({type:'wire'});});
   }
   return Response.json([]);
 },Date.now,2,{budget:new VenueReadBudget(),observationPlans:store});
@@ -39,11 +64,49 @@ server.listen(0,'127.0.0.1',()=>process.send({type:'ready',port:server.address()
 let stopping=false;
 process.on('SIGTERM',()=>{
   if(stopping)return;stopping=true;
-  void drainBridge(server,bridge).then(()=>{
+  const drained=drainBridge(server,bridge);
+  process.send({type:'stop_started'});
+  void drained.then(()=>{
     process.send({type:'stopped',cost_plans:reads.diagnostics().cost_plans},()=>process.disconnect());
   }).catch(()=>process.exit(1));
 });
 `;
+
+it("shutdown fixture captures transport rejection immediately and still requires the original error or an HTTP 200 success body", async () => {
+  const server = createServer((request, response) => {
+    if (request.url === "/reset") return response.destroy();
+    response.statusCode = request.url === "/unavailable" ? 503 : 200;
+    response.end(JSON.stringify({ ok: response.statusCode === 200 }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    const pending = captureHttpResponse(fetch(`${origin}/reset`));
+    // Let the transport settle before its consumer, as the IPC/PG checks do.
+    await delay(0);
+    const outcome = await pending;
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) assert.fail("The reset transport must reject");
+    assert.ok(outcome.error instanceof TypeError);
+    assert.equal(outcome.error.message, "fetch failed");
+    await assert.rejects(
+      assertHttpSuccess(pending),
+      (error) => error === outcome.error,
+    );
+    await assert.rejects(
+      assertHttpSuccess(captureHttpResponse(fetch(`${origin}/unavailable`))),
+      { code: "ERR_ASSERTION" },
+    );
+    await assertHttpSuccess(captureHttpResponse(fetch(`${origin}/ok`)));
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
 
 function fixture(
   owner: string,
@@ -182,7 +245,9 @@ it(
     let second: ReturnType<typeof fixture> | undefined;
     try {
       const ready = await first.wait("ready");
-      const response = fetch(`http://127.0.0.1:${ready.port}/read`);
+      const response = captureHttpResponse(
+        fetch(`http://127.0.0.1:${ready.port}/read`),
+      );
       await first.wait("wire");
       const original = (
         await pool.query(
@@ -192,7 +257,9 @@ it(
       ).rows[0];
       assert.equal(original.dirty, true);
       first.child.kill("SIGTERM");
-      assert.deepEqual(await (await response).json(), { ok: true });
+      await first.wait("stop_started");
+      first.child.send({ type: "release_wire" });
+      await assertHttpSuccess(response);
       assert.deepEqual(await first.exit, { code: 0, signal: null });
       assert.equal((await first.wait("stopped")).cost_plans.persisted, 1);
       assert.deepEqual(
@@ -206,10 +273,14 @@ it(
       );
       second = fixture(owner, "resume");
       const resumed = await second.wait("ready");
-      const next = fetch(`http://127.0.0.1:${resumed.port}/read`);
+      const next = captureHttpResponse(
+        fetch(`http://127.0.0.1:${resumed.port}/read`),
+      );
       await second.wait("wire");
       second.child.kill("SIGTERM");
-      assert.deepEqual(await (await next).json(), { ok: true });
+      await second.wait("stop_started");
+      second.child.send({ type: "release_wire" });
+      await assertHttpSuccess(next);
       assert.deepEqual(await second.exit, { code: 0, signal: null });
       const counters = (await second.wait("stopped")).cost_plans;
       assert.equal(counters.restored_admitted, 1);
