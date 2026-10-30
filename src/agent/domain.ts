@@ -204,11 +204,50 @@ export interface AccountSnapshot {
   chain_block?: number;
   max_leverages: Record<string, number>;
   min_notionals: Record<string, string>;
-  orders: { id: string; key: string; increases_risk: boolean }[];
+  orders: {
+    id: string;
+    key: string;
+    increases_risk: boolean;
+    ownership?: "copy" | "manual" | "unknown";
+    task_id?: string;
+  }[];
   fills: Fill[];
+  manual_markets?: ManualMarketHandoff[];
+  manual_fills?: ManualFill[];
+  recovered_executions?: {
+    execution_id: string;
+    task_id: string | null;
+    status: Execution["status"];
+    settled: boolean;
+  }[];
   funding: Funding[];
   flows: Flow[];
   coverage_complete: boolean;
+}
+export interface ManualMarketHandoff {
+  handoff_id: string;
+  binding_id: string;
+  coin: string;
+  at_ms: number;
+  mark_px: string;
+  signed_size: string;
+  master: string;
+  agent: string;
+  network: number;
+  wallet_generation: number;
+}
+export interface ManualFill extends Omit<Fill, "task_id"> {
+  handoff_id: string;
+}
+export interface ManualOwnershipTransfer {
+  handoff: ManualMarketHandoff;
+  quantities: Record<string, string>;
+  realized_usdc: Record<string, string>;
+}
+export interface ManualLedger {
+  lots: Record<string, Lot>;
+  seen_fills: string[];
+  transfers: ManualOwnershipTransfer[];
 }
 export interface Fill {
   id: string;
@@ -264,6 +303,7 @@ export interface MonitorError {
   read_scope?: "account" | "source";
 }
 export interface Portfolio {
+  manual_ledger?: ManualLedger;
   target_blocker?: TargetBlocker;
   last_error?: MonitorError;
   source_read_error?: MonitorError;
@@ -964,10 +1004,22 @@ export function risk(
   }
   return next;
 }
+export function manualHandoff(
+  p: Portfolio,
+  key: string,
+): ManualMarketHandoff | undefined {
+  return p.manual_ledger?.transfers.find(
+    (transfer) => `perps:${transfer.handoff.coin}` === key,
+  )?.handoff;
+}
+export function manualQuantity(p: Portfolio, key: string): string {
+  return p.manual_ledger?.lots[key]?.quantity ?? "0";
+}
 export function pnl(p: Portfolio): {
   net_usdc: string | null;
   sleeves: { copy_id: string; net_usdc: string | null }[];
   external_flows_usdc: string;
+  manual_net_usdc?: string | null;
 } {
   const quantitiesMatch =
     p.snapshot &&
@@ -975,10 +1027,12 @@ export function pnl(p: Portfolio): {
       ...new Set([
         ...Object.keys(p.snapshot.positions),
         ...p.sleeves.flatMap((s) => Object.keys(s.lots)),
+        ...Object.keys(p.manual_ledger?.lots ?? {}),
       ]),
     ].every((key) =>
       p.sleeves
         .reduce((n, s) => n.plus(s.lots[key]?.quantity ?? 0), D(0))
+        .plus(manualQuantity(p, key))
         .eq(p.snapshot!.positions[key] ?? 0),
     );
   if (
@@ -987,16 +1041,18 @@ export function pnl(p: Portfolio): {
     !p.snapshot.coverage_complete ||
     !fresh(p.snapshot.observed_at) ||
     !quantitiesMatch ||
-    p.sleeves.some((s) =>
-      Object.values(s.lots).some(
-        (l) => !D(l.quantity).isZero() && !p.snapshot!.prices[l.key],
-      ),
+    [...p.sleeves.map((s) => s.lots), p.manual_ledger?.lots ?? {}].some(
+      (lots) =>
+        Object.values(lots).some(
+          (l) => !D(l.quantity).isZero() && !p.snapshot!.prices[l.key],
+        ),
     )
   )
     return {
       net_usdc: null,
       sleeves: p.sleeves.map((s) => ({ copy_id: s.copy_id, net_usdc: null })),
       external_flows_usdc: cash(p.flow_total),
+      ...(p.manual_ledger ? { manual_net_usdc: null } : {}),
     };
   const rawSleeves = p.sleeves.map((s) => ({
     copy_id: s.copy_id,
@@ -1015,19 +1071,34 @@ export function pnl(p: Portfolio): {
     ),
   }));
   const total = rawSleeves.reduce((n, s) => n.plus(s.net_usdc), D(0));
+  const manualTotal = Object.values(p.manual_ledger?.lots ?? {}).reduce(
+    (n, l) =>
+      n
+        .plus(l.realized)
+        .minus(l.fees)
+        .plus(l.funding)
+        .plus(
+          D(l.quantity)
+            .times(p.snapshot!.prices[l.key] ?? 0)
+            .minus(l.cost),
+        ),
+    D(0),
+  );
   const accountDelta = D(p.snapshot.account_value_usdc)
     .minus(p.initial_equity ?? 0)
     .minus(p.flow_total);
-  if (total.minus(accountDelta).abs().gt("0.000001"))
+  if (total.plus(manualTotal).minus(accountDelta).abs().gt("0.000001"))
     return {
       net_usdc: null,
       sleeves: rawSleeves.map((s) => ({ copy_id: s.copy_id, net_usdc: null })),
       external_flows_usdc: cash(p.flow_total),
+      ...(p.manual_ledger ? { manual_net_usdc: null } : {}),
     };
   // Validate unrounded attribution, then conserve the verified account delta
   // when presenting each sleeve at micro-USDC precision.
   const shares = rawSleeves.map((s) => s.net_usdc.toDecimalPlaces(6));
-  const remainder = D(cash(accountDelta)).minus(
+  const copyDelta = p.manual_ledger ? total : accountDelta;
+  const remainder = D(cash(copyDelta)).minus(
     shares.reduce((n, share) => n.plus(share), D(0)),
   );
   if (!remainder.isZero() && shares.length) {
@@ -1043,8 +1114,13 @@ export function pnl(p: Portfolio): {
     net_usdc: cash(shares[i].isZero() ? 0 : shares[i]),
   }));
   return {
-    net_usdc: cash(accountDelta),
+    net_usdc: cash(copyDelta),
     sleeves,
     external_flows_usdc: cash(p.flow_total),
+    // Keep copy returns rounded from copy-owned PnL. Assign only the display
+    // rounding remainder to manual so the two displayed books conserve equity.
+    ...(p.manual_ledger
+      ? { manual_net_usdc: cash(D(cash(accountDelta)).minus(cash(copyDelta))) }
+      : {}),
   };
 }

@@ -35,12 +35,78 @@ import {
   now,
   fresh,
   PERPS_COPY_MAX_LEVERAGE,
+  manualHandoff,
   type Candidate,
   type AccountSnapshot,
   type Portfolio,
   type Execution,
   type PositionIntent,
+  type ManualMarketHandoff,
 } from "./domain.js";
+import { reconcileQuantities } from "./ledger.js";
+
+function manualMarkets(identity: any, binding: string): ManualMarketHandoff[] {
+  if (identity.manual_markets === undefined) return [];
+  const invalid = () =>
+    new AgentError(
+      "ACCOUNT_STALE",
+      "Immutable manual market ownership evidence is invalid.",
+      true,
+    );
+  if (!Array.isArray(identity.manual_markets)) throw invalid();
+  const coins = new Set<string>(),
+    ids = new Set<string>();
+  return identity.manual_markets.map((row: any) => {
+    if (
+      !row ||
+      typeof row !== "object" ||
+      typeof row.handoff_id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        row.handoff_id,
+      ) ||
+      row.binding_id !== binding ||
+      typeof row.coin !== "string" ||
+      !/^[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)?$/.test(row.coin) ||
+      !Number.isSafeInteger(row.at_ms) ||
+      row.at_ms <= 0 ||
+      row.at_ms > now() ||
+      ![row.mark_px, row.signed_size].every(
+        (value) => typeof value === "string" && /^-?\d+(?:\.\d+)?$/.test(value),
+      ) ||
+      !D(row.mark_px).isFinite() ||
+      !D(row.mark_px).gt(0) ||
+      !D(row.signed_size).isFinite() ||
+      ![row.master, row.agent].every(
+        (value) => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value),
+      ) ||
+      row.master.toLowerCase() !== identity.master?.toLowerCase() ||
+      row.agent.toLowerCase() !== identity.agent?.toLowerCase() ||
+      !Number.isInteger(row.network) ||
+      ![1, 2].includes(row.network) ||
+      row.network !== identity.network ||
+      !Number.isInteger(row.wallet_generation) ||
+      row.wallet_generation < 0 ||
+      row.wallet_generation !== identity.wallet_generation ||
+      coins.has(row.coin) ||
+      ids.has(row.handoff_id)
+    )
+      throw invalid();
+    coins.add(row.coin);
+    ids.add(row.handoff_id);
+    return {
+      handoff_id: row.handoff_id,
+      binding_id: row.binding_id,
+      coin: row.coin,
+      at_ms: row.at_ms,
+      mark_px: row.mark_px,
+      signed_size: row.signed_size,
+      master: row.master,
+      agent: row.agent,
+      network: row.network,
+      wallet_generation: row.wallet_generation,
+    };
+  });
+}
 
 const required = (key: string) => {
   const v = process.env[key];
@@ -914,6 +980,96 @@ export class CoreBridge {
       identity = await this.core("perps_wallet", { user_id: user });
       accountId = `account_${fingerprint([user, this.network]).slice(0, 32)}`;
     }
+    const handoffs = manualMarkets(identity, accountId);
+    if (
+      p?.manual_ledger?.transfers.some(
+        (transfer) =>
+          !handoffs.some(
+            (handoff) => fingerprint(handoff) === fingerprint(transfer.handoff),
+          ),
+      )
+    )
+      throw new AgentError(
+        "HANDOFF_CHANGED",
+        "Recorded manual market ownership is missing or changed.",
+      );
+    const recovered: NonNullable<AccountSnapshot["recovered_executions"]> = [];
+    const recoveredStatuses = new Map<string, any>();
+    for (const execution of (p?.executions ?? []).filter(
+      (e) =>
+        !["completed", "failed", "superseded"].includes(e.status) &&
+        handoffs.some((handoff) => e.key === `perps:${handoff.coin}`),
+    )) {
+      const status = await this.core("perps_execution_lookup", {
+        user_id: user,
+        account_id: accountId,
+        execution_id: execution.id,
+      });
+      if (status?.found === false) {
+        if (execution.task_id)
+          throw new AgentError(
+            "HANDOFF_PENDING",
+            "The read-only lookup cannot prove ownership of an existing task.",
+            true,
+          );
+        recovered.push({
+          execution_id: execution.id,
+          task_id: null,
+          status: "superseded",
+          settled: true,
+        });
+      } else if (
+        status?.found === true &&
+        typeof status.task_id === "string" &&
+        [1, 2, 3, 4, 5, 6, 7].includes(status.status)
+      ) {
+        if (execution.task_id && execution.task_id !== status.task_id)
+          throw new AgentError(
+            "HANDOFF_PENDING",
+            "Stable execution identity changed during handoff reconciliation.",
+            true,
+          );
+        let evidence: any;
+        try {
+          evidence =
+            typeof status.snapshot === "string"
+              ? JSON.parse(status.snapshot)
+              : status.snapshot;
+        } catch {}
+        if (
+          typeof evidence?.fill_settlement_pending !== "boolean" ||
+          typeof evidence?.settlement_observation_required !== "boolean"
+        )
+          throw new AgentError(
+            "HANDOFF_PENDING",
+            "Stable execution settlement evidence is incomplete.",
+            true,
+          );
+        const pendingSettlement =
+          evidence.fill_settlement_pending ||
+          evidence.settlement_observation_required;
+        const settled =
+          [3, 4, 5, 6].includes(status.status) && !pendingSettlement;
+        recovered.push({
+          execution_id: execution.id,
+          task_id: status.task_id,
+          status: !settled
+            ? "settling"
+            : status.status === 3
+              ? "completed"
+              : status.status === 6
+                ? "superseded"
+                : "failed",
+          settled,
+        });
+        recoveredStatuses.set(status.task_id, status);
+      } else
+        throw new AgentError(
+          "HANDOFF_PENDING",
+          "Stable execution lookup is incomplete; ownership cannot be transferred.",
+          true,
+        );
+    }
     const abstraction = await this.info({
         type: "userAbstraction",
         user: identity.master,
@@ -1103,8 +1259,10 @@ export class CoreBridge {
     const scopedAvailable: Record<string, string> = { core: available };
     const scopes = [
       ...new Set(
-        (p?.sleeves ?? [])
-          .flatMap((s) => s.trader.assets)
+        [
+          ...(p?.sleeves ?? []).flatMap((s) => s.trader.assets),
+          ...handoffs.map((handoff) => handoff.coin),
+        ]
           .filter((a) => a.includes(":"))
           .map((a) => a.split(":")[0]),
       ),
@@ -1232,37 +1390,76 @@ export class CoreBridge {
       meta.universe.map((x: any) => [`perps:${x.name}`, x.maxLeverage]),
     );
     let fills: AccountSnapshot["fills"] = [],
+      manualFills: NonNullable<AccountSnapshot["manual_fills"]> = [],
       funding: AccountSnapshot["funding"] = [],
       flows: AccountSnapshot["flows"] = [],
       coverage = true;
+    const oidTasks = new Map<string, string>();
+    const orderIsManual = (order: any) =>
+      handoffs.some(
+        (handoff) =>
+          handoff.coin === order.coin &&
+          Number.isSafeInteger(order.timestamp) &&
+          order.timestamp <= now() &&
+          order.timestamp > handoff.at_ms,
+      );
     if (p?.ledger_started_at) {
       const [fillRows, fundingRows, flowRows] =
         savedHistory ??
         (await readHistory(identity.master, p.ledger_started_at));
       coverage = fillRows.complete && fundingRows.complete && flowRows.complete;
-      const oidTasks = new Map<string, string>();
-      if (fillRows.events.length)
+      if (
+        fillRows.events.length ||
+        (handoffs.length && orders.some((order: any) => !orderIsManual(order)))
+      )
         for (const e of p.executions.filter(
-          (e) => e.task_id && e.key.startsWith("perps:"),
+          (e) =>
+            e.key.startsWith("perps:") &&
+            (e.task_id ||
+              recovered.find((entry) => entry.execution_id === e.id)?.task_id),
         )) {
-          const status = await this.core("perps_execution", {
-            user_id: user,
-            account_id: accountId,
-            task_id: e.task_id,
-          });
+          const task =
+            e.task_id ??
+            recovered.find((entry) => entry.execution_id === e.id)!.task_id!;
+          const status =
+            recoveredStatuses.get(task) ??
+            (await this.core("perps_execution", {
+              user_id: user,
+              account_id: accountId,
+              task_id: task,
+            }));
           for (const leg of status.legs ?? [])
-            if (leg.oid) oidTasks.set(String(leg.oid), e.task_id!);
+            if (leg.oid) oidTasks.set(String(leg.oid), task);
         }
       for (const f of fillRows.events) {
         const task = oidTasks.get(String(f.oid));
-        if (!task || f.feeToken !== "USDC") {
+        const handoff = handoffs.find((row) => row.coin === f.coin);
+        const manualShape =
+          !task &&
+          (!Number.isSafeInteger(f.time) ||
+            f.time <= 0 ||
+            !["B", "A"].includes(f.side) ||
+            ![f.sz, f.px, f.fee].every(
+              (value) =>
+                typeof value === "string" &&
+                /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value) &&
+                D(value).isFinite(),
+            ) ||
+            !D(f.sz).gt(0) ||
+            !D(f.px).gt(0));
+        if (
+          f.feeToken !== "USDC" ||
+          manualShape ||
+          (handoff && f.time === handoff.at_ms) ||
+          (task && handoff && f.time > handoff.at_ms) ||
+          (!task && (!handoff || f.time <= handoff.at_ms))
+        ) {
           coverage = false;
           continue;
         }
-        fills.push({
+        const fill = {
           id: `hl_${f.tid}_${f.oid}`,
           order_id: String(f.oid),
-          task_id: task,
           key: `perps:${f.coin}`,
           quantity: D(f.sz)
             .times(f.side === "B" ? 1 : -1)
@@ -1270,7 +1467,9 @@ export class CoreBridge {
           price: String(f.px),
           fee_usdc: String(f.fee),
           at: f.time,
-        });
+        };
+        if (task) fills.push({ ...fill, task_id: task });
+        else manualFills.push({ ...fill, handoff_id: handoff!.handoff_id });
       }
       funding = fundingRows.events.map((f) => ({
         id: `fund_${fingerprint(f).slice(0, 32)}`,
@@ -1278,6 +1477,16 @@ export class CoreBridge {
         amount_usdc: String(f.delta.usdc),
         at: f.time,
       }));
+      if (
+        funding.some((event) =>
+          handoffs.some(
+            (handoff) =>
+              event.key === `perps:${handoff.coin}` &&
+              event.at === handoff.at_ms,
+          ),
+        )
+      )
+        coverage = false;
       for (const f of flowRows.events) {
         const d = f.delta;
         let amount: string | null = null;
@@ -1342,8 +1551,24 @@ export class CoreBridge {
         id: String(x.oid),
         key: `perps:${x.coin}`,
         increases_risk: !x.reduceOnly,
+        ...(handoffs.length
+          ? {
+              ownership: oidTasks.has(String(x.oid))
+                ? ("copy" as const)
+                : orderIsManual(x)
+                  ? ("manual" as const)
+                  : ("unknown" as const),
+              ...(oidTasks.has(String(x.oid))
+                ? { task_id: oidTasks.get(String(x.oid)) }
+                : {}),
+            }
+          : {}),
       })),
       fills,
+      ...(handoffs.length
+        ? { manual_markets: handoffs, manual_fills: manualFills }
+        : {}),
+      ...(recovered.length ? { recovered_executions: recovered } : {}),
       funding,
       flows,
       coverage_complete: coverage,
@@ -1397,6 +1622,19 @@ export class CoreBridge {
       quantity_decimals: merge("quantity_decimals"),
       min_notionals: merge("min_notionals"),
       fills: snapshots.flatMap((s) => s.fills),
+      ...(snapshots.some((s) => s.manual_markets?.length)
+        ? {
+            manual_markets: snapshots.flatMap((s) => s.manual_markets ?? []),
+            manual_fills: snapshots.flatMap((s) => s.manual_fills ?? []),
+          }
+        : {}),
+      ...(snapshots.some((s) => s.recovered_executions?.length)
+        ? {
+            recovered_executions: snapshots.flatMap(
+              (s) => s.recovered_executions ?? [],
+            ),
+          }
+        : {}),
       funding: snapshots.flatMap((s) => s.funding),
       flows: snapshots.flatMap((s) => s.flows),
       orders: snapshots.flatMap((s) => s.orders),
@@ -1485,11 +1723,24 @@ export class CoreBridge {
   }
   async release(user: string, p: Portfolio): Promise<void> {
     const snap = await this.account(user, p);
+    const hasManual = Boolean(p.manual_ledger?.transfers.length);
     if (
       !fresh(snap.observed_at) ||
       !snap.coverage_complete ||
-      snap.orders.length ||
-      Object.values(snap.positions).some((q) => !D(q).isZero())
+      snap.orders.some(
+        (order) =>
+          !hasManual ||
+          order.ownership !== "manual" ||
+          !manualHandoff(p, order.key),
+      ) ||
+      (hasManual
+        ? !reconcileQuantities({ ...p, snapshot: snap }) ||
+          p.sleeves.some((sleeve) =>
+            Object.values(sleeve.lots).some(
+              (owned) => !D(owned.quantity).isZero(),
+            ),
+          )
+        : Object.values(snap.positions).some((q) => !D(q).isZero()))
     )
       throw new AgentError(
         "SETTLEMENT_PENDING",
@@ -1550,6 +1801,15 @@ export class CoreBridge {
       payload = saved.rows[0].payload;
     } else {
       const snap = await this.perpsAccount(user, p);
+      if (
+        snap.manual_markets?.some(
+          (handoff) => e.key === `perps:${handoff.coin}`,
+        )
+      )
+        throw new AgentError(
+          "EXECUTION_REJECTED",
+          "This market was permanently handed to manual trading; no copy target is authorized.",
+        );
       if (
         !fresh(snap.observed_at) ||
         !snap.coverage_complete ||
@@ -2026,7 +2286,12 @@ export class CoreBridge {
         }));
       case "cancel_increasing": {
         const snap = await this.account(input.user_id, input.portfolio);
-        for (const order of snap.orders.filter(
+        const ownedOrders = snap.orders.filter(
+          (order) =>
+            order.ownership !== "manual" ||
+            !manualHandoff(input.portfolio, order.key),
+        );
+        for (const order of ownedOrders.filter(
           (x) => x.increases_risk && x.key.startsWith("prediction:"),
         ))
           await this.core("prediction_cancel", {
@@ -2034,7 +2299,7 @@ export class CoreBridge {
             portfolio_id: input.portfolio.id,
             task_id: order.id,
           });
-        if (snap.orders.some((x) => x.increases_risk))
+        if (ownedOrders.some((x) => x.increases_risk))
           throw new AgentError(
             "UNRESOLVED_OPEN_ORDER",
             "Increasing open orders require Core reconciliation before exit.",

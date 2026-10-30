@@ -56,6 +56,7 @@ bridge 以 `ride_agent_core_outbox` 保存 execution ID、fingerprint、payload�
 - Fixed 跟单需要受支持 market scope、完整 source snapshot、覆盖窗口内的 fill evidence、确定排序；不完整证据拒绝增加风险。
 - 未入场的 suppressed shadow 只有满足完整负证据且没有任何 follower intent/lot/allocation/receipt 才可移除。风控正常阻挡新目标不会强行提交 Fixed cursor。
 - Perps 可能净额抵消，但 owned sleeve 仍按 gross 归属；prediction outcome tokens 分开，不能混合为同标的净仓。
+- 同账户原生 Perps 手动操作通过 Core immutable market handoff 接管该币种；Agent保留独立 manual ledger，只有 copy+manual 全账户守恒后才输出 copy-only 收益，手动币不再建 target，其余币继续。见 [接管协议](manual-market-handoff-2026-10-30.md)。
 - 不完整收益是 `null`；外部充值/提现不能计为交易收益。历史 source fills 计数不等于 follower executable order 数。
 
 ## UI 与工作流

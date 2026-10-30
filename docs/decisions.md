@@ -26,3 +26,11 @@
 本地`f20f87e`统一 Rider 登录和跟单 sizing 文案；远程最新`a4402eb`新增上述weighted budget；两者都不提供任意真实账户的成交证明。未决项包括跨 monitor lease、跨进程交易所限流预算、未知 prediction/redemption/dust 恢复、没有信号的硬杀断联处理和各宿主真实登录/卡片验收。具体负责人与排期：TBD – confirm。
 
 未来改决策时保留触发问题、备选方案、接受的代价、数据迁移/兼容影响和验证范围；不要用历史记录推定当前线上状态。
+
+## 2026-10-30：按币种交还手动控制
+
+用户明确选择同账户手动接管币种、其他币继续，不新增账户选择卡片。
+Core journal 冻结身份与金融边界，Agent以显式 ownership transfer + manual ledger
+保留copy收益与全账户守恒；未知任务用原ID只读恢复，不靠重新submit探测。
+Native以外scope保留拒绝，因为首次DEX现金基线不可由当前policy推断。
+详见[实现及验证](manual-market-handoff-2026-10-30.md)。

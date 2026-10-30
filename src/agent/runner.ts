@@ -14,12 +14,17 @@ import {
   type Sleeve,
   type MonitorError,
   assetAllowed,
+  manualHandoff,
+  manualQuantity,
 } from "./domain.js";
 import {
   applyFill,
   applyFunding,
   internalCross,
   reconcileQuantities,
+  applyManualHandoffs,
+  applyManualFill,
+  MANUAL_LEDGER_OWNER,
 } from "./ledger.js";
 import { event, AgentService } from "./service.js";
 import type { State } from "./repository.js";
@@ -133,6 +138,31 @@ export class AgentRunner {
           p.audit_started_at ??= snap.observed_at;
           if (p.loss_latched && p.state === "attention")
             p.state = "loss_triggered";
+          for (const recovered of snap.recovered_executions ?? []) {
+            const execution = p.executions.find(
+              (e) => e.id === recovered.execution_id,
+            );
+            if (
+              !execution ||
+              (execution.task_id != null &&
+                execution.task_id !== recovered.task_id) ||
+              ["completed", "failed", "superseded"].includes(
+                execution.status,
+              ) ||
+              !snap.manual_markets?.some(
+                (handoff) => execution.key === `perps:${handoff.coin}`,
+              )
+            )
+              throw new AgentError(
+                "HANDOFF_PENDING",
+                "Recovered execution evidence does not match the pending owned target.",
+                true,
+              );
+            execution.task_id = recovered.task_id;
+            execution.status = recovered.status;
+            if (execution.status === "completed" && !recovered.settled)
+              execution.status = "settling";
+          }
           for (const e of p.executions.filter(
             (e) =>
               e.task_id &&
@@ -157,6 +187,31 @@ export class AgentRunner {
               recordReceipt(p, fill, before);
               checkpoint(state, p, fill.key, fill.at);
             }
+          }
+          for (const transfer of applyManualHandoffs(p)) {
+            checkpoint(
+              state,
+              p,
+              `perps:${transfer.handoff.coin}`,
+              transfer.handoff.at_ms,
+            );
+            event(
+              state,
+              "market_handed_to_manual",
+              p.id,
+              "Manual trading now owns this market; copying continues only in other markets.",
+              {
+                key: `perps:${transfer.handoff.coin}`,
+                handoff_id: transfer.handoff.handoff_id,
+              },
+            );
+          }
+          for (const fill of [...(snap.manual_fills ?? [])].sort(
+            (a, b) => a.at - b.at || a.id.localeCompare(b.id),
+          )) {
+            if (p.manual_ledger?.seen_fills.includes(fill.id)) continue;
+            applyManualFill(p, fill);
+            checkpoint(state, p, fill.key, fill.at);
           }
           for (const f of snap.funding
             .filter((f) => f.at >= (p.ledger_started_at ?? Infinity))
@@ -207,6 +262,12 @@ export class AgentRunner {
             }
           }
           const profit = pnl(p);
+          if (p.manual_ledger && profit.net_usdc == null)
+            throw new AgentError(
+              "HANDOFF_ACCOUNTING_INCOMPLETE",
+              "Copy and manual ownership must reconcile with actual account equity before new targets are planned.",
+              true,
+            );
           recordPerformance(state, p);
           if (
             profit.net_usdc != null &&
@@ -521,6 +582,13 @@ export class AgentRunner {
                 const previousSource = D(fill.start_quantity!),
                   currentSource = previousSource.plus(fill.quantity),
                   previousTarget = D(t.fixed_targets?.[fill.key] ?? 0);
+                if (manualHandoff(p, fill.key)) {
+                  (t.source_quantities ??= {})[fill.key] =
+                    currentSource.toString();
+                  (t.fixed_targets ??= {})[fill.key] = "0";
+                  (t.fixed_seen_fills ??= []).push(fill.id);
+                  continue;
+                }
                 const position = source.positions.find(
                   (x) => x.key === fill.key,
                 );
@@ -566,6 +634,7 @@ export class AgentRunner {
                 ...Object.keys(t.intents),
               ]);
               for (const key of trackedKeys) {
+                if (manualHandoff(p, key)) continue;
                 if (sourceKeys.has(key)) continue;
                 if (
                   fixedWindowVerified &&
@@ -596,16 +665,17 @@ export class AgentRunner {
             }
             const permitted = source.positions.filter(
               (x) =>
-                x.market === "prediction" ||
-                assetAllowed(
-                  p.preferences,
-                  x.asset,
-                  s.trader.asset_categories?.[x.asset] ??
-                    (p.asset_filter_version === 2
-                      ? s.trader.asset_category
-                      : undefined),
-                  p.asset_filter_version ?? 1,
-                ),
+                !manualHandoff(p, x.key) &&
+                (x.market === "prediction" ||
+                  assetAllowed(
+                    p.preferences,
+                    x.asset,
+                    s.trader.asset_categories?.[x.asset] ??
+                      (p.asset_filter_version === 2
+                        ? s.trader.asset_category
+                        : undefined),
+                    p.asset_filter_version ?? 1,
+                  )),
             );
             const activeKeys = new Set(
               permitted
@@ -616,6 +686,7 @@ export class AgentRunner {
             for (const old of Object.values(t.intents))
               if (!activeKeys.has(old.key)) {
                 old.quantity = "0";
+                if (manualHandoff(p, old.key)) continue;
                 if (t.source_quantities) t.source_quantities[old.key] = "0";
                 if (t.fixed_targets) t.fixed_targets[old.key] = "0";
               }
@@ -864,6 +935,7 @@ export class AgentRunner {
             ...p.sleeves.flatMap((s) => Object.keys(s.lots)),
           ]);
           for (const key of keys) {
+            if (manualHandoff(p, key)) continue;
             if (
               p.executions.some(
                 (e) =>
@@ -1053,7 +1125,11 @@ export class AgentRunner {
                 ["completed", "superseded"].includes(e.status),
               ) &&
               p.reconciliation === "complete" &&
-              targets.every((t) => D(t.quantity).eq(snap.positions[t.key] ?? 0))
+              targets.every(
+                (t) =>
+                  manualHandoff(p, t.key) ||
+                  D(t.quantity).eq(snap.positions[t.key] ?? 0),
+              )
             )
               proposal.status = "completed";
           }
@@ -1424,9 +1500,12 @@ function checkpoint(s: State, p: Portfolio, key: string, at: number): void {
   s.checkpoints.push({
     at,
     key: `${p.id}:${key}`,
-    quantities: Object.fromEntries(
-      p.sleeves.map((x) => [x.copy_id, x.lots[key]?.quantity ?? "0"]),
-    ),
+    quantities: Object.fromEntries([
+      ...p.sleeves.map((x) => [x.copy_id, x.lots[key]?.quantity ?? "0"]),
+      ...(manualHandoff(p, key)
+        ? [[MANUAL_LEDGER_OWNER, manualQuantity(p, key)]]
+        : []),
+    ]),
   });
 }
 function eventOnce(

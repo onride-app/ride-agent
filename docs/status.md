@@ -44,3 +44,9 @@
 - Unified/RWA/portfolio margin有明确支持边界；看Core和部署flags，不以UI选项推断任意账户可执行。
 - pinned旧客户端迁移/版本兼容、外网issuer/Privy redirects、各宿主inline funding能力需独立检查。
 - 产品负责人、值班、备份恢复、告警和真实验收的owner/截止日期：TBD – confirm。
+
+## 2026-10-30 同账户手动币种接管
+
+已实现[手动接管协议](manual-market-handoff-2026-10-30.md)：native Perps 手动币不再被copy target覆盖，其他币继续；copy/manual账本与收益分开，全账户仍须守恒。
+本轮隔离PG 902/902（0skip）、functional53/53、typecheck/build/package通过。
+代码推送、各角色部署及原账号真实金融验收另记录；App不发新版，不以fixture代替真实成交。

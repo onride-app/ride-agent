@@ -106,6 +106,7 @@ npm 发布通过 `.github/workflows/publish.yml` 的手动 tag workflow：Node 2
 - `npm start` 默认 gateway，`RIDE_SERVICE_ENTRYPOINT` 配错会部署错误角色。多个服务都 SUCCESS 不证明各服务同源码版本。
 - `a4402eb`已新增同进程所有`VenueReads`实例与两个Hyperliquid host共享60秒加权预算（默认1000、代码上限1200）、响应附加费用及未知响应隔离；仍不是跨pod/fleet/IP总额度，扩容前须解决跨进程预算及调度leases。
 - 手动/旧版本安装不是全自动升级；固定 GitHub/global npm 安装保留版本，迁移检查见 migration 文档。
+- 同账户 native Perps 手动接管使用 [Core handoff + manual ledger](docs/manual-market-handoff-2026-10-30.md)。不可只删除全账户 ownership fence，也不可把手动盈亏计入 copy；foreign DEX handoff 仍拒绝，未知执行保留原 ID。
 - 不支持自动 prediction redemption；未知 receipt、未分类 merge/redemption 和 venue dust 留 attention；真实 production acceptance 不能由 fixture 补足。
 - Unified/RWA/Prediction 支持和 feature flags 分开；统一保证金/RWA 的限制看部署文档与 Core，实现存在不等于允许任意账户模式。
 - `SIGKILL` 无 shutdown signal 的断联检测仍依赖服务端/网络；已有 graceful drain 修复不能证明任意硬杀均无遗留锁。
