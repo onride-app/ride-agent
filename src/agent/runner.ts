@@ -1400,19 +1400,60 @@ export class AgentRunner {
       inFlight = new Set<Promise<void>>();
     let nextDiscovery = 0,
       wake = () => {};
+    let discoveredOnce = false;
+    let discovery: Promise<void> | undefined;
+    let discoveryFailure: { error: unknown } | undefined;
+    const checkDiscoveryFailure = () => {
+      if (discoveryFailure) throw discoveryFailure.error;
+    };
+    const discover = () => {
+      let read: Promise<string[]>;
+      try {
+        read = this.service.repository.users();
+      } catch (error) {
+        discoveryFailure = { error };
+        return;
+      }
+      discovery = Promise.resolve(read)
+        .then(
+          (values) => {
+            try {
+              if (signal.aborted) return;
+              const discovered = new Set(values);
+              nextDiscovery = now() + intervalMs;
+              discoveredOnce = true;
+              for (const [user, entry] of users) {
+                entry.present = discovered.has(user);
+                if (!entry.present && !entry.running) users.delete(user);
+              }
+              for (const user of discovered)
+                if (!users.has(user))
+                  users.set(user, {
+                    due: now(),
+                    running: false,
+                    present: true,
+                  });
+            } catch (error) {
+              discoveryFailure = { error };
+            }
+          },
+          (error) => {
+            discoveryFailure = { error };
+          },
+        )
+        .finally(() => {
+          discovery = undefined;
+          wake();
+        });
+    };
     try {
       while (!signal.aborted) {
-        if (now() >= nextDiscovery) {
-          const discovered = new Set(await this.service.repository.users());
-          nextDiscovery = now() + intervalMs;
-          for (const [user, entry] of users) {
-            entry.present = discovered.has(user);
-            if (!entry.present && !entry.running) users.delete(user);
-          }
-          for (const user of discovered)
-            if (!users.has(user))
-              users.set(user, { due: now(), running: false, present: true });
-        }
+        checkDiscoveryFailure();
+        if (!discovery && now() >= nextDiscovery) discover();
+        // The first list is required. Later discovery is only a worklist:
+        // current state, authority and risks are still checked by every tick.
+        if (!discoveredOnce) await discovery;
+        checkDiscoveryFailure();
         while (!signal.aborted && inFlight.size < 2) {
           // Keep a slow user's transaction from delaying every other user.
           // Oldest due time wins; Map order breaks ties without overlapping
@@ -1431,7 +1472,7 @@ export class AgentRunner {
             const startedAt = now();
             let failed = false;
             try {
-              if (signal.aborted) return;
+              if (signal.aborted || discoveryFailure || !entry.present) return;
               await this.tick(user);
             } catch {
               failed = true;
@@ -1463,7 +1504,7 @@ export class AgentRunner {
         }
         if (signal.aborted) break;
         const nextDue = Math.min(
-          nextDiscovery,
+          discovery ? Infinity : nextDiscovery,
           ...[...users.values()]
             .filter(
               (entry) => inFlight.size < 2 && entry.present && !entry.running,
@@ -1472,12 +1513,14 @@ export class AgentRunner {
         );
         await new Promise<void>((resolve) => {
           const done = () => {
-            clearTimeout(timer);
+            if (timer !== undefined) clearTimeout(timer);
             signal.removeEventListener("abort", done);
             wake = () => {};
             resolve();
           };
-          const timer = setTimeout(done, Math.max(0, nextDue - now()));
+          const timer = Number.isFinite(nextDue)
+            ? setTimeout(done, Math.max(0, nextDue - now()))
+            : undefined;
           wake = done;
           signal.addEventListener("abort", done, { once: true });
           if (signal.aborted) done();
@@ -1489,7 +1532,9 @@ export class AgentRunner {
       this.notifications.stop();
       signal.removeEventListener("abort", stopNotifications);
       await Promise.all(inFlight);
+      await discovery;
       await this.notifications.close();
+      checkDiscoveryFailure();
     }
   }
 }
