@@ -40,6 +40,7 @@ class Socket extends EventEmitter {
 }
 function fixture(network: "mainnet" | "testnet" = "mainnet") {
   let at = 0,
+    clockCalls = 0,
     expired!: () => void;
   const sockets: Socket[] = [],
     urls: string[] = [],
@@ -47,7 +48,10 @@ function fixture(network: "mainnet" | "testnet" = "mainnet") {
   const budget = new OrderSnapshotBudget(() => at);
   const reads = new VenueOrderSnapshots(network, {
     budget,
-    clock: () => at,
+    clock: () => {
+      clockCalls++;
+      return at;
+    },
     timers: {
       setTimeout(run) {
         expired = run;
@@ -71,6 +75,9 @@ function fixture(network: "mainnet" | "testnet" = "mainnet") {
     sockets,
     urls,
     reports,
+    get clockCalls() {
+      return clockCalls;
+    },
     expire: () => expired(),
     advance(ms: number) {
       at += ms;
@@ -539,4 +546,255 @@ it("retains control failures in the same connection-attempt budget as complete a
   assert.equal(await f.reads.readAbstraction(user, signal(), 9000), undefined);
   assert.equal(f.sockets.length, 20);
   assert.doesNotMatch(JSON.stringify(f.reports), /private-|aaaaa/);
+});
+
+for (const stage of ["unopened", "opened", "valid older"] as const)
+  it(`reports fixed timeout diagnostics for ${stage} without changing the3s wait`, async () => {
+    const f = fixture();
+    f.advance(10000);
+    const work = f.reads.readAbstraction(user, signal(), 10000);
+    const socket = f.sockets[0];
+    if (stage !== "unopened") socket.emit("open");
+    if (stage === "valid older")
+      socket.message({
+        channel: "webData3",
+        data: {
+          userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+          perpDexStates: [],
+        },
+      });
+    let settled = false;
+    void work.then(() => {
+      settled = true;
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    assert.equal(settled, false);
+    f.advance(3000);
+    f.expire();
+    assert.equal(await work, undefined);
+    assert.deepEqual(f.reports[0], {
+      event: "venue_order_snapshots",
+      outcome: "timeout",
+      requested_scopes: 0,
+      received_scopes: 0,
+      state_scopes: 0,
+      duration_ms: 3000,
+      read_kind: "abstraction",
+      socket_opened: stage !== "unopened",
+      control_messages: stage === "valid older" ? 1 : 0,
+      stale_control_messages: stage === "valid older" ? 1 : 0,
+      ...(stage === "valid older"
+        ? {
+            first_stale_control_after_start_ms: 0,
+            max_stale_control_fence_gap_ms: 1,
+          }
+        : {}),
+    });
+    assert.equal(
+      f.clockCalls,
+      stage === "unopened" ? 3 : stage === "opened" ? 4 : 5,
+    );
+    assert.equal(socket.terminated, 1);
+  });
+
+it("reports two control messages and one older valid proof while retaining the original late fresh proof", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000),
+    socket = f.sockets[0];
+  socket.emit("open");
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(100);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 10050, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  assert.deepEqual(await work, {
+    user,
+    dex_abstraction_enabled: false,
+    dispatch_at: 10000,
+    server_time: 10050,
+  });
+  assert.equal(f.reports[0].read_kind, "abstraction");
+  assert.equal(f.reports[0].socket_opened, true);
+  assert.equal(f.reports[0].control_messages, 2);
+  assert.equal(f.reports[0].stale_control_messages, 1);
+  assert.equal(f.reports[0].first_stale_control_after_start_ms, 0);
+  assert.equal(f.reports[0].max_stale_control_fence_gap_ms, 1);
+  assert.equal(f.clockCalls, 6);
+  assert.doesNotMatch(
+    JSON.stringify(f.reports),
+    /aaaaa|serverTime|dexAbstractionEnabled/,
+  );
+});
+
+for (const issue of ["owner", "future", "shape", "true"] as const)
+  it(`counts an invalid control message without counting valid-old proof ${issue}`, async () => {
+    const f = fixture();
+    f.advance(10000);
+    const work = f.reads.readAbstraction(user, signal(), 10000),
+      socket = f.sockets[0];
+    socket.emit("open");
+    const data: any = {
+      userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    };
+    if (issue === "owner") data.userState.user = "private-other-user";
+    if (issue === "future") data.userState.serverTime = 10001;
+    if (issue === "shape") data.perpDexStates = {};
+    if (issue === "true") data.userState.dexAbstractionEnabled = true;
+    socket.message({ channel: "webData3", data });
+    assert.equal(await work, undefined);
+    assert.equal(f.reports[0].outcome, "invalid");
+    assert.equal(f.reports[0].control_messages, 1);
+    assert.equal(f.reports[0].stale_control_messages, 0);
+    socket.message({
+      channel: "webData3",
+      data: {
+        userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+        perpDexStates: [],
+      },
+    });
+    assert.equal(f.reports.length, 1);
+    assert.equal(socket.listenerCount("message"), 0);
+    assert.equal("first_stale_control_after_start_ms" in f.reports[0], false);
+    assert.equal("max_stale_control_fence_gap_ms" in f.reports[0], false);
+    assert.equal(f.clockCalls, 5);
+  });
+
+for (const readKind of ["orders", "account"] as const)
+  it(`reports ${readKind} scope without any control count or additional clocks`, async () => {
+    const f = fixture();
+    f.advance(10000);
+    const work =
+      readKind === "orders"
+        ? f.reads.read(user, ["xyz"], signal())
+        : f.reads.readAccount(user, ["", "xyz"], signal());
+    const socket = f.sockets[0];
+    socket.emit("open");
+    if (readKind === "account") {
+      socket.snapshot("");
+      socket.state("");
+    }
+    socket.snapshot("xyz");
+    if (readKind === "account") socket.state("xyz");
+    assert.ok(await work);
+    assert.equal(f.reports[0].read_kind, readKind);
+    assert.equal(f.reports[0].socket_opened, true);
+    assert.equal(f.reports[0].control_messages, 0);
+    assert.equal(f.reports[0].stale_control_messages, 0);
+    assert.equal(f.clockCalls, readKind === "orders" ? 3 : 6);
+    assert.equal(socket.terminated, 1);
+  });
+
+it("keeps a diagnostic reporter failure isolated from the complete account result", async () => {
+  const f = fixture();
+  f.advance(10000);
+  f.reports.push = () => {
+    throw Error("private-report-failure");
+  };
+  const work = f.reads.readAccount(user, ["xyz"], signal()),
+    socket = f.sockets[0];
+  socket.emit("open");
+  socket.snapshot("xyz");
+  socket.state("xyz");
+  assert.ok(await work);
+  assert.equal(socket.terminated, 1);
+  assert.equal(f.clockCalls, 4);
+});
+
+it("records the first valid-old arrival delay and maximum history-fence gap without extra clocks", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000),
+    socket = f.sockets[0];
+  socket.emit("open");
+  f.advance(100);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9950, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(400);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9900, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(2500);
+  f.expire();
+  assert.equal(await work, undefined);
+  assert.equal(f.reports[0].first_stale_control_after_start_ms, 100);
+  assert.equal(f.reports[0].max_stale_control_fence_gap_ms, 100);
+  assert.equal(f.reports[0].stale_control_messages, 2);
+  assert.equal(f.reports[0].duration_ms, 3000);
+  assert.equal(f.clockCalls, 6);
+});
+
+it("omits an invalid first delay for the whole session instead of replacing it at the second valid-old message", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 9980),
+    socket = f.sockets[0];
+  f.advance(-20);
+  socket.emit("open");
+  f.advance(10);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9979, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(20);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9970, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(2990);
+  f.expire();
+  assert.equal(await work, undefined);
+  assert.equal("first_stale_control_after_start_ms" in f.reports[0], false);
+  assert.equal(f.reports[0].max_stale_control_fence_gap_ms, 10);
+  assert.equal(f.reports[0].stale_control_messages, 2);
+  assert.equal(f.clockCalls, 6);
+});
+
+it("omits a fractional first delay without clamping or changing the valid-old wait", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000),
+    socket = f.sockets[0];
+  socket.emit("open");
+  f.advance(0.5);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.advance(2999.5);
+  f.expire();
+  assert.equal(await work, undefined);
+  assert.equal("first_stale_control_after_start_ms" in f.reports[0], false);
+  assert.equal(f.reports[0].max_stale_control_fence_gap_ms, 1);
+  assert.equal(f.reports[0].outcome, "timeout");
+  assert.equal(f.clockCalls, 5);
 });

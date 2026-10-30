@@ -130,6 +130,11 @@ export class VenueOrderSnapshots {
       };
       let abstraction: ForeignAccountRead["abstraction"],
         abstractionDispatch: number | undefined;
+      let socketOpened = false,
+        controlMessages = 0,
+        staleControlMessages = 0;
+      let firstStaleControlAfterStartMs: number | undefined,
+        maxStaleControlFenceGapMs: number | undefined;
       let socket: WebSocket | undefined,
         settled = false,
         timer: unknown;
@@ -159,6 +164,25 @@ export class VenueOrderSnapshots {
             received_scopes: rows.size,
             state_scopes: states.size,
             duration_ms: Math.max(0, clock() - started),
+            read_kind: abstractionOnly
+              ? "abstraction"
+              : includeStates
+                ? "account"
+                : "orders",
+            socket_opened: socketOpened,
+            control_messages: controlMessages,
+            stale_control_messages: staleControlMessages,
+            ...(staleControlMessages > 0 &&
+            firstStaleControlAfterStartMs !== undefined
+              ? {
+                  first_stale_control_after_start_ms:
+                    firstStaleControlAfterStartMs,
+                }
+              : {}),
+            ...(staleControlMessages > 0 &&
+            maxStaleControlFenceGapMs !== undefined
+              ? { max_stale_control_fence_gap_ms: maxStaleControlFenceGapMs }
+              : {}),
           });
         } catch {
           /* diagnostic only */
@@ -186,6 +210,7 @@ export class VenueOrderSnapshots {
             followRedirects: false,
           });
         listen("open", () => {
+          socketOpened = true;
           try {
             if (abstractionOnly) {
               abstractionDispatch = clock();
@@ -243,6 +268,7 @@ export class VenueOrderSnapshots {
             return;
           const data = parsed?.data;
           if (abstractionOnly && parsed?.channel === "webData3") {
+            controlMessages++;
             const control = data?.userState,
               at = clock();
             if (
@@ -265,8 +291,21 @@ export class VenueOrderSnapshots {
             if (
               minimumServerTime !== undefined &&
               control.serverTime < minimumServerTime
-            )
+            ) {
+              staleControlMessages++;
+              if (staleControlMessages === 1) {
+                const delay = at - started;
+                if (Number.isSafeInteger(delay) && delay >= 0)
+                  firstStaleControlAfterStartMs = delay;
+              }
+              const gap = minimumServerTime - control.serverTime;
+              if (Number.isSafeInteger(gap) && gap > 0)
+                maxStaleControlFenceGapMs =
+                  maxStaleControlFenceGapMs === undefined
+                    ? gap
+                    : Math.max(maxStaleControlFenceGapMs, gap);
               return;
+            }
             abstraction = {
               user: control.user.toLowerCase(),
               dex_abstraction_enabled: false,
