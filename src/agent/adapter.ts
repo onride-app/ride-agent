@@ -1,6 +1,7 @@
 import { AgentError, errorDetails } from "./contracts.js";
 import { isPlanReadEvidence, type PlanReadEvidence } from "./read-evidence.js";
 import { monitorOperation } from "./monitor-diagnostics.js";
+import { sourceRequiresRwa } from "./source-identities.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -17,6 +18,8 @@ export interface SourceSnapshot {
   complete: boolean;
   // Actual Perps clearinghouse scopes observed by this snapshot; "" is native.
   perps_dexes?: string[];
+  // Internal proof of the minimum scope actually collected, not permission.
+  observation_scope_requires_rwa?: boolean;
 }
 export interface ActivationCheck {
   eligible: boolean;
@@ -343,17 +346,30 @@ export class BridgeAdapter implements VenueAdapter {
       );
     return result;
   }
-  sourceFills(trader: Candidate, start: number, end: number) {
-    return this.call<{
+  async sourceFills(trader: Candidate, start: number, end: number) {
+    const result = await this.call<{
       fills: SourceFill[];
       complete: boolean;
       reason?: string;
+      observation_scope_requires_rwa?: boolean;
     }>("source_fills", {
       trader_id: trader.id,
       market: trader.market,
       start_at: start,
       end_at: end,
+      ...(sourceRequiresRwa(trader) ? { minimum_requires_rwa: true } : {}),
     });
+    if (
+      sourceRequiresRwa(trader) &&
+      result.observation_scope_requires_rwa !== true
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "The execution boundary did not verify the original source's required observation scope.",
+        true,
+        503,
+      );
+    return result;
   }
   notificationStatus(user: string) {
     return this.call<{ configured: boolean; device_registered: boolean }>(
@@ -376,8 +392,22 @@ export class BridgeAdapter implements VenueAdapter {
   account(user: string, portfolio: Portfolio) {
     return this.call<AccountSnapshot>("account", { user_id: user, portfolio });
   }
-  source(trader: Candidate) {
-    return this.call<SourceSnapshot>("source", { trader_id: trader.id });
+  async source(trader: Candidate) {
+    const result = await this.call<SourceSnapshot>("source", {
+      trader_id: trader.id,
+      ...(sourceRequiresRwa(trader) ? { minimum_requires_rwa: true } : {}),
+    });
+    if (
+      sourceRequiresRwa(trader) &&
+      result.observation_scope_requires_rwa !== true
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "The execution boundary did not verify the original source's required observation scope.",
+        true,
+        503,
+      );
+    return result;
   }
   submit(user: string, portfolio: Portfolio, execution: Execution) {
     return this.call<{ task_id: string }>("submit", {

@@ -334,6 +334,12 @@ it("uses precisely the native / RWA scopes observed by readSource, including suc
         observed_at: now(),
       });
       try {
+        if (tagged && !enabled) {
+          await assert.rejects(bridge.source("fixture"), {
+            code: "SOURCE_SCOPE_UNAVAILABLE",
+          });
+          continue;
+        }
         const observation = await bridge.source("fixture");
         const scopes = enabled && tagged ? ["", "xyz"] : [""];
         assert.deepEqual(observation.perps_dexes, scopes);

@@ -143,7 +143,7 @@ function fixture(
   stub.venueReads = reads;
   stub.resolve = async () => ({
     address: sourceAddress,
-    tags: ["category:stocks_rwa"],
+    tags: options.rwa === false ? [] : ["category:stocks_rwa"],
   });
   stub.taxonomy = async () => new Map([["xyz:CL", "commodities"]]);
   const feed = new SourceFeed((id) => stub.readSource(id), {

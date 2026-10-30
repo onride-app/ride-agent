@@ -40,6 +40,7 @@ import {
   runMonitorTrace,
   monitorPhase,
   noteMonitorAccountAge,
+  noteMonitorSourceEvidence,
 } from "./monitor-diagnostics.js";
 import {
   recordPerformance,
@@ -460,44 +461,72 @@ export class AgentRunner {
           for (const s of p.sleeves) {
             if (["closed", "closing", "loss_triggered"].includes(s.state))
               continue;
-            if (now() - (s.reviewed_at ?? 0) >= 86400_000) {
-              const updated = await publicRead(() =>
-                adapter.profile(s.trader.id),
-              );
-              if (updated.scored_at >= s.trader.scored_at) {
-                const inactive =
-                  updated.last_trade_at == null
-                    ? null
-                    : now() - updated.last_trade_at;
-                const normal = Math.max(
-                  7 * 86400_000,
-                  (updated.median_hold_hours ?? 168) * 3600_000 * 2,
+            const reviewRetryAt = s.review_retry_at;
+            const reviewRetryPending =
+              Number.isSafeInteger(reviewRetryAt) &&
+              reviewRetryAt! > now() &&
+              reviewRetryAt! - now() <= 60_000;
+            if (
+              now() - (s.reviewed_at ?? 0) >= 86400_000 &&
+              !reviewRetryPending
+            ) {
+              try {
+                const updated = await publicRead(() =>
+                  adapter.profile(s.trader.id),
                 );
-                if (
-                  updated.eligibility !== "PASS" ||
-                  updated.score < s.trader.score - 10 ||
-                  updated.style !== s.trader.style ||
-                  (inactive != null && inactive > normal)
-                )
-                  eventOnce(
-                    state,
-                    "daily_review",
-                    p.id,
-                    "Trader score, style or trading activity needs review.",
-                    {
-                      copy_id: s.copy_id,
-                      previous_score: s.trader.score,
-                      current_score: updated.score,
-                      previous_style: s.trader.style,
-                      current_style: updated.style,
-                      inactive_days:
-                        inactive != null && inactive > normal
-                          ? Math.floor(inactive / 86400_000)
-                          : null,
-                    },
+                if (updated.scored_at >= s.trader.scored_at) {
+                  const inactive =
+                    updated.last_trade_at == null
+                      ? null
+                      : now() - updated.last_trade_at;
+                  const normal = Math.max(
+                    7 * 86400_000,
+                    (updated.median_hold_hours ?? 168) * 3600_000 * 2,
                   );
-                s.trader = updated;
-                s.reviewed_at = now();
+                  if (
+                    updated.eligibility !== "PASS" ||
+                    updated.score < s.trader.score - 10 ||
+                    updated.style !== s.trader.style ||
+                    (inactive != null && inactive > normal)
+                  )
+                    eventOnce(
+                      state,
+                      "daily_review",
+                      p.id,
+                      "Trader score, style or trading activity needs review.",
+                      {
+                        copy_id: s.copy_id,
+                        previous_score: s.trader.score,
+                        current_score: updated.score,
+                        previous_style: s.trader.style,
+                        current_style: updated.style,
+                        inactive_days:
+                          inactive != null && inactive > normal
+                            ? Math.floor(inactive / 86400_000)
+                            : null,
+                      },
+                    );
+                  s.trader = updated;
+                  s.reviewed_at = now();
+                  delete s.review_retry_at;
+                }
+              } catch (error) {
+                // Discovery scores and live source identity are independent.
+                // Only an explicit score absence may defer this review; other
+                // profile failures still stop the existing planning path.
+                if (
+                  !(error instanceof AgentError) ||
+                  error.code !== "SCORE_UNAVAILABLE"
+                )
+                  throw error;
+                s.review_retry_at = now() + 60_000;
+                eventOnce(
+                  state,
+                  "daily_review",
+                  p.id,
+                  "Fresh trader score is unavailable. Existing source tracking continues under unchanged controls.",
+                  { copy_id: s.copy_id, reason: "SCORE_UNAVAILABLE" },
+                );
               }
             }
             if (p.reconciliation !== "complete" && s.initialized) continue;
@@ -513,6 +542,7 @@ export class AgentRunner {
               observation = { ok: true, value };
             }
             const source = observation.value;
+            const sourceCheckedAt = now();
             if (
               !sourceEvidenceReady(source) ||
               !fresh(source.observed_at, 5000) ||
@@ -525,6 +555,15 @@ export class AgentRunner {
                 "Source coverage or equity is incomplete.",
                 true,
               );
+            noteMonitorSourceEvidence(
+              source.observed_at,
+              source.positions.reduce(
+                (minimum, position) => Math.min(minimum, position.observed_at),
+                source.positions[0]?.observed_at ?? source.observed_at,
+              ),
+              sourceCheckedAt,
+              p.sleeves.indexOf(s) + 1,
+            );
             if (!fresh(snap.observed_at))
               throw new AgentError(
                 "ACCOUNT_STALE",

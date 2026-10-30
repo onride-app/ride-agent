@@ -170,6 +170,8 @@ export interface Sleeve extends Allocation {
   last_source_at: number | null;
   replaced_at: number | null;
   reviewed_at?: number;
+  // A missing daily score does not replace a successful review or source read.
+  review_retry_at?: number;
   leverage_rules_revision?: string;
   source_quantities?: Record<string, string>;
   fixed_targets?: Record<string, string>;

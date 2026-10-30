@@ -5,7 +5,7 @@ import { AgentError } from "./contracts.js";
 export interface MonitorTimingRecord {
   event: "agent_monitor_timing";
   tick_ref: string;
-  kind: "tick" | "phase" | "operation" | "account_age";
+  kind: "tick" | "phase" | "operation" | "account_age" | "source_age";
   phase: string;
   parent_phase?: string;
   operation?: string;
@@ -13,6 +13,12 @@ export interface MonitorTimingRecord {
   outcome: "ok" | "error";
   error_category?: string;
   account_age_ms?: number;
+  source_slot?: number;
+  source_checked_at_ms?: number;
+  source_observed_at_ms?: number;
+  source_positions_min_observed_at_ms?: number;
+  source_age_ms?: number;
+  source_positions_max_age_ms?: number;
 }
 interface TraceOptions {
   clock?: () => number;
@@ -76,6 +82,12 @@ const errorCategories = new Set([
   "EXECUTOR_RESPONSE_INVALID",
   "EXECUTOR_REQUEST_TOO_LARGE",
   "SOURCE_NOT_FOUND",
+  "SOURCE_STALE",
+  "SCORE_UNAVAILABLE",
+  "SOURCE_SCOPE_UNAVAILABLE",
+  "SOURCE_IDENTITY_UNAVAILABLE",
+  "SOURCE_IDENTITY_CONFLICT",
+  "SOURCE_IDENTITY_INVALID",
   "NOT_FOUND",
   "PUSH_NOT_REGISTERED",
   "PUSH_NOT_CONFIGURED",
@@ -214,5 +226,42 @@ export function noteMonitorAccountAge(
     duration_ms: 0,
     outcome: "ok",
     account_age_ms: Math.round(Math.max(0, age)),
+  });
+}
+
+// Evidence at the existing consumption guard, distinct from historical
+// last_source_at stamps. Only numbers and the existing random tick_ref escape.
+export function noteMonitorSourceEvidence(
+  observedAt: number,
+  minimumPositionObservedAt: number,
+  checkedAt: number,
+  slot: number,
+): void {
+  const trace = traces.getStore();
+  if (
+    !trace ||
+    ![observedAt, minimumPositionObservedAt, checkedAt].every(
+      Number.isSafeInteger,
+    ) ||
+    !Number.isInteger(slot) ||
+    slot < 1 ||
+    slot > 1000
+  )
+    return;
+  const age = checkedAt - observedAt;
+  const positionAge = checkedAt - minimumPositionObservedAt;
+  const valid = age >= 0 && age <= 5000 && positionAge >= 0 && positionAge <= 5000;
+  emit(trace, {
+    kind: "source_age",
+    phase: trace.phase,
+    duration_ms: 0,
+    outcome: valid ? "ok" : "error",
+    ...(valid ? {} : { error_category: "SOURCE_STALE" }),
+    source_slot: slot,
+    source_checked_at_ms: checkedAt,
+    source_observed_at_ms: observedAt,
+    source_positions_min_observed_at_ms: minimumPositionObservedAt,
+    source_age_ms: age,
+    source_positions_max_age_ms: positionAge,
   });
 }

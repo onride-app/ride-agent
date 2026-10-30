@@ -20,6 +20,14 @@ import { notificationCancellation } from "./notification-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
 import { VenueOrderSnapshots } from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
+import {
+  PerpsSourceIdentities,
+  sourceRequiresRwa,
+} from "./source-identities.js";
+import {
+  perpsAcceptanceRequest,
+  perpsExecutionAcceptance,
+} from "./execution-acceptance.js";
 import { sourceEvidenceReady } from "./source-observations.js";
 import {
   inObservedPerpsScope,
@@ -121,6 +129,7 @@ export class CoreBridge {
   private orderSnapshots: VenueOrderSnapshots;
   private sourceFeed = new SourceFeed((id) => this.readSource(id));
   private pool: pg.Pool;
+  private sourceIdentities: PerpsSourceIdentities;
   private notificationReceipts: NotificationReceipts;
   private prediction: PredictionVenue;
   private taxonomyCache: { at: number; values: Map<string, string> } | null =
@@ -153,6 +162,11 @@ export class CoreBridge {
       );
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
+    this.sourceIdentities = new PerpsSourceIdentities(
+      this.pool,
+      salt,
+      (input, signal) => this.core("perps_source_identities", input, signal),
+    );
     this.notificationReceipts = new NotificationReceipts(this.pool);
     this.prediction = new PredictionVenue(
       this.pool,
@@ -164,6 +178,7 @@ export class CoreBridge {
       throw Error("Trader identity salt must contain 32 characters");
   }
   async migrate() {
+    await this.sourceIdentities.migrate();
     await this.prediction.migrate();
     await this.notificationReceipts.migrate();
     await this.pool.query(
@@ -285,21 +300,56 @@ export class CoreBridge {
       return this.candidatesCache.rows;
     const rows = await this.core("perps_pool", {});
     if (!Array.isArray(rows)) throw Error("Invalid trader pool");
+    await this.sourceIdentities.remember(
+      rows.map((row) => {
+        if (
+          !Array.isArray(row.tags) ||
+          row.tags.some((tag: unknown) => typeof tag !== "string")
+        )
+          throw new AgentError(
+            "SOURCE_SCOPE_UNAVAILABLE",
+            "Current source observation scope metadata is unavailable.",
+            true,
+            503,
+          );
+        return {
+          address:
+            typeof row.address === "string"
+              ? row.address.toLowerCase()
+              : row.address,
+          requires_rwa: Boolean(row.tags?.includes("category:stocks_rwa")),
+        };
+      }),
+    );
     this.candidatesCache = { at: now(), rows };
     return rows;
   }
-  private async resolve(id: string) {
-    const row = (await this.rows()).find(
-      (r: any) => this.traderId(r.address) === id,
-    );
-    if (!row)
+  private async resolve(id: string, purpose: "source" | "profile" = "source") {
+    if (typeof id !== "string" || !/^trader_[0-9a-f]{32}$/.test(id))
       throw new AgentError(
-        "NOT_FOUND",
-        "Fresh trader identity is unavailable.",
+        "SOURCE_IDENTITY_INVALID",
+        "Original source identifier is invalid.",
         false,
-        404,
+        400,
       );
-    return row;
+    if (purpose === "profile") {
+      const row = (await this.rows()).find(
+        (r: any) => this.traderId(r.address) === id,
+      );
+      if (!row || !Number.isFinite(row.expires_at) || row.expires_at <= now())
+        throw new AgentError(
+          "SCORE_UNAVAILABLE",
+          "A current qualified trader score is unavailable for review. Original source observation remains independent.",
+          true,
+          503,
+        );
+      return row;
+    }
+    const identity = await this.sourceIdentities.resolve(id);
+    return {
+      address: identity.address,
+      tags: identity.requires_rwa ? ["category:stocks_rwa"] : [],
+    };
   }
   private async taxonomy(): Promise<Map<string, string>> {
     if (this.taxonomyCache && fresh(this.taxonomyCache.at, 3600_000))
@@ -342,8 +392,44 @@ export class CoreBridge {
         "This dedicated RWA flow requires Standard mode; unified or portfolio-margin balances cannot be counted as separate DEX collateral.",
       );
   }
-  async source(id: string) {
-    return this.sourceFeed.read(id);
+  async source(id: string, minimumRequiresRwa = false) {
+    if (minimumRequiresRwa) await this.sourceIdentities.resolve(id, true);
+    const snapshot = await this.sourceFeed.read(id);
+    if (
+      snapshot.observation_scope_requires_rwa !== undefined ||
+      minimumRequiresRwa
+    ) {
+      const minimum = await this.resolve(id);
+      if (
+        minimum.tags?.includes("category:stocks_rwa") &&
+        snapshot.observation_scope_requires_rwa !== true
+      )
+        throw new AgentError(
+          "SOURCE_SCOPE_UNAVAILABLE",
+          "The source scope requirement increased; a new complete RWA observation is required.",
+          true,
+          503,
+        );
+      const returnedAt = now();
+      if (
+        [
+          snapshot.observed_at,
+          ...snapshot.positions.map((position) => position.observed_at),
+        ].some(
+          (observedAt) =>
+            !Number.isFinite(observedAt) ||
+            observedAt > returnedAt ||
+            returnedAt - observedAt > 5000,
+        )
+      )
+        throw new AgentError(
+          "SOURCE_STALE",
+          "Source evidence expired while verifying the required observation scope.",
+          true,
+          503,
+        );
+    }
+    return snapshot;
   }
   private async readSource(id: string) {
     if (
@@ -351,8 +437,18 @@ export class CoreBridge {
       (await this.prediction.recognizes(id))
     )
       return this.prediction.source(id);
-    const row = await this.resolve(id),
-      native = await this.infoWithEvidence(
+    const row = await this.resolve(id);
+    if (
+      row.tags?.includes("category:stocks_rwa") &&
+      process.env.RIDE_AGENT_RWA_ENABLED !== "true"
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "The original source requires complete RWA observations, which are not enabled.",
+        true,
+        503,
+      );
+    const native = await this.infoWithEvidence(
         { type: "clearinghouseState", user: row.address },
         true,
       ),
@@ -506,6 +602,9 @@ export class CoreBridge {
       account_value_usdc: String(state.marginSummary.accountValue),
       positions,
       perps_dexes: perpsDexes,
+      observation_scope_requires_rwa: Boolean(
+        row.tags?.includes("category:stocks_rwa"),
+      ),
       complete: true,
     };
   }
@@ -550,7 +649,7 @@ export class CoreBridge {
       (await this.prediction.recognizes(id))
     )
       return this.prediction.profile(id);
-    const row = await this.resolve(id),
+    const row = await this.resolve(id, "profile"),
       source = await this.source(id);
     let raw: any = {};
     try {
@@ -1913,7 +2012,10 @@ export class CoreBridge {
             "EXECUTION_REJECTED",
             "Verified leverage rules changed; recalculate the target before increasing exposure.",
           );
-        const source = await this.source(s.trader.id);
+        const source = await this.source(
+          s.trader.id,
+          sourceRequiresRwa(s.trader),
+        );
         const currentSource = source.positions?.find(
           (position) => position.key === intent.key,
         );
@@ -2042,6 +2144,11 @@ export class CoreBridge {
     observed_quantity: string | null;
     settled: boolean;
   }> {
+    const uncertain = {
+      status: "uncertain" as const,
+      observed_quantity: null,
+      settled: false,
+    };
     let task = e.task_id;
     if (!task) {
       const saved = await this.pool.query(
@@ -2049,13 +2156,51 @@ export class CoreBridge {
         [e.id, user, p.id],
       );
       if (!saved.rowCount)
-        return { status: "failed", observed_quantity: null, settled: false };
-      if (saved.rows[0].response) task = saved.rows[0].response.task_id;
-      else {
+        return e.key.startsWith("perps:")
+          ? uncertain
+          : { status: "failed", observed_quantity: null, settled: false };
+      if (e.key.startsWith("prediction:") && saved.rows[0].response)
+        task = saved.rows[0].response.task_id;
+      else if (
+        e.key.startsWith("perps:") &&
+        typeof saved.rows[0].response?.task_id === "string" &&
+        saved.rows[0].response.task_id
+      )
+        task = saved.rows[0].response.task_id;
+      else if (e.key.startsWith("perps:")) {
+        const request = perpsAcceptanceRequest(
+          user,
+          this.perpsBinding(p),
+          e,
+          saved.rows[0].payload,
+        );
+        if (!request || this.network !== "mainnet") return uncertain;
+        const startedAt = now();
+        let response: unknown;
+        try {
+          response = await this.core("perps_execution_acceptance", request);
+        } catch {
+          // Older Core, a lost read response, or incomplete acceptance evidence
+          // cannot authorize replay or release an unknown original target.
+          return uncertain;
+        }
+        const proof = perpsExecutionAcceptance(
+          request,
+          response,
+          startedAt,
+          now(),
+        );
+        if (proof.kind === "unknown") return uncertain;
+        if (proof.kind === "not_accepted_expired")
+          return { status: "failed", observed_quantity: null, settled: false };
+        task = proof.task_id;
+        await this.pool.query(
+          "UPDATE ride_agent_core_outbox SET response=$2 WHERE execution_id=$1",
+          [e.id, { task_id: task }],
+        );
+      } else if (e.key.startsWith("prediction:")) {
         const response = await this.core(
-          e.key.startsWith("prediction:")
-            ? "prediction_submit"
-            : "perps_submit",
+          "prediction_submit",
           saved.rows[0].payload,
         );
         await this.pool.query(
@@ -2063,7 +2208,7 @@ export class CoreBridge {
           [e.id, response],
         );
         task = response.task_id;
-      }
+      } else return uncertain;
     }
     if (e.key.startsWith("prediction:"))
       return this.prediction.execution(user, p, e, task!);
@@ -2296,7 +2441,20 @@ export class CoreBridge {
       case "profile":
         return this.profile(input.trader_id);
       case "source":
-        return this.source(input.trader_id);
+        if (
+          input.minimum_requires_rwa !== undefined &&
+          typeof input.minimum_requires_rwa !== "boolean"
+        )
+          throw new AgentError(
+            "SOURCE_SCOPE_UNAVAILABLE",
+            "Source observation scope is invalid.",
+            false,
+            400,
+          );
+        return this.source(
+          input.trader_id,
+          input.minimum_requires_rwa === true,
+        );
       case "source_fills": {
         if (
           !Number.isSafeInteger(input.start_at) ||
@@ -2318,8 +2476,21 @@ export class CoreBridge {
             reason:
               "Authenticated prediction source fill history is unavailable.",
           };
+        if (
+          input.minimum_requires_rwa !== undefined &&
+          typeof input.minimum_requires_rwa !== "boolean"
+        )
+          throw new AgentError(
+            "SOURCE_SCOPE_UNAVAILABLE",
+            "Source observation scope is invalid.",
+            false,
+            400,
+          );
+        const source = await this.source(
+          input.trader_id,
+          input.minimum_requires_rwa === true,
+        );
         const row = await this.resolve(input.trader_id);
-        const source = await this.source(input.trader_id);
         if (!sourceEvidenceReady(source) || !Array.isArray(source.perps_dexes))
           throw new AgentError(
             "SOURCE_FILL_EVIDENCE_MISSING",
@@ -2335,6 +2506,7 @@ export class CoreBridge {
         );
         return {
           complete: history.complete,
+          observation_scope_requires_rwa: source.observation_scope_requires_rwa,
           fills: scopedSourceFills(
             history.events,
             input.trader_id,

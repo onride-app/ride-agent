@@ -286,13 +286,51 @@ it("keeps a user leverage cap effective when source leverage is higher without i
   }
 });
 
-it("reconciles an existing outbox using its original identifier and payload after expiry and revision changes", async () => {
+function originalAcceptedProof(payload: any, task: string) {
+  const fields = [
+    "user_id",
+    "account_id",
+    "execution_id",
+    "fingerprint",
+    "asset",
+    "direction",
+    "target_position_pct",
+    "leverage",
+    "created_at",
+    "expires_at",
+    "policy_revision",
+  ];
+  return {
+    protocol_version: 1,
+    acceptance: "accepted",
+    task_id: task,
+    reason_code: "ORIGINAL_TASK_FOUND",
+    proof: {
+      ...Object.fromEntries(fields.map((key) => [key, payload[key]])),
+      network: "mainnet",
+      observed_at: now(),
+      current_execution_epoch: null,
+      serialized_expiry_check: false,
+    },
+  };
+}
+
+it("reconciles an existing outbox by a read-only original-task proof after expiry and revision changes, without replaying its payload", async (t) => {
+  let clock = now();
+  t.mock.method(Date, "now", () => clock);
   const f = bridgeFixture();
-  f.e.expires_at = now() - 1000;
+  clock += 60_000;
   f.p.revision += 1;
   f.p.state = "attention";
   const payload = {
+    user_id: "alice",
+    account_id: f.p.account_id,
     execution_id: f.e.id,
+    fingerprint: f.e.fingerprint,
+    asset: "BTC",
+    direction: "long",
+    target_position_pct: "2.0000",
+    leverage: 5,
     target_quantity: "0.1",
     entry_reference_price: "100",
     created_at: f.e.created_at,
@@ -310,30 +348,57 @@ it("reconciles an existing outbox using its original identifier and payload afte
     assert.fail(
       "Recovery must not use a new source position to replace the payload",
     );
+  const task = "00000000-0000-4000-8000-000000000004";
+  const reads: string[] = [];
+  f.stub.core = async (op: string, request: any) => {
+    reads.push(op);
+    if (op === "perps_execution_acceptance") {
+      assert.equal(request.execution_id, payload.execution_id);
+      assert.equal(request.expires_at, payload.expires_at);
+      return originalAcceptedProof(payload, task);
+    }
+    if (op === "perps_execution") return { status: 2, legs: [] };
+    assert.fail(
+      "Reconciliation must not resubmit or rewrite the original admission",
+    );
+  };
   try {
     const recovered = await f.bridge.execution("alice", f.p, f.e);
-    assert.equal(recovered.task_id, "task_original");
+    assert.equal(recovered.task_id, task);
     assert.equal(recovered.status, "submitted");
-    assert.deepEqual(f.submissions, [payload]);
+    assert.deepEqual(f.submissions, []);
+    assert.deepEqual(reads, ["perps_execution_acceptance", "perps_execution"]);
     assert.deepEqual(f.outbox.get(f.e.id).payload, payload);
   } finally {
     await f.bridge.close();
   }
 });
 
-it("recovers a Core-accepted response loss by the same execution id and frozen payload after expiry", async () => {
+it("recovers a Core-accepted response loss by read-only proof of the same execution id after expiry, with exactly one original submission", async (t) => {
+  let clock = now();
+  t.mock.method(Date, "now", () => clock);
   const f = bridgeFixture(),
     accepted = new Set<string>();
   let lost = false;
+  const task = "00000000-0000-4000-8000-000000000004";
   f.stub.core = async (op: string, payload: any) => {
     if (op === "perps_submit") {
+      assert.equal(
+        lost,
+        false,
+        "Unknown original work must never be submitted again",
+      );
       accepted.add(payload.execution_id);
       f.submissions.push(structuredClone(payload));
       if (!lost) {
         lost = true;
         throw Error("Accepted but response lost");
       }
-      return { task_id: "task_original" };
+      return { task_id: task };
+    }
+    if (op === "perps_execution_acceptance") {
+      assert.equal(accepted.has(payload.execution_id), true);
+      return originalAcceptedProof(f.outbox.get(f.e.id).payload, task);
     }
     if (op === "perps_execution") return { status: 2, legs: [] };
     return { policy_revision: 1 };
@@ -341,7 +406,7 @@ it("recovers a Core-accepted response loss by the same execution id and frozen p
   try {
     await assert.rejects(f.bridge.submit("alice", f.p, f.e), /response lost/);
     const frozen = structuredClone(f.outbox.get(f.e.id).payload);
-    f.e.expires_at = now() - 1000;
+    clock += 60_000;
     f.p.revision++;
     f.p.state = "attention";
     f.stub.perpsAccount = () =>
@@ -349,9 +414,9 @@ it("recovers a Core-accepted response loss by the same execution id and frozen p
     f.stub.source = () =>
       assert.fail("Do not replan accepted work from a later source");
     const status = await f.bridge.execution("alice", f.p, f.e);
-    assert.equal(status.task_id, "task_original");
+    assert.equal(status.task_id, task);
     assert.equal(accepted.size, 1);
-    assert.deepEqual(f.submissions, [frozen, frozen]);
+    assert.deepEqual(f.submissions, [frozen]);
     assert.deepEqual(f.outbox.get(f.e.id).payload, frozen);
   } finally {
     await f.bridge.close();

@@ -264,6 +264,9 @@ it("expired completion buffers from 2000 vanished owners cannot permanently exha
 });
 
 it("a timed-out sender that ignores cancellation cannot later acknowledge success or overlap its original claim", async () => {
+  // Keep lease time independent of host scheduling stalls; cancellation still
+  // uses the real 20ms timer below. Expired leases have separate regressions.
+  const clock = Date.now();
   const repository = new MemoryRepository(),
     adapter: VenueAdapter = new FakeAdapter(),
     entered = deferred(),
@@ -281,6 +284,7 @@ it("a timed-out sender that ignores cancellation cannot later acknowledge succes
   const dispatcher = new NotificationDispatcher(repository, adapter, {
     timeoutMs: 20,
     leaseMs: 60,
+    clock: () => clock,
   });
   dispatcher.enqueue("unknown");
   await entered.promise;
