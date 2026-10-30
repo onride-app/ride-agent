@@ -87,6 +87,8 @@ export interface VenueAdapter {
       message: string;
       portfolio_id: string | null;
     },
+    signal?: AbortSignal,
+    deadlineMs?: number,
   ): Promise<void>;
 }
 export interface SourceFill {
@@ -142,6 +144,7 @@ function validBridgeResponse(operation: string, data: unknown): boolean {
   if (operation === "candidates") return Array.isArray(data);
   if (operation === "read_plan_evidence") return isPlanReadEvidence(data);
   if (!record(data)) return false;
+  if (operation === "notify") return data.ok === true;
   if (!["account", "preflight", "bind"].includes(operation)) return true;
   return (
     typeof data.account_id === "string" &&
@@ -216,21 +219,32 @@ export class BridgeAdapter implements VenueAdapter {
       throw new Error("Executor URL must not contain credentials");
     if (!token) throw new Error("Missing executor service token");
   }
-  private async call<T>(operation: string, input: unknown): Promise<T> {
+  private async call<T>(
+    operation: string,
+    input: unknown,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return monitorOperation(operation, () =>
-      this.performCall<T>(operation, input),
+      this.performCall<T>(operation, input, signal),
     );
   }
-  private async performCall<T>(operation: string, input: unknown): Promise<T> {
+  private async performCall<T>(
+    operation: string,
+    input: unknown,
+    callerSignal?: AbortSignal,
+  ): Promise<T> {
     // The complete account observation is bounded at 20s inside the bridge.
     // Leave transport margin for its typed failure and retry hint to arrive.
-    const signal = AbortSignal.timeout(
+    const timeoutSignal = AbortSignal.timeout(
       operation.startsWith("funding_")
         ? 90000
         : ["account", "preflight", "bind"].includes(operation)
           ? 25000
           : 20000,
     );
+    const signal = callerSignal
+      ? AbortSignal.any([timeoutSignal, callerSignal])
+      : timeoutSignal;
     let response: Response;
     try {
       response = await withBridgeDeadline(
@@ -397,7 +411,13 @@ export class BridgeAdapter implements VenueAdapter {
       message: string;
       portfolio_id: string | null;
     },
+    signal?: AbortSignal,
+    deadlineMs = Date.now() + 20000,
   ) {
-    await this.call("notify", { user_id: user, event });
+    await this.call(
+      "notify",
+      { user_id: user, event, deadline_ms: deadlineMs },
+      signal,
+    );
   }
 }

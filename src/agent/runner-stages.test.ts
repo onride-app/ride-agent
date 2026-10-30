@@ -144,7 +144,7 @@ it("publishes the audit before a slow source, then commits verified planning bef
     f.advance(6000);
     source.resolve();
     await flush();
-    assert.equal(f.committed.length, 2);
+    assert.equal(f.committed.length, 3);
     assert.equal(f.committed[1].portfolios[0].state, "active");
     assert.equal(f.committed[1].portfolios[0].last_error, undefined);
     assert.equal(
@@ -157,19 +157,25 @@ it("publishes the audit before a slow source, then commits verified planning bef
       "planning must not relabel the already published financial evidence",
     );
     assert.equal(notifying, true);
-    assert.equal(finished, false);
+    assert.equal(
+      finished,
+      true,
+      "delivery must not keep the financial tick in flight",
+    );
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   } finally {
     source.resolve();
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   }
-  assert.equal(f.committed.length, 3);
+  assert.equal(f.committed.length, 4);
   assert.ok(
-    f.committed[2].updates.every(
-      (update) => update.notification === "delivered",
-    ),
+    f.committed
+      .at(-1)!
+      .updates.every((update) => update.notification === "delivered"),
   );
   assert.equal(f.adapter.submitCount, 0);
 });
@@ -397,18 +403,19 @@ it("keeps failed audits out of planning while durable unknown reconciliation and
     };
   };
   await f.runner.tick("alice");
-  assert.equal(f.committed.length, 3);
+  await f.runner.notificationsIdle();
+  assert.equal(f.committed.length, 4);
   assert.deepEqual(ids, ["execution_uncertain_original"]);
   assert.ok(
-    f.committed[2].updates.every(
-      (update) => update.notification === "delivered",
-    ),
+    f.committed
+      .at(-1)!
+      .updates.every((update) => update.notification === "delivered"),
   );
   assert.equal(
     f.committed[2].portfolios[0].last_error?.code,
     "VENUE_READ_BUDGET_EXHAUSTED",
   );
-  const before = structuredClone(f.committed[2]);
+  const before = await f.repository.read("alice");
   f.advance(1000);
   source.resolve();
   await flush();

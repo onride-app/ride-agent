@@ -1241,7 +1241,7 @@ export class AgentService {
                     e.at < end &&
                     (!e.data.copy_id || e.data.copy_id === sleeve.copy_id),
                 )
-                .map(({ notification, ...e }) => e),
+                .map(({ notification, notification_claim, ...e }) => e),
               fees_usdc: receipts.length
                 ? cash(receipts.reduce((n, x) => n.plus(x.fee_usdc), D(0)))
                 : followerComplete
@@ -1305,7 +1305,9 @@ export class AgentService {
         const last = page.at(-1);
         return result(
           {
-            updates: page.map(({ notification, ...event }) => event),
+            updates: page.map(
+              ({ notification, notification_claim, ...event }) => event,
+            ),
             next_cursor: last
               ? this.cursor.encode(user, last.at, last.id)
               : (args.cursor ?? null),
@@ -1884,6 +1886,7 @@ export class AgentService {
         notification_attempts,
         next_notification_at,
         notification_error,
+        notification_claim,
         ...record
       } = update;
       return result({ update: record });

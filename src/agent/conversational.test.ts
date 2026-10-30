@@ -318,8 +318,14 @@ it("schedules an opted-in local digest once across restarts, retries failed push
   adapter.notify = async () => {
     throw Error("push unavailable");
   };
-  await new AgentRunner(api).tick("alice");
-  await new AgentRunner(api).tick("alice");
+  const tickAndDeliver = async () => {
+    const runner = new AgentRunner(api);
+    await runner.tick("alice");
+    await runner.notificationsIdle();
+    await runner.closeNotifications();
+  };
+  await tickAndDeliver();
+  await tickAndDeliver();
   await repository.transact("alice", async (s) => {
     assert.equal(s.updates.filter((x) => x.kind === "daily_digest").length, 1);
     assert.equal(s.updates[0].notification, "pending");
@@ -328,7 +334,7 @@ it("schedules an opted-in local digest once across restarts, retries failed push
     adapter.notifyCount++;
   };
   at += 10000;
-  await new AgentRunner(api).tick("alice");
+  await tickAndDeliver();
   assert.equal(adapter.notifyCount, 1);
   assert.equal(localDay(at, "Asia/Shanghai").time, "09:01");
   await repository.transact("alice", async (s) => {
@@ -339,7 +345,7 @@ it("schedules an opted-in local digest once across restarts, retries failed push
     local_time: "09:00",
     timezone: "Asia/Shanghai",
   });
-  await new AgentRunner(api).tick("alice");
+  await tickAndDeliver();
   await repository.transact("alice", async (s) => {
     assert.equal(s.updates[0].notification, "cancelled");
   });

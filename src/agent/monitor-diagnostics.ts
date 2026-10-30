@@ -33,6 +33,9 @@ const phases = new Set([
   "audit_control",
   "observe_plan",
   "durable_notify",
+  "notification_dispatch",
+  "notification_claim",
+  "notification_ack",
   "account_observation",
   "account_binding",
   "db_state_read",
@@ -74,6 +77,14 @@ const errorCategories = new Set([
   "EXECUTOR_REQUEST_TOO_LARGE",
   "SOURCE_NOT_FOUND",
   "NOT_FOUND",
+  "PUSH_NOT_REGISTERED",
+  "PUSH_NOT_CONFIGURED",
+  "PUSH_UNAVAILABLE",
+  "PUSH_RESPONSE_INVALID",
+  "PUSH_RECEIPT_UNAVAILABLE",
+  "PUSH_EVENT_MISMATCH",
+  "PUSH_DELIVERY_TIMEOUT",
+  "PUSH_DELIVERY_CANCELLED",
 ]);
 function elapsed(trace: Trace, start: number): number {
   const value = trace.clock() - start;
@@ -147,6 +158,23 @@ export async function runMonitorTrace<T>(
     thresholdMs: options.thresholdMs ?? 250,
   };
   return traces.run(trace, () => timed(trace, "tick", "tick", work));
+}
+/** Notification delivery has its own reference and never extends a financial tick. */
+export async function runNotificationTrace<T>(
+  work: () => Promise<T>,
+): Promise<T> {
+  const parent = traces.getStore();
+  const trace: Trace = {
+    ref: randomUUID(),
+    phase: "notification_dispatch",
+    clock: parent?.clock ?? (() => performance.now()),
+    report:
+      parent?.report ?? ((record) => console.info(JSON.stringify(record))),
+    thresholdMs: parent?.thresholdMs ?? 250,
+  };
+  return traces.run(trace, () =>
+    timed(trace, "phase", "notification_dispatch", work),
+  );
 }
 export async function monitorPhase<T>(
   name: string,

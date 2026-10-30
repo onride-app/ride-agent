@@ -450,7 +450,7 @@ for (const delayed of ["notification", "uncertain reconciliation"] as const)
       if (accounts.length === 2) {
         assert.equal(
           drained,
-          true,
+          delayed === "uncertain reconciliation",
           "pending durable work must finish before retrying the account",
         );
         f.controller.abort();
@@ -493,15 +493,15 @@ for (const delayed of ["notification", "uncertain reconciliation"] as const)
       await time.advance(1000);
       assert.deepEqual(
         accounts,
-        [0],
-        "an elapsed retry cannot interrupt durable work",
+        delayed === "notification" ? [0, 216] : [0],
+        "notifications are independent; financial reconciliation remains serialized",
       );
       gate.resolve();
       await flush();
       await flush();
       assert.deepEqual(
         accounts,
-        [0, 1000],
+        delayed === "notification" ? [0, 216] : [0, 1000],
         "do not append another five seconds after the retry has already elapsed",
       );
     } finally {
@@ -511,7 +511,11 @@ for (const delayed of ["notification", "uncertain reconciliation"] as const)
     }
     const saved = await f.repository.read("alice");
     assert.ok(
-      saved.updates.every((update) => update.notification === "delivered"),
+      saved.updates.every(
+        (update) =>
+          update.notification ===
+          (delayed === "notification" ? "pending" : "delivered"),
+      ),
     );
     if (delayed === "uncertain reconciliation") {
       assert.ok(

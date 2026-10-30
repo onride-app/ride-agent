@@ -45,6 +45,7 @@ export interface Update {
   notification_attempts?: number;
   next_notification_at?: number;
   notification_error?: string;
+  notification_claim?: { token: string; expires_at: number };
 }
 export interface HoldingCheckpoint {
   at: number;

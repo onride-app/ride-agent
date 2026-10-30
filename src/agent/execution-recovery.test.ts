@@ -88,8 +88,9 @@ it("does not let hanging public reads prevent a bind failure from committing or 
     new Cursor("s".repeat(32)),
   );
   let timeout: ReturnType<typeof setTimeout>;
+  const runner = new AgentRunner(service);
   await Promise.race([
-    new AgentRunner(service).tick("alice"),
+    runner.tick("alice"),
     new Promise((_, reject) => {
       timeout = setTimeout(
         () =>
@@ -99,6 +100,7 @@ it("does not let hanging public reads prevent a bind failure from committing or 
     }),
   ]);
   clearTimeout(timeout!);
+  await runner.notificationsIdle();
   const before = await repo.transact("alice", async (s) => structuredClone(s));
   assert.equal(before.portfolios[0].state, "attention");
   source.resolve({

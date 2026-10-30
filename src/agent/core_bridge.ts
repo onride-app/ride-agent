@@ -16,6 +16,8 @@ import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
+import { notificationCancellation } from "./notification-cancellation.js";
+import { NotificationReceipts } from "./notification-receipts.js";
 import { VenueOrderSnapshots } from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
 import { sourceEvidenceReady } from "./source-observations.js";
@@ -119,6 +121,7 @@ export class CoreBridge {
   private orderSnapshots: VenueOrderSnapshots;
   private sourceFeed = new SourceFeed((id) => this.readSource(id));
   private pool: pg.Pool;
+  private notificationReceipts: NotificationReceipts;
   private prediction: PredictionVenue;
   private taxonomyCache: { at: number; values: Map<string, string> } | null =
     null;
@@ -150,6 +153,7 @@ export class CoreBridge {
       );
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
+    this.notificationReceipts = new NotificationReceipts(this.pool);
     this.prediction = new PredictionVenue(
       this.pool,
       (op, input) => this.core(op, input),
@@ -161,6 +165,7 @@ export class CoreBridge {
   }
   async migrate() {
     await this.prediction.migrate();
+    await this.notificationReceipts.migrate();
     await this.pool.query(
       `CREATE TABLE IF NOT EXISTS ride_agent_core_outbox (execution_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,portfolio_id TEXT NOT NULL,fingerprint TEXT NOT NULL,payload JSONB NOT NULL,response JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT now());`,
     );
@@ -203,7 +208,11 @@ export class CoreBridge {
     );
     return response;
   }
-  private async core(operation: string, input: unknown): Promise<any> {
+  private async core(
+    operation: string,
+    input: unknown,
+    notificationSignal?: AbortSignal,
+  ): Promise<any> {
     const r = await fetch(
       new URL(`/internal/agent-core/${operation}`, this.coreUrl),
       {
@@ -213,11 +222,13 @@ export class CoreBridge {
           Authorization: `Bearer ${this.coreToken}`,
         },
         body: JSON.stringify(input),
-        signal: AbortSignal.timeout(
-          this.venueReads.accountReadTimeout(
-            operation.startsWith("perps_funding_") ? 90000 : 20000,
-          ),
-        ),
+        signal: notificationSignal
+          ? AbortSignal.any([notificationSignal, AbortSignal.timeout(20000)])
+          : AbortSignal.timeout(
+              this.venueReads.accountReadTimeout(
+                operation.startsWith("perps_funding_") ? 90000 : 20000,
+              ),
+            ),
         redirect: "error",
       },
     );
@@ -2096,8 +2107,32 @@ export class CoreBridge {
       message: string;
       portfolio_id: string | null;
     },
+    signal?: AbortSignal,
+    deadline = now() + 20000,
   ): Promise<void> {
-    const tokens = await this.core("push_tokens", { user_id: user });
+    const left = deadline - now();
+    if (!Number.isSafeInteger(deadline) || left <= 0 || left > 20000)
+      throw new AgentError(
+        "PUSH_DELIVERY_TIMEOUT",
+        "Notification result is unconfirmed; retry the original event.",
+        true,
+        503,
+      );
+    const timeout = AbortSignal.timeout(left);
+    signal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const check = () => {
+      signal!.throwIfAborted();
+      if (now() >= deadline)
+        throw new AgentError(
+          "PUSH_DELIVERY_TIMEOUT",
+          "Notification result is unconfirmed; retry the original event.",
+          true,
+          503,
+        );
+    };
+    check();
+    const tokens = await this.core("push_tokens", { user_id: user }, signal);
+    check();
     if (!tokens.length)
       throw new AgentError(
         "PUSH_NOT_REGISTERED",
@@ -2127,9 +2162,12 @@ export class CoreBridge {
           grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
           assertion,
         }),
-        signal: AbortSignal.timeout(10000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(10000)])
+          : AbortSignal.timeout(10000),
       });
       const payload = (await response.json()) as any;
+      check();
       if (!response.ok || !payload.access_token)
         throw Error("Push authentication failed");
       this.tokens = {
@@ -2138,6 +2176,10 @@ export class CoreBridge {
       };
     }
     for (const token of tokens) {
+      check();
+      if (await this.notificationReceipts.acknowledged(user, event, token))
+        continue;
+      check();
       const response = await fetch(
         `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(service.project_id)}/messages:send`,
         {
@@ -2162,13 +2204,37 @@ export class CoreBridge {
               apns: { headers: { "apns-collapse-id": event.id } },
             },
           }),
-          signal: AbortSignal.timeout(10000),
+          signal: signal
+            ? AbortSignal.any([signal, AbortSignal.timeout(10000)])
+            : AbortSignal.timeout(10000),
         },
       );
       if (!response.ok) throw Error("Push delivery failed");
+      const receipt = (await response.json()) as any;
+      if (
+        typeof receipt?.name !== "string" ||
+        !/^projects\/[^/\s]+\/messages\/[^/\s]+$/.test(receipt.name) ||
+        !receipt.name.startsWith(`projects/${service.project_id}/messages/`)
+      )
+        throw new AgentError(
+          "PUSH_RESPONSE_INVALID",
+          "Push acceptance could not be verified; delivery remains pending.",
+          true,
+          503,
+        );
+      // A complete provider acceptance is truthful even if the caller has
+      // just cancelled. Persist it before checking time; never send another
+      // device after the same absolute cutoff.
+      await this.notificationReceipts.acknowledge(user, event, token);
+      check();
     }
+    check();
   }
-  async operation(op: string, input: any): Promise<unknown> {
+  async operation(
+    op: string,
+    input: any,
+    notificationCaller?: AbortSignal,
+  ): Promise<unknown> {
     switch (op) {
       case "read_plan_evidence":
         return readSelectedPlanEvidence(input?.traders, {
@@ -2351,10 +2417,30 @@ export class CoreBridge {
           );
         return { ok: true };
       }
-      case "notify":
-        return this.notify(input.user_id, input.event).then(() => ({
-          ok: true,
-        }));
+      case "notify": {
+        const deadline = input.deadline_ms ?? now() + 20000;
+        const remaining = deadline - now();
+        if (
+          !Number.isSafeInteger(deadline) ||
+          remaining <= 0 ||
+          remaining > 20000
+        )
+          throw new AgentError(
+            "PUSH_DELIVERY_TIMEOUT",
+            "Notification deadline expired; delivery remains unconfirmed.",
+            true,
+            503,
+          );
+        const timeout = AbortSignal.timeout(remaining);
+        const signal = notificationCaller
+          ? AbortSignal.any([timeout, notificationCaller])
+          : timeout;
+        return this.notify(input.user_id, input.event, signal, deadline).then(
+          () => ({
+            ok: true,
+          }),
+        );
+      }
       default:
         throw new AgentError(
           "NOT_FOUND",
@@ -2410,12 +2496,24 @@ export async function startCoreBridge() {
         );
       return;
     }
+    const cancellation =
+      req.params.operation === "notify"
+        ? notificationCancellation(req, res)
+        : undefined;
     try {
-      res.json(await bridge.operation(req.params.operation, req.body));
+      res.json(
+        await bridge.operation(
+          req.params.operation,
+          req.body,
+          cancellation?.signal,
+        ),
+      );
     } catch (e) {
       res
         .status(e instanceof AgentError ? e.httpStatus : 503)
         .json({ error: failure(e).error });
+    } finally {
+      cancellation?.close();
     }
   });
   const listener = app.listen(

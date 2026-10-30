@@ -1,5 +1,9 @@
 import { AgentError } from "./contracts.js";
 import {
+  NotificationDispatcher,
+  type PreparedNotifications,
+} from "./notification-dispatcher.js";
+import {
   D,
   cash,
   uid,
@@ -48,7 +52,20 @@ import {
 export class AgentRunner {
   private sourceTimes = new Map<string, number>();
   private venueRetryAt = new Map<string, number>();
-  constructor(private service: AgentService) {}
+  private notifications: NotificationDispatcher;
+  constructor(private service: AgentService) {
+    this.notifications = new NotificationDispatcher(
+      service.repository,
+      service.adapter,
+    );
+  }
+  async notificationsIdle(): Promise<void> {
+    await this.notifications.flush();
+  }
+  async closeNotifications(): Promise<void> {
+    await this.notifications.close();
+    await this.notifications.flush();
+  }
   async tick(user: string): Promise<void> {
     return runMonitorTrace(() => this.tickBody(user));
   }
@@ -1201,135 +1218,121 @@ export class AgentRunner {
         this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
       this.venueRetryAt.set(user, nextVenueRetryAt);
     } else this.venueRetryAt.delete(user);
-    await transact("durable_notify", async (state) => {
-      for (const p of state.portfolios)
-        for (const e of p.executions.filter(
-          (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
-        )) {
-          if (
-            e.status === "queued" &&
-            (e.revision !== p.revision || p.state === "attention")
-          ) {
-            e.status = "superseded";
-            continue;
-          }
-          if (e.status === "queued" && e.expires_at <= now()) {
-            e.status = "failed";
-            e.error = "Target expired before submission";
-            continue;
-          }
-          try {
-            if (e.status === "uncertain") {
-              const observed = await adapter.execution(user, p, e);
-              if (observed.status !== "failed") {
-                e.status = observed.status;
-                e.task_id = observed.task_id ?? e.task_id;
-                e.observed_quantity = observed.observed_quantity;
-                continue;
-              }
-              if (e.revision !== p.revision || p.state === "attention") {
-                e.status = "superseded";
-                continue;
-              }
-              if (e.expires_at <= now()) {
-                e.status = "failed";
-                e.error = "Target expired before submission";
-                continue;
-              }
-            }
-            // The bridge revalidates source revision, ownership, authority, price
-            // deviation, live margin and Core policy immediately before signing.
-            const submit = await adapter.submit(user, p, e);
-            e.task_id = submit.task_id;
-            e.status = "submitted";
-            event(
-              state,
-              "execution_submitted",
-              p.id,
-              "Order submitted; fill and settlement are pending.",
-              { execution_id: e.id },
-            );
-          } catch (error) {
+    let preparedNotifications: PreparedNotifications | undefined;
+    try {
+      await transact("durable_notify", async (state) => {
+        for (const p of state.portfolios)
+          for (const e of p.executions.filter(
+            (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
+          )) {
             if (
-              error instanceof AgentError &&
-              error.code === "EXECUTION_REJECTED"
+              e.status === "queued" &&
+              (e.revision !== p.revision || p.state === "attention")
             ) {
-              e.status = "failed";
-              e.error = error.message;
-            } else {
-              e.status = "uncertain";
-              e.error =
-                "Submission result unknown; same execution identifier must be reconciled.";
+              e.status = "superseded";
+              continue;
             }
-            eventOnce(
-              state,
-              e.status === "failed"
-                ? "EXECUTION_REJECTED"
-                : "EXECUTION_UNCERTAIN",
-              p.id,
-              e.error,
-              { execution_id: e.id },
-            );
+            if (e.status === "queued" && e.expires_at <= now()) {
+              e.status = "failed";
+              e.error = "Target expired before submission";
+              continue;
+            }
+            try {
+              if (e.status === "uncertain") {
+                const observed = await adapter.execution(user, p, e);
+                if (observed.status !== "failed") {
+                  e.status = observed.status;
+                  e.task_id = observed.task_id ?? e.task_id;
+                  e.observed_quantity = observed.observed_quantity;
+                  continue;
+                }
+                if (e.revision !== p.revision || p.state === "attention") {
+                  e.status = "superseded";
+                  continue;
+                }
+                if (e.expires_at <= now()) {
+                  e.status = "failed";
+                  e.error = "Target expired before submission";
+                  continue;
+                }
+              }
+              // The bridge revalidates source revision, ownership, authority, price
+              // deviation, live margin and Core policy immediately before signing.
+              const submit = await adapter.submit(user, p, e);
+              e.task_id = submit.task_id;
+              e.status = "submitted";
+              event(
+                state,
+                "execution_submitted",
+                p.id,
+                "Order submitted; fill and settlement are pending.",
+                { execution_id: e.id },
+              );
+            } catch (error) {
+              if (
+                error instanceof AgentError &&
+                error.code === "EXECUTION_REJECTED"
+              ) {
+                e.status = "failed";
+                e.error = error.message;
+              } else {
+                e.status = "uncertain";
+                e.error =
+                  "Submission result unknown; same execution identifier must be reconciled.";
+              }
+              eventOnce(
+                state,
+                e.status === "failed"
+                  ? "EXECUTION_REJECTED"
+                  : "EXECUTION_UNCERTAIN",
+                p.id,
+                e.error,
+                { execution_id: e.id },
+              );
+            }
           }
-        }
-      const prefs = state.notification_preferences;
-      if (prefs?.daily_digest) {
-        const local = localDay(now(), prefs.timezone),
-          enabled = localDay(prefs.enabled_at, prefs.timezone);
-        if (
-          local.time >= prefs.local_time &&
-          prefs.last_digest_day !== local.day &&
-          (enabled.day < local.day || enabled.time < prefs.local_time)
-        ) {
-          const p = state.portfolios.at(-1);
-          if (p) {
-            const performance = performanceView(state, p, "daily");
-            event(
-              state,
-              "daily_digest",
-              p.id,
-              `Ride daily report · ${local.day} · net profit ${performance.net_profit_usdc ?? "unavailable"} USDC · ${performance.coverage} coverage.`,
-              { performance, timezone: prefs.timezone, digest_day: local.day },
-            );
-          }
-          prefs.last_digest_day = local.day;
-        }
-      }
-      for (const update of state.updates.filter(
-        (e) =>
-          e.notification === "pending" &&
-          (e.next_notification_at ?? 0) <= now(),
-      ))
-        try {
-          // Disabling an opted-in digest cancels queued digest delivery only.
+        const prefs = state.notification_preferences;
+        if (prefs?.daily_digest) {
+          const local = localDay(now(), prefs.timezone),
+            enabled = localDay(prefs.enabled_at, prefs.timezone);
           if (
-            update.kind === "daily_digest" &&
-            (!prefs?.daily_digest ||
-              update.data.digest_day !== localDay(now(), prefs.timezone).day)
+            local.time >= prefs.local_time &&
+            prefs.last_digest_day !== local.day &&
+            (enabled.day < local.day || enabled.time < prefs.local_time)
           ) {
-            update.notification = "cancelled";
-            continue;
+            const p = state.portfolios.at(-1);
+            if (p) {
+              const performance = performanceView(state, p, "daily");
+              event(
+                state,
+                "daily_digest",
+                p.id,
+                `Ride daily report · ${local.day} · net profit ${performance.net_profit_usdc ?? "unavailable"} USDC · ${performance.coverage} coverage.`,
+                {
+                  performance,
+                  timezone: prefs.timezone,
+                  digest_day: local.day,
+                },
+              );
+            }
+            prefs.last_digest_day = local.day;
           }
-          await adapter.notify(user, update);
-          update.notification = "delivered";
-          update.notification_error = undefined;
-          update.next_notification_at = undefined;
-        } catch (error) {
-          update.notification_attempts =
-            (update.notification_attempts ?? 0) + 1;
-          update.next_notification_at =
-            now() +
-            Math.min(
-              3600_000,
-              5000 * 2 ** Math.min(10, update.notification_attempts),
-            );
-          update.notification_error =
-            error instanceof AgentError ? error.code : "PUSH_UNAVAILABLE";
-          /* Durable retry on the next tick. */
         }
-    });
+        preparedNotifications = this.notifications.prepare(user, state);
+      });
+    } catch (error) {
+      if (preparedNotifications)
+        this.notifications.rollback(preparedNotifications);
+      throw error;
+    }
+    if (preparedNotifications)
+      this.notifications.committed(preparedNotifications);
   }
+
   async run(signal: AbortSignal, intervalMs = 5000): Promise<void> {
+    const stopNotifications = () => this.notifications.stop();
+    signal.addEventListener("abort", stopNotifications, { once: true });
+    if (signal.aborted) stopNotifications();
     const users = new Map<
         string,
         { due: number; running: boolean; present: boolean }
@@ -1423,7 +1426,10 @@ export class AgentRunner {
     } finally {
       // Shutdown stops admission immediately and preserves durable completion
       // of transactions and external-effect reconciliation already in flight.
+      this.notifications.stop();
+      signal.removeEventListener("abort", stopNotifications);
       await Promise.all(inFlight);
+      await this.notifications.close();
     }
   }
 }

@@ -104,8 +104,8 @@ function assertPrivate(records: MonitorTimingRecord[]) {
   assert.ok(records.length > 0);
   assert.equal(
     new Set(records.map((record) => record.tick_ref)).size,
-    1,
-    "nested Runner instrumentation must reuse one ephemeral trace",
+    records.some((record) => record.phase === "notification_dispatch") ? 2 : 1,
+    "financial work reuses one reference; notification delivery has a separate reference",
   );
   assert.match(records[0].tick_ref, /^[0-9a-f-]{36}$/);
 }
@@ -171,7 +171,11 @@ it("separates account work, early audit publication, source planning and durable
     assert.deepEqual(order, ["account_start", "account_done", "audit_ready"]);
     assert.deepEqual(
       records
-        .filter((record) => record.kind === "phase")
+        .filter(
+          (record) =>
+            record.kind === "phase" &&
+            !record.phase.startsWith("notification_"),
+        )
         .map((record) => [record.phase, record.duration_ms]),
       [["account_observation", 300]],
     );
@@ -192,26 +196,35 @@ it("separates account work, early audit publication, source planning and durable
     source.resolve();
     await flush();
     assert.equal(order.at(-1), "notify_start");
-    assert.equal(finished, false);
+    assert.equal(
+      finished,
+      true,
+      "notification delivery is separate from the financial tick",
+    );
     f.advance(1700);
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   } finally {
     account.resolve();
     source.resolve();
     commit.resolve();
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   }
   assert.deepEqual(
     records
-      .filter((record) => record.kind === "phase")
+      .filter(
+        (record) =>
+          record.kind === "phase" && !record.phase.startsWith("notification_"),
+      )
       .map((record) => [record.phase, record.duration_ms, record.outcome]),
     [
       ["account_observation", 300, "ok"],
       ["audit_control", 500, "ok"],
       ["observe_plan", 600, "ok"],
-      ["durable_notify", 600, "ok"],
+      ["durable_notify", 0, "ok"],
     ],
   );
   assert.ok(
@@ -224,7 +237,7 @@ it("separates account work, early audit publication, source planning and durable
     records.some(
       (record) =>
         record.kind === "tick" &&
-        record.duration_ms === 1700 &&
+        record.duration_ms === 1100 &&
         record.outcome === "ok",
     ),
   );
@@ -272,24 +285,33 @@ it("records binding failures while preserving the caught error and draining noti
     binding.resolve();
     await flush();
     assert.ok(notified > 0);
-    assert.equal(finished, false);
+    assert.equal(
+      finished,
+      true,
+      "notification delivery is separate from the financial tick",
+    );
     f.advance(700);
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   } finally {
     binding.resolve();
     notification.resolve();
     await running;
+    await f.runner.notificationsIdle();
   }
   assert.deepEqual(
     records
-      .filter((record) => record.kind === "phase")
+      .filter(
+        (record) =>
+          record.kind === "phase" && !record.phase.startsWith("notification_"),
+      )
       .map((record) => [record.phase, record.duration_ms, record.outcome]),
     [
       ["account_binding", 300, "error"],
       ["audit_control", 300, "ok"],
       ["observe_plan", 0, "ok"],
-      ["durable_notify", 400, "ok"],
+      ["durable_notify", 0, "ok"],
     ],
   );
   const saved = await f.repository.read(privateUser);

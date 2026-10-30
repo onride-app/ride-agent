@@ -68,6 +68,10 @@ it("uses existing Firebase project and delivers only the report owner's event pa
     "testnet",
   );
   const stub = bridge as any;
+  stub.notificationReceipts = {
+    acknowledged: async () => false,
+    acknowledge: async () => {},
+  };
   stub.core = async (op: string, args: any) => {
     assert.equal(op, "push_tokens");
     assert.deepEqual(args, { user_id: "alice" });
