@@ -136,6 +136,38 @@ export class PgRepository implements Repository {
       // flushing ClientWrite; driver timeout and shutdown must close sockets.
       statement_timeout: statementTimeoutMs,
       query_timeout: queryTimeoutMs,
+      // pg-pool awaits this once before a new connection can be checked out.
+      // Configure after pg applies URL options/PGOPTIONS, preserving all other
+      // settings and any stricter positive TCP bound. This is a network ACK
+      // deadline, not a timer around the financial callback or transaction.
+      onConnect: async (client) => {
+        const result = await client.query<{ tcp_user_timeout_ms: number }>(
+          `SELECT (CASE WHEN setting::int BETWEEN 1 AND 20000 THEN setting
+                       ELSE pg_catalog.set_config('tcp_user_timeout', '20000', false)
+                  END)::int AS tcp_user_timeout_ms
+             FROM pg_catalog.pg_settings
+            WHERE name='tcp_user_timeout' AND unit='ms'`,
+        );
+        const effective = result.rows[0]?.tcp_user_timeout_ms;
+        // Unsupported kernels and Unix sockets report zero. Keep compatibility
+        // without claiming server-side protection on those connections.
+        if (
+          result.rowCount !== 1 ||
+          typeof effective !== "number" ||
+          !Number.isSafeInteger(effective) ||
+          effective < 0 ||
+          effective > 20000
+        )
+          throw new Error("Database TCP timeout could not be configured");
+      },
+    });
+    // pg-pool has already removed an errored idle/initializing connection.
+    // Its checkout still rejects; this diagnostic must never throw or expose
+    // the driver's error object, connection details or SQL.
+    this.pool.on("error", () => {
+      try {
+        console.error("Rider database pool connection failed.");
+      } catch {}
     });
   }
   async migrate(): Promise<void> {
