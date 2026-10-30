@@ -1096,8 +1096,20 @@ async function highDexObservationLoad(
           );
         assert.ok(
           snap.observed_at <=
-            base + Math.min(...calls.map((x) => x.at)) + wireMs,
-          "snapshot freshness must use its earliest actual response rather than stamp the end of the frame",
+            base +
+              Math.min(
+                ...calls
+                  .filter((x) =>
+                    [
+                      "clearinghouseState",
+                      "spotClearinghouseState",
+                      "allMids",
+                      "frontendOpenOrders",
+                    ].includes(x.type),
+                  )
+                  .map((x) => x.at),
+              ),
+          "snapshot freshness must retain its earliest actual financial dispatch, independently of preceding mode or scope metadata reads",
         );
         for (const dex of mode === "unified"
           ? Array.from({ length: 10 }, (_, j) => `dex${j}`)

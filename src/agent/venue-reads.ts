@@ -477,7 +477,7 @@ export class VenueReads {
     let ticket: ReadTicket | undefined,
       sent = false,
       settled = false;
-    let wireTimer: unknown;
+    let wireTimer: unknown, admissionTimer: unknown;
     let wireSignal = signal;
     const user = (payload as { user?: unknown })?.user;
     const owner = typeof user === "string" && user.length ? user : undefined;
@@ -485,10 +485,34 @@ export class VenueReads {
     const requestSignal = this.callerSignal
       ? AbortSignal.any([signal, this.callerSignal])
       : signal;
+    const sourceAdmission =
+      lane === "source" &&
+      !scope &&
+      cost.rows?.maximum !== undefined &&
+      cost.reserve >= 100
+        ? new AbortController()
+        : undefined;
+    const admissionUntil = sourceAdmission
+      ? this.clock() + Math.max(1, this.deadlineMs - 1000)
+      : undefined;
+    const admissionError = () =>
+      new AgentError(
+        "VENUE_READ_DEADLINE",
+        "Source admission expired before the minimum wire window.",
+        true,
+        503,
+      );
     const admissionSignal = scope
       ? AbortSignal.any([requestSignal, scope.admission.signal])
-      : requestSignal;
+      : sourceAdmission
+        ? AbortSignal.any([requestSignal, sourceAdmission.signal])
+        : requestSignal;
     try {
+      if (sourceAdmission)
+        admissionTimer = this.timers.setTimeout(
+          () => sourceAdmission.abort(admissionError()),
+          Math.max(0, admissionUntil! - this.clock()),
+        );
       ticket = await this.budget.acquire(
         lane,
         cost.reserve,
@@ -497,6 +521,12 @@ export class VenueReads {
         cost.unknownSurcharge,
         scope?.reservation,
       );
+      if (admissionTimer !== undefined)
+        this.timers.clearTimeout(admissionTimer);
+      // A late ticket may resolve in the same turn as the queue cutoff. No
+      // HTTP is sent unless the original operation still has its wire reserve.
+      if (admissionUntil !== undefined && this.clock() >= admissionUntil)
+        throw admissionError();
       this.checkCooldown(cost.method, lane, false);
       if (admissionSignal.aborted) throw admissionSignal.reason;
       if (signal.aborted) throw signal.reason;
@@ -670,6 +700,8 @@ export class VenueReads {
         this.count(cost.method, lane, "local_cooldown_denied");
       throw error;
     } finally {
+      if (admissionTimer !== undefined)
+        this.timers.clearTimeout(admissionTimer);
       if (wireTimer !== undefined) this.timers.clearTimeout(wireTimer);
       if (sent && !settled) {
         this.count(cost.method, lane, "charged_weight", ticket!.reservation);

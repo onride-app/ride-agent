@@ -18,7 +18,10 @@ import { VenueReads } from "./venue-reads.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
 import { notificationCancellation } from "./notification-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
-import { VenueOrderSnapshots } from "./venue-order-snapshots.js";
+import {
+  VenueOrderSnapshots,
+  type ForeignAccountRead,
+} from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
 import {
   PerpsSourceIdentities,
@@ -1229,12 +1232,16 @@ export class CoreBridge {
         user: identity.master,
       }),
       mode = perpsAccountMode(abstraction),
-      readHistory = (address: string, start: number, end = now()) =>
-        Promise.all([
+      readHistory = async (address: string, start: number, end = now()) => {
+        // Read the largest bounded provisional hold before accumulating the
+        // other histories' settled weight. Preserve all pages and one fence.
+        const fills = await this.paged("userFillsByTime", address, start, end);
+        const [funding, flows] = await Promise.all([
           this.paged("userFunding", address, start, end),
-          this.paged("userFillsByTime", address, start, end),
           this.paged("userNonFundingLedgerUpdates", address, start, end),
-        ]).then(([funding, fills, flows]) => [fills, funding, flows] as const),
+        ]);
+        return [fills, funding, flows] as const;
+      },
       financialPrefix =
         mode === "unified" &&
         process.env.RIDE_AGENT_UNIFIED_ENABLED === "true" &&
@@ -1246,12 +1253,99 @@ export class CoreBridge {
         );
     let state: any, orders: any, mids: any, meta: any, spotPrefix: any;
     let savedHistory: Awaited<ReturnType<typeof readHistory>> | undefined;
+    let prefixDexes: any, prefixScopes: ForeignAccountRead | undefined;
+    let nativeObservedAt: number | undefined;
+    let historyCompletedAt: number | undefined;
     if (financialPrefix) {
-      [state, mids, spotPrefix] = await Promise.all([
-        this.info({ type: "clearinghouseState", user: identity.master }),
+      // Discover scopes before financial evidence, so the native pair and all
+      // foreign guards share one fresh connection before the history fence.
+      prefixDexes = await this.info({ type: "perpDexs" });
+      if (
+        !Array.isArray(prefixDexes) ||
+        prefixDexes[0] !== null ||
+        prefixDexes
+          .slice(1)
+          .some((dex: any) => typeof dex?.name !== "string" || !dex.name.trim())
+      )
+        throw new AgentError(
+          "ACCOUNT_STALE",
+          "Complete Perps market scopes are unavailable.",
+          true,
+        );
+      const scopeNames = [
+        "",
+        ...prefixDexes.slice(1).map((dex: any) => dex.name as string),
+      ];
+      [prefixScopes, mids, spotPrefix] = await Promise.all([
+        this.orderSnapshots
+          .readAccount(
+            identity.master,
+            scopeNames,
+            this.venueReads.accountReadSignal(),
+          )
+          .catch(() => undefined),
         this.info({ type: "allMids" }),
         this.info({ type: "spotClearinghouseState", user: identity.master }),
       ]);
+      this.venueReads.accountReadTimeout();
+      const observed = now(),
+        native =
+          prefixScopes?.states instanceof Map
+            ? (prefixScopes.states.get("") as any)
+            : undefined;
+      const nativeOrdersAt =
+        prefixScopes?.dispatches?.orders instanceof Map
+          ? prefixScopes.dispatches.orders.get("")
+          : undefined;
+      const nativeStateAt =
+        prefixScopes?.dispatches?.states instanceof Map
+          ? prefixScopes.dispatches.states.get("")
+          : undefined;
+      const validDispatch = (at: unknown): at is number =>
+        typeof at === "number" &&
+        Number.isSafeInteger(at) &&
+        at > 0 &&
+        at <= observed;
+      const nativeDecimal = (value: unknown): value is string | number =>
+        (typeof value === "number" && Number.isFinite(value)) ||
+        (typeof value === "string" &&
+          /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value) &&
+          D(value).isFinite());
+      if (
+        !(prefixScopes?.orders instanceof Map) ||
+        !(prefixScopes.states instanceof Map) ||
+        scopeNames.some(
+          (dex) =>
+            !Array.isArray(prefixScopes!.orders.get(dex)) ||
+            !Array.isArray(
+              (prefixScopes!.states.get(dex) as any)?.assetPositions,
+            ),
+        ) ||
+        prefixScopes.orders.get("")!.length !== 0 ||
+        !nativeDecimal(native?.marginSummary?.accountValue) ||
+        !nativeDecimal(native?.withdrawable) ||
+        !validDispatch(nativeOrdersAt) ||
+        !validDispatch(nativeStateAt)
+      ) {
+        // WS orders do not promise frontend order fields. Nonempty native,
+        // partial or unproven batches retain the entire original REST sweep.
+        prefixScopes = undefined;
+        [state, orders] = await Promise.all([
+          this.info({ type: "clearinghouseState", user: identity.master }),
+          this.info({ type: "frontendOpenOrders", user: identity.master }),
+        ]);
+      } else {
+        state = {
+          ...native,
+          marginSummary: {
+            ...native.marginSummary,
+            accountValue: String(native.marginSummary.accountValue),
+          },
+          withdrawable: String(native.withdrawable),
+        };
+        orders = prefixScopes.orders.get("");
+        nativeObservedAt = Math.min(nativeOrdersAt, nativeStateAt);
+      }
       if (
         !state.marginSummary?.accountValue ||
         !Array.isArray(state.assetPositions)
@@ -1262,18 +1356,15 @@ export class CoreBridge {
           true,
         );
       unifiedUsdc(spotPrefix);
-      // The financial values above are the ones returned in this frame.
-      // Cover them with one history fence before admitting expensive rules
-      // and foreign-scope guards. Their success is still mandatory below.
+      // All returned native financial evidence, including fallback REST, must
+      // precede the complete history fence. Later guards cannot backfill it.
       savedHistory = await readHistory(
         identity.master,
         p!.ledger_started_at!,
         now(),
       );
-      [orders, meta] = await Promise.all([
-        this.info({ type: "frontendOpenOrders", user: identity.master }),
-        this.info({ type: "meta" }),
-      ]);
+      historyCompletedAt = now();
+      meta = await this.info({ type: "meta" });
     } else {
       [state, orders, mids, meta] = await Promise.all([
         this.info({ type: "clearinghouseState", user: identity.master }),
@@ -1304,6 +1395,46 @@ export class CoreBridge {
     let accountValue = String(state.marginSummary.accountValue);
     let available = String(state.withdrawable);
     if (mode === "unified") {
+      const readDexAbstraction = async () => {
+        if (financialPrefix) {
+          try {
+            const proof = await this.orderSnapshots.readAbstraction(
+              identity.master,
+              this.venueReads.accountReadSignal(),
+              historyCompletedAt,
+            );
+            this.venueReads.accountReadTimeout();
+            const at = now();
+            const fresh = (value: unknown): value is number =>
+              typeof value === "number" &&
+              Number.isSafeInteger(value) &&
+              value > 0 &&
+              value <= at &&
+              at - value <= 5000;
+            if (
+              proof &&
+              typeof proof.user === "string" &&
+              proof.user.toLowerCase() === identity.master.toLowerCase() &&
+              proof.dex_abstraction_enabled === false &&
+              fresh(proof.dispatch_at) &&
+              fresh(proof.server_time) &&
+              historyCompletedAt !== undefined &&
+              proof.server_time >= historyCompletedAt
+            ) {
+              nativeObservedAt = Math.min(
+                nativeObservedAt ?? Infinity,
+                proof.dispatch_at,
+                proof.server_time,
+              );
+              return false;
+            }
+          } catch {
+            /* Fresh independent control proof is optional; retain REST. */
+          }
+        }
+        this.venueReads.accountReadTimeout();
+        return this.info({ type: "userDexAbstraction", user: identity.master });
+      };
       const [spot, dexAbstraction, dexes] = await Promise.all([
         financialPrefix
           ? spotPrefix
@@ -1311,8 +1442,8 @@ export class CoreBridge {
               type: "spotClearinghouseState",
               user: identity.master,
             }),
-        this.info({ type: "userDexAbstraction", user: identity.master }),
-        this.info({ type: "perpDexs" }),
+        readDexAbstraction(),
+        financialPrefix ? prefixDexes : this.info({ type: "perpDexs" }),
       ]);
       if (![false, null].includes(dexAbstraction))
         throw new AgentError(
@@ -1341,11 +1472,13 @@ export class CoreBridge {
         | { orders: Map<string, unknown[]>; states: Map<string, unknown> }
         | undefined;
       try {
-        freshScopes = await this.orderSnapshots.readAccount(
-          identity.master,
-          foreignDexes,
-          this.venueReads.accountReadSignal(),
-        );
+        freshScopes = financialPrefix
+          ? prefixScopes
+          : await this.orderSnapshots.readAccount(
+              identity.master,
+              foreignDexes,
+              this.venueReads.accountReadSignal(),
+            );
       } catch {
         // A failed live snapshot keeps the complete, budgeted REST sweep.
       }
@@ -1680,7 +1813,10 @@ export class CoreBridge {
       venue_accounts: { perps: accountId },
       available_by_market: { perps: available },
       available_by_scope: scopedAvailable,
-      observed_at: this.venueReads.accountObservedAt(),
+      observed_at: Math.min(
+        this.venueReads.accountObservedAt(),
+        nativeObservedAt ?? Infinity,
+      ),
       account_value_usdc: accountValue,
       available_usdc: available,
       dedicated:

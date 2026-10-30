@@ -17,6 +17,7 @@ type Charge = {
   weight: number;
   sent: boolean;
   settled: boolean;
+  boundedSourceHold?: number;
 };
 type Waiter = {
   lane: ReadLane;
@@ -44,6 +45,9 @@ type Observation = {
   closed: boolean;
   complete: boolean;
   grew: boolean;
+  hadUncertain: boolean;
+  sampleInvalid: boolean;
+  admittedPeak: number;
   started: number;
 };
 type Owner = {
@@ -102,6 +106,12 @@ export class VenueReadBudget {
   >();
   private nextObservationAt = 0;
   private recentObservationWeights: number[] = [];
+  private recentSuccessfulObservationFrames: {
+    paid: number;
+    demand: number | null;
+    peak: number;
+    at: number;
+  }[] = [];
   private sourcePacingLoans = 0;
   private observations = { started: 0, completed: 0, deferred: 0, growth: 0 };
   constructor(
@@ -152,6 +162,40 @@ export class VenueReadBudget {
       ),
       observations: { ...this.observations },
     };
+  }
+  private observationPacingMs(weight: number) {
+    const originalAllowance = this.limit * 0.8;
+    const original = Math.ceil((weight * 60000) / originalAllowance);
+    const learned = this.recentSuccessfulObservationFrames.filter(
+      (frame) =>
+        frame.demand !== null &&
+        frame.peak > frame.paid &&
+        frame.at > this.clock() - 60000,
+    );
+    if (!learned.length) return original;
+    const sourceHold = this.charges
+      .filter(
+        (charge) =>
+          charge.lane === "source" &&
+          charge.sent &&
+          charge.weight > 0 &&
+          (!charge.settled || charge.at > this.clock() - 60000),
+      )
+      .reduce(
+        (maximum, charge) => Math.max(maximum, charge.boundedSourceHold ?? 0),
+        0,
+      );
+    if (sourceHold <= 0) return original;
+    const eligible = learned.filter((frame) => sourceHold > frame.paid);
+    if (!eligible.length) return original;
+    const overhang = Math.max(
+      0,
+      ...eligible.map((frame) => frame.demand! - frame.paid),
+    );
+    const allowance = originalAllowance - overhang - sourceHold;
+    if (allowance <= 0) return original;
+    const spacing = Math.ceil((weight * 60000) / allowance);
+    return spacing <= Math.max(original, 60000) ? spacing : original;
   }
   private prune() {
     const now = this.clock();
@@ -239,6 +283,12 @@ export class VenueReadBudget {
         if (this.observation?.ticket !== ticket) return;
         this.observation.closed = true;
         this.observation.complete = complete;
+        if (
+          [...this.queues.account, ...this.queues.source].some(
+            (waiter) => waiter.observation === ticket,
+          )
+        )
+          this.observation.sampleInvalid = true;
         this.finishObservation();
       },
     };
@@ -252,6 +302,9 @@ export class VenueReadBudget {
       closed: false,
       complete: false,
       grew: false,
+      hadUncertain: false,
+      sampleInvalid: false,
+      admittedPeak: 0,
       started: now,
     };
     this.observations.started++;
@@ -261,7 +314,7 @@ export class VenueReadBudget {
         this.recentObservationWeights.length;
       this.nextObservationAt = Math.max(
         this.nextObservationAt,
-        now + Math.ceil((weight * 60000) / (this.limit * 0.8)),
+        now + this.observationPacingMs(weight),
       );
     }
     return ticket;
@@ -303,22 +356,42 @@ export class VenueReadBudget {
       seen: this.clock(),
       peaks,
     });
-    // Spread complete frames rather than spending a minute's capacity in a
-    // short burst followed by stale snapshots. Actual sent weight determines
-    // pacing; bounded/unknown provisional holds never manufacture a delay.
-    // Leave twenty percent for public sources and independent account reads.
+    // Spread complete frames rather than spending the window in a burst.
+    // Settled ledger costs form the base; unknown charges keep their original
+    // conservative weight. Qualified known cost samples and real source bounds
+    // can add bounded soft spacing, without treating a hold as a paid fee.
+    // The original share, full reservations and hard ledger remain unchanged.
     if (frame.complete)
       this.recentObservationWeights = [
         ...this.recentObservationWeights,
         Math.min(this.limit, frame.committed),
       ].slice(-5);
+    if (frame.complete) {
+      const demand = this.observationPlans.get(frame.owner)!.demand;
+      this.recentSuccessfulObservationFrames = [
+        ...this.recentSuccessfulObservationFrames,
+        {
+          paid: frame.committed,
+          peak: frame.admittedPeak,
+          at: this.clock(),
+          demand:
+            !frame.hadUncertain &&
+            !frame.sampleInvalid &&
+            demand < this.limit &&
+            frame.committed > 0 &&
+            frame.committed <= demand
+              ? demand
+              : null,
+        },
+      ].slice(-5);
+    }
     const pacedWeight = this.recentObservationWeights.length
       ? this.recentObservationWeights.reduce((sum, weight) => sum + weight, 0) /
         this.recentObservationWeights.length
       : Math.min(this.limit, frame.committed);
     this.nextObservationAt = Math.max(
       this.nextObservationAt,
-      frame.started + Math.ceil((pacedWeight * 60000) / (this.limit * 0.8)),
+      frame.started + this.observationPacingMs(pacedWeight),
     );
     const queued = this.observationQueue.get(frame.owner);
     if (queued) queued.demand = this.observationPlans.get(frame.owner)!.demand;
@@ -376,6 +449,11 @@ export class VenueReadBudget {
     for (const lane of ["account", "source"] as const) {
       for (const waiter of this.queues[lane]) {
         waiter.signal.removeEventListener("abort", waiter.cancel);
+        if (
+          waiter.observation &&
+          this.observation?.ticket === waiter.observation
+        )
+          this.observation.sampleInvalid = true;
         waiter.reject(this.coolingDown());
       }
       this.queues[lane] = [];
@@ -436,7 +514,12 @@ export class VenueReadBudget {
     unknownSurcharge = false,
     observation?: AccountReadReservation,
   ): Promise<ReadTicket> {
-    if (this.cooldownRemaining() > 0) return Promise.reject(this.coolingDown());
+    const reject = (error: Error): Promise<ReadTicket> => {
+      if (observation && this.observation?.ticket === observation)
+        this.observation.sampleInvalid = true;
+      return Promise.reject(error);
+    };
+    if (this.cooldownRemaining() > 0) return reject(this.coolingDown());
     if (
       !Number.isSafeInteger(cost) ||
       cost <= 0 ||
@@ -444,12 +527,12 @@ export class VenueReadBudget {
       signal.aborted ||
       this.queues.account.length + this.queues.source.length >= 256
     )
-      return Promise.reject(this.denied(true));
+      return reject(this.denied(true));
     if (
       observation &&
       (this.observation?.ticket !== observation || this.observation.closed)
     )
-      return Promise.reject(this.observationDeferred(1000));
+      return reject(this.observationDeferred(1000));
     if (observation) {
       const frame = this.observation!;
       frame.peak = Math.max(frame.peak, frame.committed + cost);
@@ -459,14 +542,15 @@ export class VenueReadBudget {
         this.used() + cost > this.limit
       ) {
         frame.grew = true;
-        return Promise.reject(this.denied(true, cost));
+        frame.sampleInvalid = true;
+        return reject(this.denied(true, cost));
       }
     }
     const ownerKey = owner ?? "";
     {
       const owners = this.owners[lane];
       if (!owners.has(ownerKey)) {
-        if (owners.size >= 2048) return Promise.reject(this.denied(true));
+        if (owners.size >= 2048) return reject(this.denied(true));
         const baseline = owners.size
           ? Math.min(...[...owners.values()].map((x) => x.served - x.pending))
           : 0;
@@ -495,6 +579,8 @@ export class VenueReadBudget {
         const index = this.queues[lane].indexOf(waiter);
         if (index < 0) return;
         this.queues[lane].splice(index, 1);
+        if (observation && this.observation?.ticket === observation)
+          this.observation.sampleInvalid = true;
         signal.removeEventListener("abort", waiter.cancel);
         reject(this.denied(waiter.budgetBlocked, waiter.cost));
         this.pump();
@@ -622,6 +708,11 @@ export class VenueReadBudget {
             : next.cost,
           sent: false,
           settled: false,
+          ...(next.lane === "source" &&
+          !next.unknownSurcharge &&
+          next.cost >= 100
+            ? { boundedSourceHold: next.cost }
+            : {}),
         };
         // One bounded request may cross the soft source share before the FIFO
         // head's pacing time. It never predicts refunds or guarantees that the
@@ -635,6 +726,7 @@ export class VenueReadBudget {
           frame.remaining -= held;
           frame.committed += measured;
           frame.peak = Math.max(frame.peak, frame.committed);
+          frame.admittedPeak = Math.max(frame.admittedPeak, frame.committed);
           frame.pending++;
         }
         this.active[next.lane]++;
@@ -652,6 +744,7 @@ export class VenueReadBudget {
         const uncertain = () => {
           if (!charge.sent || charge.settled) return;
           charge.settled = true;
+          if (frame) frame.hadUncertain = true;
           charge.at = this.clock();
           this.owners[next.lane].get(next.owner)!.pending -= reservation;
           if (next.unknownSurcharge)
@@ -679,6 +772,7 @@ export class VenueReadBudget {
             )
               throw new RangeError("Invalid venue weight settlement");
             const refund = charge.weight - weight;
+            if (frame && weight === 0) frame.sampleInvalid = true;
             charge.weight = weight;
             charge.settled = true;
             charge.at = this.clock();
@@ -698,6 +792,7 @@ export class VenueReadBudget {
             released = true;
             uncertain();
             if (!charge.sent) {
+              if (frame) frame.sampleInvalid = true;
               this.charges = this.charges.filter((c) => c !== charge);
               this.owners[next.lane].get(next.owner)!.served -= charge.weight;
               this.owners[next.lane].get(next.owner)!.pending -= reservation;

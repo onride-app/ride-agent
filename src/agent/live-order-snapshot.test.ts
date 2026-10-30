@@ -8,14 +8,28 @@ import { VenueReads } from "./venue-reads.js";
 const owner = "0x" + "a".repeat(40);
 const dexNames = ["xyz", "flx", "hyna"];
 const pendingOrder = { oid: 123, coin: "hyna:TSLA", reduceOnly: false };
-const emptyOrders = () => new Map(dexNames.map((dex) => [dex, []]));
+const emptyOrders = () => new Map(["", ...dexNames].map((dex) => [dex, []]));
 type AccountBatch = {
   orders: Map<string, unknown[]>;
   states: Map<string, unknown>;
+  dispatches?: { orders: Map<string, number>; states: Map<string, number> };
 };
 const emptyBatch = (): AccountBatch => ({
   orders: emptyOrders(),
-  states: new Map(dexNames.map((dex) => [dex, { assetPositions: [] }])),
+  states: new Map(
+    ["", ...dexNames].map((dex) => [
+      dex,
+      {
+        assetPositions: [],
+        marginSummary: { accountValue: "10" },
+        withdrawable: "8",
+      },
+    ]),
+  ),
+  dispatches: {
+    orders: new Map(["", ...dexNames].map((dex) => [dex, Date.now()])),
+    states: new Map(["", ...dexNames].map((dex) => [dex, Date.now()])),
+  },
 });
 
 function fixture(t: TestContext, network: "mainnet" | "testnet" = "mainnet") {
@@ -140,7 +154,7 @@ function fixture(t: TestContext, network: "mainnet" | "testnet" = "mainnet") {
   };
 }
 
-it("uses every fresh foreign-DEX state and order snapshot while retaining native and history reads", async (t) => {
+it("uses fresh native and every foreign-DEX pair while retaining complete history reads", async (t) => {
   const f = fixture(t);
   const snap = await f.bridge.perpsAccount("alice", f.portfolio);
   assert.equal(snap.coverage_complete, true);
@@ -148,11 +162,11 @@ it("uses every fresh foreign-DEX state and order snapshot while retaining native
   assert.equal(snap.available_usdc, "95.000000");
   assert.equal(f.batches.length, 1);
   assert.equal(f.batches[0].user, owner);
-  assert.deepEqual(f.batches[0].dexes, dexNames);
+  assert.deepEqual(f.batches[0].dexes, ["", ...dexNames]);
   assert.ok(f.batches[0].signal instanceof AbortSignal);
   assert.deepEqual(
     f.reads.filter((read) => read.type === "frontendOpenOrders"),
-    [{ type: "frontendOpenOrders", user: owner }],
+    [],
   );
   assert.equal(
     f.reads.filter((read) => read.type === "clearinghouseState" && read.dex)
@@ -239,7 +253,10 @@ it("checks a new order batch on every account observation and rejects newly obse
   f.setBatch({
     ...emptyBatch(),
     orders: new Map(
-      dexNames.map((dex) => [dex, dex === "hyna" ? [pendingOrder] : []]),
+      ["", ...dexNames].map((dex) => [
+        dex,
+        dex === "hyna" ? [pendingOrder] : [],
+      ]),
     ),
   });
   await assert.rejects(f.bridge.perpsAccount("alice", f.portfolio), {

@@ -369,3 +369,174 @@ it("terminates an actual ws handshake on account abort and handles its late erro
   socket.destroy();
   await new Promise<void>((resolve) => server.close(() => resolve()));
 });
+
+it("collects explicit native and foreign pairs on one new session and retains each actual subscription dispatch", async () => {
+  const f = fixture();
+  f.advance(1000);
+  const work = f.reads.readAccount(user, ["", "xyz"], signal());
+  assert.equal(f.sockets.length, 1);
+  const socket = f.sockets[0];
+  const send = socket.send.bind(socket);
+  socket.send = (text) => {
+    send(text);
+    f.advance(7);
+  };
+  socket.emit("open");
+  assert.deepEqual(
+    socket.sent.map((row) => [row.subscription.type, row.subscription.dex]),
+    [
+      ["openOrders", ""],
+      ["clearinghouseState", ""],
+      ["openOrders", "xyz"],
+      ["clearinghouseState", "xyz"],
+    ],
+  );
+  f.advance(2500);
+  socket.snapshot("");
+  socket.state("");
+  socket.snapshot("xyz");
+  socket.state("xyz");
+  const result = (await work) as any;
+  assert.ok(result);
+  assert.equal(result.dispatches.orders.get(""), 1000);
+  assert.equal(result.dispatches.states.get(""), 1007);
+  assert.equal(result.dispatches.orders.get("xyz"), 1014);
+  assert.equal(result.dispatches.states.get("xyz"), 1021);
+  assert.equal(
+    await f.reads.read(user, [""], signal()),
+    undefined,
+    "native scope does not broaden the ordinary foreign-orders reader",
+  );
+  assert.equal(f.sockets.length, 1);
+});
+
+it("waits only within the original session for false control state produced after history completed", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000);
+  let settled = false;
+  void work.then(() => {
+    settled = true;
+  });
+  const socket = f.sockets[0];
+  socket.emit("open");
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+  assert.equal(settled, false);
+  f.advance(100);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 10050, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  const proof = await work;
+  assert.equal(proof?.dispatch_at, 10000);
+  assert.equal(proof?.server_time, 10050);
+  assert.equal(f.sockets.length, 1);
+});
+it("does not reset the original control timeout while ignoring a snapshot older than the history boundary", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000),
+    socket = f.sockets[0];
+  socket.emit("open");
+  f.advance(2500);
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: { user, serverTime: 9999, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    },
+  });
+  f.expire();
+  assert.equal(await work, undefined);
+  assert.equal(f.sockets.length, 1);
+  assert.equal(socket.terminated, 1);
+});
+
+for (const issue of [
+  "owner",
+  "missing owner",
+  "true",
+  "missing flag",
+  "null flag",
+  "string flag",
+  "missing time",
+  "future time",
+  "zero time",
+  "fractional time",
+  "stale time",
+  "missing wrapper",
+  "perp state shape",
+  "binary",
+  "json",
+] as const)
+  it(`rejects malformed fresh control proof ${issue} without leaking a provider payload`, async () => {
+    const f = fixture();
+    f.advance(10000);
+    const work = f.reads.readAbstraction(user, signal(), 9000),
+      socket = f.sockets[0];
+    socket.emit("open");
+    const data: any = {
+      userState: { user, serverTime: 10000, dexAbstractionEnabled: false },
+      perpDexStates: [],
+    };
+    if (issue === "owner") data.userState.user = "private-other-owner";
+    if (issue === "missing owner") delete data.userState.user;
+    if (issue === "true") data.userState.dexAbstractionEnabled = true;
+    if (issue === "missing flag") delete data.userState.dexAbstractionEnabled;
+    if (issue === "null flag") data.userState.dexAbstractionEnabled = null;
+    if (issue === "string flag") data.userState.dexAbstractionEnabled = "false";
+    if (issue === "missing time") delete data.userState.serverTime;
+    if (issue === "future time") data.userState.serverTime = 10001;
+    if (issue === "zero time") data.userState.serverTime = 0;
+    if (issue === "fractional time") data.userState.serverTime = 9800.5;
+    if (issue === "stale time") data.userState.serverTime = 4000;
+    if (issue === "missing wrapper") delete data.userState;
+    if (issue === "perp state shape") data.perpDexStates = {};
+    if (issue === "binary")
+      socket.emit("message", Buffer.from("private-binary"), true);
+    else if (issue === "json")
+      socket.emit("message", Buffer.from("private-invalid-json"), false);
+    else socket.message({ channel: "webData3", data });
+    assert.equal(await work, undefined);
+    assert.doesNotMatch(JSON.stringify(f.reports), /private-|aaaaa/);
+  });
+it("cancels an independent control session before it can subscribe after account expiry", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const controller = new AbortController(),
+    work = f.reads.readAbstraction(user, controller.signal, 9000),
+    socket = f.sockets[0];
+  controller.abort();
+  assert.equal(await work, undefined);
+  socket.emit("open");
+  assert.equal(socket.sent.length, 0);
+  assert.equal(socket.terminated, 1);
+  assert.equal(socket.listenerCount("message"), 0);
+});
+it("retains control failures in the same connection-attempt budget as complete account pairs", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const first = f.reads.readAccount(user, ["xyz"], signal());
+  f.sockets[0].emit("open");
+  f.sockets[0].snapshot("xyz");
+  f.sockets[0].state("xyz");
+  assert.ok(await first);
+  for (let i = 0; i < 19; i++) {
+    const work = f.reads.readAbstraction(user, signal(), 9000);
+    f.sockets.at(-1)!.emit("error", Error("private-failure"));
+    assert.equal(await work, undefined);
+  }
+  assert.equal(await f.reads.readAbstraction(user, signal(), 9000), undefined);
+  assert.equal(f.sockets.length, 20);
+  assert.doesNotMatch(JSON.stringify(f.reports), /private-|aaaaa/);
+});

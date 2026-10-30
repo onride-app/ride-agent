@@ -37,6 +37,13 @@ const sharedOrderSnapshotBudget = new OrderSnapshotBudget();
 export type ForeignAccountRead = {
   orders: Map<string, unknown[]>;
   states: Map<string, unknown>;
+  dispatches: { orders: Map<string, number>; states: Map<string, number> };
+  abstraction?: {
+    user: string;
+    dex_abstraction_enabled: false;
+    dispatch_at: number;
+    server_time: number;
+  };
 };
 
 export class VenueOrderSnapshots {
@@ -64,37 +71,65 @@ export class VenueOrderSnapshots {
   ): Promise<ForeignAccountRead | undefined> {
     return this.collect(user, dexes, signal, true);
   }
+  async readAbstraction(
+    user: string,
+    signal: AbortSignal,
+    minimumServerTime?: number,
+  ) {
+    return (
+      await this.collect(user, [], signal, false, true, minimumServerTime)
+    )?.abstraction;
+  }
   private async collect(
     user: string,
     dexes: string[],
     signal: AbortSignal,
     includeStates: boolean,
+    abstractionOnly = false,
+    minimumServerTime?: number,
   ): Promise<ForeignAccountRead | undefined> {
     const scopes = new Set(dexes);
+    const clock = this.options.clock ?? Date.now;
+    if (
+      minimumServerTime !== undefined &&
+      (!abstractionOnly ||
+        !Number.isSafeInteger(minimumServerTime) ||
+        minimumServerTime <= 0 ||
+        minimumServerTime > clock())
+    )
+      return;
     if (
       signal.aborted ||
       !/^0x[0-9a-f]{40}$/i.test(user) ||
-      !scopes.size ||
+      (!scopes.size && !abstractionOnly) ||
       scopes.size !== dexes.length ||
       scopes.size > 64 ||
       dexes.some(
-        (dex) => typeof dex !== "string" || !dex.trim() || dex.length > 64,
+        (dex) =>
+          typeof dex !== "string" ||
+          (dex === "" ? !includeStates : !dex.trim()) ||
+          dex.length > 64,
       )
     )
       return;
     const release = (this.options.budget ?? sharedOrderSnapshotBudget).acquire(
       user.toLowerCase(),
-      scopes.size * (includeStates ? 2 : 1),
+      scopes.size * (includeStates ? 2 : 1) + (abstractionOnly ? 1 : 0),
     );
     if (!release) return;
     const timers = this.options.timers ?? readTimers;
-    const clock = this.options.clock ?? Date.now;
     const started = clock();
     const report =
       this.options.report ?? ((record) => console.info(JSON.stringify(record)));
     return new Promise((resolve) => {
       const rows = new Map<string, unknown[]>();
       const states = new Map<string, unknown>();
+      const dispatches = {
+        orders: new Map<string, number>(),
+        states: new Map<string, number>(),
+      };
+      let abstraction: ForeignAccountRead["abstraction"],
+        abstractionDispatch: number | undefined;
       let socket: WebSocket | undefined,
         settled = false,
         timer: unknown;
@@ -152,20 +187,32 @@ export class VenueOrderSnapshots {
           });
         listen("open", () => {
           try {
+            if (abstractionOnly) {
+              abstractionDispatch = clock();
+              socket!.send(
+                JSON.stringify({
+                  method: "subscribe",
+                  subscription: { type: "webData3", user },
+                }),
+              );
+            }
             for (const dex of scopes) {
+              dispatches.orders.set(dex, clock());
               socket!.send(
                 JSON.stringify({
                   method: "subscribe",
                   subscription: { type: "openOrders", user, dex },
                 }),
               );
-              if (includeStates)
+              if (includeStates) {
+                dispatches.states.set(dex, clock());
                 socket!.send(
                   JSON.stringify({
                     method: "subscribe",
                     subscription: { type: "clearinghouseState", user, dex },
                   }),
                 );
+              }
             }
           } catch {
             finish("unavailable");
@@ -195,47 +242,86 @@ export class VenueOrderSnapshots {
           )
             return;
           const data = parsed?.data;
-          // A subscription acknowledgment, incremental orderUpdates, missing
-          // scope, or silence cannot establish that a DEX has no open orders.
-          if (
-            ![
-              "openOrders",
-              ...(includeStates ? ["clearinghouseState"] : []),
-            ].includes(parsed?.channel) ||
-            !data ||
-            typeof data.user !== "string" ||
-            data.user.toLowerCase() !== user.toLowerCase() ||
-            typeof data.dex !== "string" ||
-            !scopes.has(data.dex)
-          ) {
-            finish("invalid");
-            return;
-          }
-          if (parsed.channel === "openOrders") {
-            if (!Array.isArray(data.orders)) {
-              finish("invalid");
-              return;
-            }
-            rows.set(data.dex, data.orders);
-          } else {
-            const state = data.clearinghouseState;
+          if (abstractionOnly && parsed?.channel === "webData3") {
+            const control = data?.userState,
+              at = clock();
             if (
-              !state ||
-              !Array.isArray(state.assetPositions) ||
-              !state.marginSummary ||
-              state.marginSummary.accountValue == null ||
-              state.withdrawable == null
+              !control ||
+              typeof control.user !== "string" ||
+              control.user.toLowerCase() !== user.toLowerCase() ||
+              control.dexAbstractionEnabled !== false ||
+              !Array.isArray(data.perpDexStates) ||
+              !Number.isSafeInteger(control.serverTime) ||
+              control.serverTime <= 0 ||
+              control.serverTime > at ||
+              at - control.serverTime > 5000 ||
+              !Number.isSafeInteger(abstractionDispatch) ||
+              abstractionDispatch! <= 0 ||
+              abstractionDispatch! > at
             ) {
               finish("invalid");
               return;
             }
-            states.set(data.dex, state);
+            if (
+              minimumServerTime !== undefined &&
+              control.serverTime < minimumServerTime
+            )
+              return;
+            abstraction = {
+              user: control.user.toLowerCase(),
+              dex_abstraction_enabled: false,
+              dispatch_at: abstractionDispatch!,
+              server_time: control.serverTime,
+            };
+          } else {
+            // A subscription acknowledgment, incremental orderUpdates, missing
+            // scope, or silence cannot establish that a DEX has no open orders.
+            if (
+              ![
+                "openOrders",
+                ...(includeStates ? ["clearinghouseState"] : []),
+              ].includes(parsed?.channel) ||
+              !data ||
+              typeof data.user !== "string" ||
+              data.user.toLowerCase() !== user.toLowerCase() ||
+              typeof data.dex !== "string" ||
+              !scopes.has(data.dex)
+            ) {
+              finish("invalid");
+              return;
+            }
+            if (parsed.channel === "openOrders") {
+              if (!Array.isArray(data.orders)) {
+                finish("invalid");
+                return;
+              }
+              rows.set(data.dex, data.orders);
+            } else {
+              const state = data.clearinghouseState;
+              if (
+                !state ||
+                !Array.isArray(state.assetPositions) ||
+                !state.marginSummary ||
+                state.marginSummary.accountValue == null ||
+                state.withdrawable == null
+              ) {
+                finish("invalid");
+                return;
+              }
+              states.set(data.dex, state);
+            }
           }
           if (
             rows.size === scopes.size &&
-            (!includeStates || states.size === scopes.size)
+            (!includeStates || states.size === scopes.size) &&
+            (!abstractionOnly || abstraction !== undefined)
           )
-            finish("complete", { orders: rows, states });
+            finish("complete", {
+              orders: rows,
+              states,
+              dispatches,
+              ...(abstraction ? { abstraction } : {}),
+            });
         });
         listen("error", () => finish("unavailable"));
         listen("close", () => finish("closed"));

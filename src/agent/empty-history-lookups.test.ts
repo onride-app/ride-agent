@@ -163,12 +163,32 @@ function fixture(
       signal: AbortSignal,
     ) => {
       assert.equal(address, master);
-      assert.deepEqual(dexes, ["xyz"]);
+      assert.deepEqual(dexes, ["", "xyz"]);
       assert.equal(signal.aborted, false);
+      const dispatched = base + time.at;
       await time.sleep(300);
       return {
-        orders: new Map([["xyz", []]]),
-        states: new Map([["xyz", { assetPositions: [] }]]),
+        orders: new Map([
+          ["", []],
+          ["xyz", []],
+        ]),
+        states: new Map([
+          [
+            "",
+            {
+              marginSummary: { accountValue: "0" },
+              withdrawable: "0",
+              assetPositions: options.fill
+                ? [{ position: { coin: "BTC", szi: "0.2" } }]
+                : [],
+            },
+          ],
+          ["xyz", { assetPositions: [] }],
+        ]),
+        dispatches: {
+          orders: new Map(dexes.map((dex) => [dex, dispatched])),
+          states: new Map(dexes.map((dex) => [dex, dispatched])),
+        },
       };
     },
   };
@@ -227,8 +247,6 @@ it("returns a fresh complete snapshot without looking up 500 failed historical t
       f.base + f.time.at - snapshot.observed_at <= 20000,
   );
   for (const type of [
-    "clearinghouseState",
-    "frontendOpenOrders",
     "spotClearinghouseState",
     "userFillsByTime",
     "userFunding",

@@ -166,15 +166,33 @@ function fixture(t: TestContext, mode = "unifiedAccount") {
   stub.orderSnapshots = {
     readAccount: async (user: string, dexes: string[], signal: AbortSignal) => {
       assert.equal(user, owner);
-      assert.deepEqual(dexes, ["xyz"]);
+      assert.deepEqual(dexes, dexes.includes("") ? ["", "xyz"] : ["xyz"]);
       assert.equal(signal.aborted, false);
       actions.push({ operation: "foreign_snapshot", at: clock });
+      const dispatched = clock;
       clock += 10;
       return {
+        dispatches: {
+          orders: new Map(dexes.map((dex) => [dex, dispatched])),
+          states: new Map(dexes.map((dex) => [dex, dispatched])),
+        },
         orders: new Map([
+          ...(dexes.includes("") ? [["", []] as [string, unknown[]]] : []),
           ["xyz", foreignOrder ? [{ oid: 1, coin: "xyz:TSLA" }] : []],
         ]),
         states: new Map([
+          ...(dexes.includes("")
+            ? [
+                [
+                  "",
+                  {
+                    marginSummary: { accountValue: "100" },
+                    withdrawable: "100",
+                    assetPositions: [],
+                  },
+                ] as [string, any],
+              ]
+            : []),
           [
             "xyz",
             {
@@ -269,18 +287,20 @@ it("fences all complete histories after the financial responses and before the e
     ),
   );
   assert.ok(firstHistory >= Math.max(...financial.map((read) => read.end)));
-  for (const method of [
-    "frontendOpenOrders",
-    "meta",
-    "userDexAbstraction",
-    "perpDexs",
-  ])
+  for (const method of ["frontendOpenOrders", "meta", "userDexAbstraction"])
     assert.ok(
       f.reads
         .filter((read) => read.type === method)
         .every((read) => read.start >= lastHistory),
       `${method} cannot increase the prefix before bounded fill history`,
     );
+  assert.ok(
+    f.reads.find((read) => read.type === "perpDexs")!.end <= firstHistory,
+  );
+  assert.ok(
+    f.actions.find((row) => row.operation === "foreign_snapshot")!.at <=
+      firstHistory,
+  );
   assert.equal(
     f.reads.filter((read) => read.type === "userAbstraction").length,
     2,

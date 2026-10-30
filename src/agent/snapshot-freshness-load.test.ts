@@ -99,6 +99,7 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       dexes: string[];
       states: string[];
       at: number;
+      control: boolean;
     }[] = [];
   let maximumWeight = 0,
     maximumActiveAccounts = 0;
@@ -206,6 +207,7 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
         dexes: [] as string[],
         states: [] as string[],
         at: time.at,
+        control: false,
       };
       sockets.push(row);
       class Socket extends EventEmitter {
@@ -214,9 +216,36 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
           const message = JSON.parse(raw);
           assert.equal(message.method, "subscribe");
           const { user, dex, type } = message.subscription;
-          assert.ok(["openOrders", "clearinghouseState"].includes(type));
+          assert.ok(
+            ["openOrders", "clearinghouseState", "webData3"].includes(type),
+          );
           assert.ok(accounts.includes(user));
-          assert.ok(dexes.includes(dex));
+          if (type === "webData3") {
+            row.user = user;
+            row.control = true;
+            time.timers.setTimeout(() => {
+              if (!this.stopped)
+                this.emit(
+                  "message",
+                  Buffer.from(
+                    JSON.stringify({
+                      channel: "webData3",
+                      data: {
+                        userState: {
+                          user,
+                          serverTime: base + time.at,
+                          dexAbstractionEnabled: false,
+                        },
+                        perpDexStates: [],
+                      },
+                    }),
+                  ),
+                  false,
+                );
+            }, 200);
+            return;
+          }
+          assert.ok(["", ...dexes].includes(dex));
           row.user = user;
           (type === "openOrders" ? row.dexes : row.states).push(dex);
           time.timers.setTimeout(() => {
@@ -300,8 +329,6 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
         );
         const requests = trace.filter((request) => request.frame === frame);
         for (const method of [
-          "clearinghouseState",
-          "frontendOpenOrders",
           "spotClearinghouseState",
           "userAbstraction",
           "userFillsByTime",
@@ -335,12 +362,32 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
         const live = sockets.filter((socket) => socket.frame === frame);
         assert.equal(
           live.length,
-          1,
-          "each complete frame needs its own socket, not a cached observation",
+          2,
+          "each complete frame needs fresh independent financial and posthistory control sessions",
         );
-        assert.deepEqual(live[0].dexes.sort(), [...dexes].sort());
-        assert.deepEqual(live[0].states.sort(), [...dexes].sort());
+        assert.deepEqual(live[0].dexes.sort(), ["", ...dexes].sort());
+        assert.deepEqual(live[0].states.sort(), ["", ...dexes].sort());
         assert.ok(live[0].at >= started);
+        assert.equal(live[0].control, false);
+        assert.equal(live[1].control, true);
+        assert.equal(live[0].user, address);
+        assert.equal(live[1].user, address);
+        assert.deepEqual(live[1].dexes, []);
+        assert.deepEqual(live[1].states, []);
+        assert.ok(
+          live[1].at >=
+            Math.max(
+              ...requests
+                .filter((request) =>
+                  [
+                    "userFillsByTime",
+                    "userFunding",
+                    "userNonFundingLedgerUpdates",
+                  ].includes(request.type),
+                )
+                .map((request) => request.at + wireMs),
+            ),
+        );
         const observed = snapshot.observed_at - base,
           earliest = Math.min(
             ...requests
