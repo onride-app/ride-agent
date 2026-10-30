@@ -246,12 +246,12 @@ it("clears a still-future account hint after an uncaught durable transaction err
     errors: unknown[][] = [];
   t.mock.method(console, "error", (...items: unknown[]) => errors.push(items));
   const transact = f.repository.transact.bind(f.repository);
-  let transactions = 0;
+  let failDurableCommit = true;
   f.repository.transact = (user, work) => {
-    const current = ++transactions;
     return transact(user, async (state) => {
       const result = await work(state);
-      if (current === 3) {
+      if (failDurableCommit && f.durable.length === 1) {
+        failDurableCommit = false;
         await failure.promise;
         throw new Error("fixture durable commit failure");
       }

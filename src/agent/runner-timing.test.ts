@@ -310,7 +310,6 @@ it("records binding failures while preserving the caught error and draining noti
     [
       ["account_binding", 300, "error"],
       ["audit_control", 300, "ok"],
-      ["observe_plan", 0, "ok"],
       ["durable_notify", 0, "ok"],
     ],
   );

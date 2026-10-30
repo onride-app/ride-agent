@@ -417,7 +417,7 @@ export class AgentRunner {
     });
     for (const audit of audited.values())
       noteMonitorAccountAge(audit.observedAt, "published");
-    const nextVenueRetryAt = await transact("observe_plan", async (state) => {
+    const observeAndPlan = async (state: State) => {
       const accountFailures = new Set<string>();
       for (const p of state.portfolios.filter((p) => p.state !== "closed")) {
         const expected = audited.get(p.id);
@@ -1251,15 +1251,26 @@ export class AgentRunner {
               : Infinity,
           ),
       );
-    });
-    if (Number.isFinite(nextVenueRetryAt)) {
-      if (this.venueRetryAt.size >= 2000)
-        this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
-      this.venueRetryAt.set(user, nextVenueRetryAt);
-    } else this.venueRetryAt.delete(user);
+    };
+    // No portfolio can pass the guard above without a successful audit. In
+    // that case planning has no mutations; read its retry hint in the already
+    // required durable transaction instead of locking and rewriting state.
+    const nextVenueRetryAt =
+      audited.size === 0
+        ? undefined
+        : await transact("observe_plan", observeAndPlan);
+    const rememberVenueRetry = (at: number) => {
+      if (Number.isFinite(at)) {
+        if (this.venueRetryAt.size >= 2000)
+          this.venueRetryAt.delete(this.venueRetryAt.keys().next().value!);
+        this.venueRetryAt.set(user, at);
+      } else this.venueRetryAt.delete(user);
+    };
+    if (nextVenueRetryAt !== undefined) rememberVenueRetry(nextVenueRetryAt);
     let preparedNotifications: PreparedNotifications | undefined;
+    let deferredVenueRetryAt: number | undefined;
     try {
-      await transact("durable_notify", async (state) => {
+      deferredVenueRetryAt = await transact("durable_notify", async (state) => {
         for (const p of state.portfolios)
           for (const e of p.executions.filter(
             (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
@@ -1358,12 +1369,22 @@ export class AgentRunner {
           }
         }
         preparedNotifications = this.notifications.prepare(user, state);
+        if (audited.size === 0)
+          return Math.min(
+            Infinity,
+            ...state.portfolios
+              .filter((p) => p.state !== "closed")
+              .map((p) => venueReadRetryAt(p) ?? Infinity),
+          );
       });
     } catch (error) {
       if (preparedNotifications)
         this.notifications.rollback(preparedNotifications);
       throw error;
     }
+    // Neither retry hints nor external sends may escape a failed commit.
+    if (deferredVenueRetryAt !== undefined)
+      rememberVenueRetry(deferredVenueRetryAt);
     if (preparedNotifications)
       this.notifications.committed(preparedNotifications);
   }

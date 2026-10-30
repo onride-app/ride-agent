@@ -7,6 +7,7 @@ import { now, recommend } from "./domain.js";
 import { candidate, FakeAdapter, snapshot } from "./fixtures.js";
 import { Cursor, MemoryRepository, type State } from "./repository.js";
 import { AgentRunner } from "./runner.js";
+import { runMonitorTrace } from "./monitor-diagnostics.js";
 import { AgentService, fromPlan } from "./service.js";
 import { SourceFeed } from "./source-feed.js";
 import { VenueReads } from "./venue-reads.js";
@@ -177,7 +178,11 @@ async function sustained(
     start: number;
     end: number;
   }[] = [];
-  const phaseCounts = new Map<string, number>();
+  const tickCounts = new Map<string, number>();
+  const tickContext = new AsyncLocalStorage<{
+    index: number;
+    transactions: number;
+  }>();
   const tickSpans: { user: string; start: number; end?: number }[] = [];
   type HistoryWindow = {
     trader: string;
@@ -278,16 +283,17 @@ async function sustained(
   };
   const transact = repository.transact.bind(repository);
   repository.transact = async (user, work) => {
-    const count = phaseCounts.get(user) ?? 0;
-    phaseCounts.set(user, count + 1);
-    const start = time.at;
+    const context = tickContext.getStore();
+    const firstTransaction =
+      context !== undefined && context.transactions++ === 0;
+    const index = context?.index ?? 0;
     const commitMs =
-      !publicationLatency.auditOnly || count % 3 === 0
-        ? latencyAt(publicationLatency.commitMs, Math.floor(count / 3))
+      !publicationLatency.auditOnly || firstTransaction
+        ? latencyAt(publicationLatency.commitMs, index)
         : 0;
     const readMs =
-      !publicationLatency.auditOnly || count % 3 === 0
-        ? latencyAt(publicationLatency.readMs, Math.floor(count / 3))
+      !publicationLatency.auditOnly || firstTransaction
+        ? latencyAt(publicationLatency.readMs, index)
         : 0;
     const result = await transact(user, async (state) => {
       // These delays remain inside the real transaction lock, including on
@@ -296,12 +302,6 @@ async function sustained(
       const result = await work(state);
       if (commitMs) await time.sleep(commitMs);
       return result;
-    });
-    phaseSpans.push({
-      user,
-      phase: ["audit_control", "observe_plan", "durable_notify"][count % 3],
-      start,
-      end: time.at,
     });
     // MemoryRepository.read waits for its transaction tail. Capture only after
     // this transaction has committed and before the runner starts its next one.
@@ -410,7 +410,7 @@ async function sustained(
           const venueComplete = time.at;
           const coreMs = latencyAt(
             publicationLatency.coreMs,
-            Math.floor(((phaseCounts.get(user) ?? 1) - 1) / 3),
+            tickContext.getStore()?.index ?? 0,
           );
           if (coreMs)
             await time.sleep(coreMs, accountReads.accountReadSignal());
@@ -669,7 +669,28 @@ async function sustained(
       Math.max(maximumTicks.get(user) ?? 0, activeTicks.get(user)!),
     );
     try {
-      await tick(user);
+      const index = tickCounts.get(user) ?? 0;
+      tickCounts.set(user, index + 1);
+      await tickContext.run({ index, transactions: 0 }, () =>
+        runMonitorTrace(() => tick(user), {
+          clock: () => time.at,
+          thresholdMs: 0,
+          report: (record) => {
+            if (
+              record.kind === "phase" &&
+              ["audit_control", "observe_plan", "durable_notify"].includes(
+                record.phase,
+              )
+            )
+              phaseSpans.push({
+                user,
+                phase: record.phase,
+                start: time.at - record.duration_ms,
+                end: time.at,
+              });
+          },
+        }),
+      );
       if (finishBasedControl) {
         // Read the real runner's completed-tick hint without mutating it, so
         // this control changes cadence alone rather than duplicating evolving

@@ -160,6 +160,14 @@ type Observation = {
   observed: number;
   weight: number;
 };
+type BackendPipeline = {
+  label: string;
+  readMs: number;
+  publicationMs: number;
+  planningMs: number;
+  durableMs: number;
+  skipEmptyPlanning: boolean;
+};
 
 async function snapshotLoad(
   t: TestContext,
@@ -168,6 +176,7 @@ async function snapshotLoad(
   restart = false,
   atomicReject = false,
   disableRestoreAfterRestart = false,
+  backend?: BackendPipeline,
 ) {
   const time = new FakeTime(),
     base = 1793200000000,
@@ -587,10 +596,29 @@ async function snapshotLoad(
       ledger_started_at: base - 1000,
     } as unknown as Portfolio;
     let round = 0;
+    let pendingRetryAt: number | undefined;
+    const backendDue = (started: number) =>
+      pendingRetryAt !== undefined && pendingRetryAt - time.at <= 5000
+        ? Math.max(time.at, pendingRetryAt)
+        : Math.max(time.at, started + 5000);
     while (time.at < horizon) {
       const started = time.at,
         frame = { owner, round: ++round };
       let retry = 5000;
+      let retryAt: number | undefined;
+      if (backend) await time.sleep(backend.readMs);
+      const observationStarted = time.at;
+      if (backend && pendingRetryAt !== undefined && pendingRetryAt > time.at) {
+        // The real runner still drains durable work every normal interval
+        // while a persisted account hint prevents another bridge observation.
+        await time.sleep(
+          backend.publicationMs +
+            (backend.skipEmptyPlanning ? 0 : backend.planningMs) +
+            backend.durableMs,
+        );
+        await time.sleep(backendDue(started) - time.at);
+        continue;
+      }
       try {
         const snapshot = await context.run(frame, () =>
           bridge.perpsAccount(`user${owner}`, portfolio),
@@ -599,7 +627,7 @@ async function snapshotLoad(
         assert.equal(snapshot.account_value_usdc, "100.000000");
         assert.equal(snapshot.available_usdc, "100.000000");
         assert.ok(
-          time.at - started <= 20000,
+          time.at - observationStarted <= 20000,
           "complete account observation retains its original 20-second limit",
         );
         const requests = trace.filter((request) => request.frame === frame);
@@ -648,7 +676,7 @@ async function snapshotLoad(
           live[0].states.filter(Boolean).sort(),
           [...dexes].sort(),
         );
-        assert.ok(live[0].at >= started);
+        assert.ok(live[0].at >= observationStarted);
         const observed = snapshot.observed_at - base,
           earliest = Math.min(
             ...requests
@@ -663,19 +691,27 @@ async function snapshotLoad(
               .map((request) => request.at),
           );
         assert.ok(
-          observed >= started - 1000,
+          observed >= observationStarted - 1000,
           "only the existing 1s public-price TTL can predate this frame",
         );
         assert.ok(
           observed <= earliest,
           "snapshot time cannot be relabeled to the end of its complete frame",
         );
+        // A returned bridge frame is not yet visible in backend state. This
+        // independent envelope never changes the financial evidence stamp.
+        if (backend) await time.sleep(backend.publicationMs);
         observations[owner].push({
           started,
           completed: time.at,
           observed,
           weight: requests.reduce((sum, request) => sum + request.weight, 0),
         });
+        if (backend) {
+          pendingRetryAt = undefined;
+          await time.sleep(backend.planningMs + backend.durableMs);
+          retryAt = backendDue(started);
+        }
       } catch (error) {
         assert.ok(error instanceof AgentError, String(error));
         assert.ok(
@@ -687,8 +723,9 @@ async function snapshotLoad(
           error.code,
         );
         retry = Math.max(1, Number(error.details?.retry_after_ms ?? 5000));
+        const failedAt = time.at;
         failures.push({
-          at: time.at,
+          at: failedAt,
           owner,
           code: error.code,
           retry,
@@ -700,8 +737,21 @@ async function snapshotLoad(
             (x: any) => x.demand,
           ),
         } as any);
+        if (backend) {
+          // Error hints are absolute. Failed audit commit, unchanged planning
+          // (legacy only), and durable reconciliation must drain before retry.
+          pendingRetryAt = failedAt + retry;
+          await time.sleep(
+            backend.publicationMs +
+              (backend.skipEmptyPlanning ? 0 : backend.planningMs) +
+              backend.durableMs,
+          );
+          retryAt = backendDue(started);
+        }
       }
-      await time.sleep(retry);
+      await time.sleep(
+        retryAt === undefined ? retry : Math.max(0, retryAt - time.at),
+      );
     }
   });
   const sourceLoop = (async () => {
@@ -937,6 +987,7 @@ async function snapshotLoad(
     const report = {
       wireMs,
       dbDelayMs,
+      backendPipeline: backend,
       restartEvidence,
       disableRestoreAfterRestart,
       resumeMetrics,
@@ -1095,3 +1146,33 @@ it("reports the same fixed-phase external-ledger baseline without durable recove
   assert.ok(report.maximumWeight <= 1000);
   assert.equal(report.invalidCleanAttempts, 0);
 });
+
+// Explicit experiments, separate from the original direct-bridge contract.
+// Global slow-log read/commit/phase medians are envelope inputs, never owner
+// attribution or proof that they caused the hosted account's observed latency.
+if (process.env.MCP_NOOP_PIPELINE_EXPERIMENT === "1")
+  for (const publicationMs of [675, 2460])
+    for (const skipEmptyPlanning of [false, true])
+      it(`backend envelope publication ${publicationMs}ms empty planning ${skipEmptyPlanning ? "skipped" : "retained"} keeps the original strict workload`, async (t) => {
+        const report = await snapshotLoad(t, 500, 200, false, false, false, {
+          label:
+            publicationMs === 675
+              ? "global-slow-log-envelope-inputs"
+              : "synthetic-2460ms-publication-envelope",
+          readMs: 529,
+          publicationMs,
+          planningMs: 1346,
+          durableMs: 1252,
+          skipEmptyPlanning,
+        });
+        assert.deepEqual(report.fixedHistoryWeights, [39]);
+        assert.ok(report.fixedHistoryCalls >= 15);
+        assert.equal(report.sourceCompletions.length, 6);
+        assert.ok(report.sourceCompletions.every((count) => count > 0));
+        assert.ok(report.maximumWeight <= 1000);
+        assert.ok(report.maximumProviderWindow <= 1000);
+        assert.ok(
+          report.maximumAge.every((age) => age < 30000),
+          JSON.stringify(report.maximumAge),
+        );
+      });

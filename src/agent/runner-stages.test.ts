@@ -404,7 +404,11 @@ it("keeps failed audits out of planning while durable unknown reconciliation and
   };
   await f.runner.tick("alice");
   await f.runner.notificationsIdle();
-  assert.equal(f.committed.length, 4);
+  assert.equal(
+    f.committed.length,
+    3,
+    "audit and durable work plus notification ACK; empty planning does not rewrite state",
+  );
   assert.deepEqual(ids, ["execution_uncertain_original"]);
   assert.ok(
     f.committed
@@ -412,7 +416,7 @@ it("keeps failed audits out of planning while durable unknown reconciliation and
       .updates.every((update) => update.notification === "delivered"),
   );
   assert.equal(
-    f.committed[2].portfolios[0].last_error?.code,
+    f.committed[1].portfolios[0].last_error?.code,
     "VENUE_READ_BUDGET_EXHAUSTED",
   );
   const before = await f.repository.read("alice");
