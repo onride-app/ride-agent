@@ -1,4 +1,9 @@
 import { AgentError } from "./contracts.js";
+import {
+  ACCOUNT_OBSERVATION_PLAN_TTL_MS,
+  validObservationCostPlan,
+  type ObservationCostPlan,
+} from "./account-observation-plans.js";
 
 export type ReadLane = "account" | "source";
 export interface BudgetTimers {
@@ -34,6 +39,7 @@ type Waiter = {
 export interface AccountReadReservation {
   readonly id: number;
   close(complete?: boolean): void;
+  costPlan(): ObservationCostPlan | null;
 }
 type Observation = {
   ticket: AccountReadReservation;
@@ -49,6 +55,9 @@ type Observation = {
   sampleInvalid: boolean;
   admittedPeak: number;
   started: number;
+  publishCostPlan(plan: ObservationCostPlan): void;
+  previousPlan?: { demand: number; peaks: number[] };
+  planAttempt?: object;
 };
 type Owner = {
   served: number;
@@ -102,7 +111,11 @@ export class VenueReadBudget {
   >();
   private observationPlans = new Map<
     string,
-    { demand: number; seen: number; peaks: number[] }
+    { demand: number; seen: number; peaks: number[]; attempt?: object }
+  >();
+  private observationPlanAttempts = new Map<
+    string,
+    { token: object; at: number }
   >();
   private nextObservationAt = 0;
   private recentObservationWeights: number[] = [];
@@ -199,6 +212,13 @@ export class VenueReadBudget {
   }
   private prune() {
     const now = this.clock();
+    for (const [owner, attempt] of this.observationPlanAttempts)
+      if (
+        attempt.at < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS &&
+        this.observation?.owner !== owner &&
+        !this.observationQueue.has(owner)
+      )
+        this.observationPlanAttempts.delete(owner);
     for (const [key, entry] of this.observationQueue)
       if (entry.seen <= now - 120000) this.observationQueue.delete(key);
     this.charges = this.charges.filter(
@@ -228,11 +248,94 @@ export class VenueReadBudget {
   // keeps its place; a ready head's full capacity stays protected. Before its
   // pacing time, bounded sources may use the limited lane-share exception.
   // No account payload or completed evidence is retained here.
+  restoreObservationPlan(
+    owner: string,
+    value: unknown,
+    remainingTtlMs: number,
+  ): boolean {
+    const plan = validObservationCostPlan(value, this.limit);
+    const now = this.clock();
+    const existing = this.observationPlans.get(owner);
+    if (existing && existing.seen < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
+      this.observationPlans.delete(owner);
+    if (
+      !plan ||
+      !Number.isSafeInteger(remainingTtlMs) ||
+      remainingTtlMs <= 0 ||
+      remainingTtlMs > ACCOUNT_OBSERVATION_PLAN_TTL_MS ||
+      this.observationPlans.has(owner) ||
+      this.observationQueue.has(owner) ||
+      this.observation?.owner === owner ||
+      this.observationPlans.size >= 2048
+    )
+      return false;
+    this.observationPlans.set(owner, {
+      ...plan,
+      seen: now - (ACCOUNT_OBSERVATION_PLAN_TTL_MS - remainingTtlMs),
+      attempt: this.observationPlanAttempts.get(owner)?.token,
+    });
+    return true;
+  }
+  beginObservationPlanAttempt(owner: string): object {
+    this.prune();
+    if (
+      this.observationPlanAttempts.size >= 2048 &&
+      !this.observationPlanAttempts.has(owner)
+    )
+      throw this.denied(true);
+    const token = {};
+    this.observationPlanAttempts.set(owner, { token, at: this.clock() });
+    return token;
+  }
+  observationPlanAttemptCurrent(owner: string, token: object): boolean {
+    return this.observationPlanAttempts.get(owner)?.token === token;
+  }
+  invalidateObservationPlan(owner: string, token?: object): boolean {
+    if (
+      token &&
+      !this.observationPlanAttemptCurrent(owner, token) &&
+      this.observationPlans.get(owner)?.attempt !== token
+    )
+      return false;
+    const removed = this.observationPlans.delete(owner);
+    const queued = this.observationQueue.get(owner);
+    const changed = queued !== undefined && queued.demand !== this.limit;
+    if (queued) queued.demand = this.limit;
+    return removed || changed;
+  }
+  refreshObservationPlan(
+    owner: string,
+    value: unknown,
+    remainingTtlMs: number,
+  ): boolean {
+    const plan = validObservationCostPlan(value, this.limit);
+    if (
+      !plan ||
+      !Number.isSafeInteger(remainingTtlMs) ||
+      remainingTtlMs <= 0 ||
+      remainingTtlMs > ACCOUNT_OBSERVATION_PLAN_TTL_MS
+    ) {
+      this.invalidateObservationPlan(owner);
+      return false;
+    }
+    if (this.observation?.owner === owner) return false;
+    if (this.observationPlans.size >= 2048 && !this.observationPlans.has(owner))
+      return false;
+    this.observationPlans.set(owner, {
+      ...plan,
+      seen: this.clock() - (ACCOUNT_OBSERVATION_PLAN_TTL_MS - remainingTtlMs),
+      attempt: this.observationPlanAttempts.get(owner)?.token,
+    });
+    const queued = this.observationQueue.get(owner);
+    if (queued) queued.demand = plan.demand;
+    return true;
+  }
   beginObservation(owner: string): AccountReadReservation {
     this.prune();
     const now = this.clock();
     for (const [key, entry] of this.observationPlans)
-      if (entry.seen < now - 600000) this.observationPlans.delete(key);
+      if (entry.seen < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
+        this.observationPlans.delete(key);
     if (this.cooldownRemaining() > 0) throw this.coolingDown();
     let entry = this.observationQueue.get(owner);
     if (!entry) {
@@ -277,8 +380,16 @@ export class VenueReadBudget {
       throw error;
     }
     this.observationQueue.delete(owner);
+    let learnedCostPlan: ObservationCostPlan | null = null;
     const ticket: AccountReadReservation = {
       id: ++this.observationSequence,
+      costPlan: () =>
+        learnedCostPlan
+          ? {
+              demand: learnedCostPlan.demand,
+              peaks: [...learnedCostPlan.peaks],
+            }
+          : null,
       close: (complete = false) => {
         if (this.observation?.ticket !== ticket) return;
         this.observation.closed = true;
@@ -306,6 +417,16 @@ export class VenueReadBudget {
       sampleInvalid: false,
       admittedPeak: 0,
       started: now,
+      publishCostPlan: (plan) => {
+        learnedCostPlan = plan;
+      },
+      previousPlan: this.observationPlans.has(owner)
+        ? {
+            demand: this.observationPlans.get(owner)!.demand,
+            peaks: [...this.observationPlans.get(owner)!.peaks],
+          }
+        : undefined,
+      planAttempt: this.observationPlanAttempts.get(owner)?.token,
     };
     this.observations.started++;
     if (this.recentObservationWeights.length) {
@@ -334,13 +455,9 @@ export class VenueReadBudget {
     // Include a metadata miss margin. An expanding scope/history raises the
     // high-water mark before admission and fails closed if it cannot fit.
     const previous =
-      this.observationPlans.get(frame.owner)?.demand ??
-      (frame.complete ? 0 : this.limit);
+      frame.previousPlan?.demand ?? (frame.complete ? 0 : this.limit);
     const peaks = frame.complete
-      ? [
-          ...(this.observationPlans.get(frame.owner)?.peaks ?? []),
-          frame.peak,
-        ].slice(-3)
+      ? [...(frame.previousPlan?.peaks ?? []), frame.peak].slice(-3)
       : [];
     this.observationPlans.set(frame.owner, {
       demand: Math.min(
@@ -355,7 +472,20 @@ export class VenueReadBudget {
       ),
       seen: this.clock(),
       peaks,
+      attempt: frame.planAttempt,
     });
+    if (
+      frame.complete &&
+      !frame.hadUncertain &&
+      !frame.sampleInvalid &&
+      frame.committed > 0
+    ) {
+      const plan = validObservationCostPlan(
+        this.observationPlans.get(frame.owner),
+        this.limit,
+      );
+      if (plan) frame.publishCostPlan(plan);
+    }
     // Spread complete frames rather than spending the window in a burst.
     // Settled ledger costs form the base; unknown charges keep their original
     // conservative weight. Qualified known cost samples and real source bounds

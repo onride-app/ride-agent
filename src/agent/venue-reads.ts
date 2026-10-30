@@ -2,6 +2,11 @@ import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import {
+  costPlanUnavailable,
+  type ObservationPlanLease,
+  type ObservationPlanStore,
+} from "./account-observation-plans.js";
+import {
   CoordinatedReadError,
   coordinatedEvidence,
   type VenueReadFetcher,
@@ -32,6 +37,12 @@ type AccountReadScope = {
   reservationPromise?: Promise<AccountReadReservation>;
   admissionError?: unknown;
   observedAt?: number;
+  planLease?: ObservationPlanLease;
+  planBound?: boolean;
+  planDisabled?: boolean;
+  durableAttempted?: boolean;
+  monotonicUntil: number;
+  planAttempt?: object;
 };
 type Counters = {
   calls: number;
@@ -90,6 +101,17 @@ const counters = (): Counters => ({
   unknown_overrun: 0,
   unknown_debt_weight: 0,
 });
+const costPlanCounters = () => ({
+  loaded_valid: 0,
+  loaded_cold: 0,
+  load_failed: 0,
+  claimed: 0,
+  restored_admitted: 0,
+  claim_failed: 0,
+  persisted: 0,
+  persist_failed: 0,
+  invalidated: 0,
+});
 export interface VenueReadOptions {
   transport?: "official" | "core_shared_info";
   budget?: VenueReadBudget;
@@ -97,6 +119,9 @@ export interface VenueReadOptions {
   deadlineMs?: number;
   signal?: AbortSignal;
   report?: (record: Record<string, unknown>) => void;
+  observationPlans?: ObservationPlanStore;
+  requireObservationPlanBinding?: boolean;
+  monotonicClock?: () => number;
 }
 
 // Completed account evidence is never reused. Metadata TTL and same-lane
@@ -110,7 +135,14 @@ export class VenueReads {
   private readonly transport: "official" | "core_shared_info";
   private readonly callerSignal?: AbortSignal;
   private readonly report: NonNullable<VenueReadOptions["report"]>;
+  private readonly observationPlans?: ObservationPlanStore;
+  private readonly requireObservationPlanBinding: boolean;
+  private readonly monotonicClock: () => number;
   private counts = counters();
+  private costPlans = costPlanCounters();
+  private accountObservations = new Set<Promise<unknown>>();
+  private accountFinalizers = new Set<Promise<void>>();
+  private draining = false;
   private byMethod = new Map<string, Counters>();
   private rateLimitResponses = new Map<string, RateLimitResponse>();
   private lastReport: number;
@@ -130,6 +162,10 @@ export class VenueReads {
     this.deadlineMs = options.deadlineMs ?? 12000;
     this.transport = options.transport ?? "official";
     this.callerSignal = options.signal;
+    this.observationPlans = options.observationPlans;
+    this.requireObservationPlanBinding =
+      options.requireObservationPlanBinding ?? false;
+    this.monotonicClock = options.monotonicClock ?? (() => performance.now());
     if (
       !Number.isSafeInteger(this.deadlineMs) ||
       this.deadlineMs < 1 ||
@@ -160,6 +196,7 @@ export class VenueReads {
       interval_ms: Math.max(0, this.clock() - this.lastReport),
       budget: this.budget.snapshot(),
       counts: { ...this.counts },
+      cost_plans: { ...this.costPlans },
       methods: [...this.byMethod].map(([purpose_method, values]) => ({
         purpose_method,
         ...values,
@@ -181,6 +218,7 @@ export class VenueReads {
       /* Telemetry cannot alter reads. */
     }
     this.counts = counters();
+    this.costPlans = costPlanCounters();
     this.byMethod.clear();
     this.rateLimitResponses.clear();
     this.lastReport = this.clock();
@@ -207,40 +245,129 @@ export class VenueReads {
   }
   async observeAccount<T>(work: () => Promise<T>, owner?: string): Promise<T> {
     if (this.accountScope.getStore()) return work();
+    if (this.draining) throw costPlanUnavailable();
     const scope: AccountReadScope = {
       id: ++this.accountSequence,
       until: this.clock() + 20000,
       admission: new AbortController(),
       owner,
+      monotonicUntil: this.monotonicClock() + 20000,
     };
     const timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
       20000,
     );
-    return this.accountScope.run(scope, async () => {
+    const observing = this.accountScope.run(scope, async () => {
       let abort!: () => void;
       const cancelled = new Promise<never>((_, reject) => {
         abort = () => reject(scope.admission.signal.reason);
         scope.admission.signal.addEventListener("abort", abort, { once: true });
       });
       let complete = false;
+      let finalizing = false;
+      const cleanup = () => {
+        this.timers.clearTimeout(timer);
+        scope.admission.signal.removeEventListener("abort", abort);
+      };
       try {
         const value = await Promise.race([work(), cancelled]);
         this.accountReadTimeout();
         complete = true;
+        // All successful work has returned before cost publication. A failed,
+        // still-pending, unknown or otherwise invalid scope yields no plan.
+        scope.reservation?.close(true);
+        const plan = scope.reservation?.costPlan();
+        if (plan && scope.planLease && this.observationPlans) {
+          const signal = this.callerSignal
+            ? AbortSignal.any([scope.admission.signal, this.callerSignal])
+            : scope.admission.signal;
+          // Financial work is already complete and remains dated at dispatch.
+          // Only the operational CAS runs in this tracked finalizer, under the
+          // SAME original timer. Dirty state remains until its real commit.
+          finalizing = true;
+          const finalizer = (async () => {
+            try {
+              if (
+                signal.aborted ||
+                !(await this.observationPlans!.complete(
+                  scope.planLease!,
+                  plan,
+                  signal,
+                ))
+              )
+                throw costPlanUnavailable();
+              this.accountReadTimeout();
+              this.costPlans.persisted++;
+            } catch {
+              this.costPlans.persist_failed++;
+              this.invalidateCostPlan(scope);
+            } finally {
+              cleanup();
+            }
+          })();
+          this.accountFinalizers.add(finalizer);
+          void finalizer.then(
+            () => this.accountFinalizers.delete(finalizer),
+            () => this.accountFinalizers.delete(finalizer),
+          );
+        } else if (scope.durableAttempted) this.invalidateCostPlan(scope);
         return value;
       } catch (error) {
+        if (scope.durableAttempted) this.invalidateCostPlan(scope);
         scope.admission.abort(error);
         throw error;
       } finally {
-        this.timers.clearTimeout(timer);
-        scope.admission.signal.removeEventListener("abort", abort);
+        if (!finalizing) cleanup();
         scope.reservation?.close(complete);
       }
     });
+    this.accountObservations.add(observing);
+    try {
+      return await observing;
+    } finally {
+      this.accountObservations.delete(observing);
+    }
+  }
+  async drainAccounts(): Promise<void> {
+    this.draining = true;
+    await Promise.allSettled([...this.accountObservations]);
+    await Promise.allSettled([...this.accountFinalizers]);
+  }
+  private invalidateCostPlan(scope: AccountReadScope): void {
+    if (
+      scope.owner &&
+      this.budget.invalidateObservationPlan(scope.owner, scope.planAttempt)
+    )
+      this.costPlans.invalidated++;
   }
   accountObservedAt(): number {
     return this.accountScope.getStore()?.observedAt ?? this.clock();
+  }
+  bindAccountCostPlan(owner: string): void {
+    const scope = this.accountScope.getStore();
+    if (
+      !scope ||
+      scope.reservationPromise ||
+      scope.reservation ||
+      scope.planLease ||
+      scope.planBound ||
+      !/^[0-9a-f]{64}$/.test(owner)
+    )
+      throw costPlanUnavailable();
+    scope.owner = owner;
+    scope.planBound = true;
+  }
+  disableAccountCostPlan(): void {
+    const scope = this.accountScope.getStore();
+    if (
+      !scope ||
+      scope.reservationPromise ||
+      scope.reservation ||
+      scope.planLease ||
+      scope.planBound
+    )
+      throw costPlanUnavailable();
+    scope.planDisabled = true;
   }
   accountReadSignal(): AbortSignal {
     return (
@@ -277,13 +404,86 @@ export class VenueReads {
     const signal = this.callerSignal
       ? AbortSignal.any([scope.admission.signal, this.callerSignal])
       : scope.admission.signal;
+    let durableHint:
+      Awaited<ReturnType<ObservationPlanStore["read"]>> | undefined;
+    let restored = false;
+    if (this.observationPlans && !scope.planDisabled) {
+      if (this.requireObservationPlanBinding && !scope.planBound)
+        throw costPlanUnavailable();
+      try {
+        scope.planAttempt = this.budget.beginObservationPlanAttempt(
+          scope.owner!,
+        );
+        const before = this.monotonicClock();
+        durableHint = await this.observationPlans.read(scope.owner!, signal);
+        this.accountReadTimeout();
+        if (signal.aborted) throw signal.reason;
+        if (
+          !this.budget.observationPlanAttemptCurrent(
+            scope.owner!,
+            scope.planAttempt,
+          )
+        )
+          throw costPlanUnavailable();
+        // DB age is authoritative; round-trip delay consumes, never renews,
+        // the remaining original ten-minute operational-plan lifetime.
+        const remaining = Math.floor(
+          durableHint.remainingTtlMs -
+            Math.max(0, this.monotonicClock() - before),
+        );
+        if (durableHint.plan && remaining > 0) {
+          this.costPlans.loaded_valid++;
+          restored = this.budget.refreshObservationPlan(
+            scope.owner!,
+            durableHint.plan,
+            remaining,
+          );
+        } else {
+          this.costPlans.loaded_cold++;
+          this.invalidateCostPlan(scope);
+        }
+      } catch {
+        this.costPlans.load_failed++;
+        this.invalidateCostPlan(scope);
+        throw costPlanUnavailable();
+      }
+    }
     let deferred: unknown;
     for (;;) {
       if (signal.aborted) throw signal.reason;
       this.accountReadTimeout();
       if (deferred && this.clock() > until) throw deferred;
       try {
-        return this.budget.beginObservation(scope.owner!);
+        const reservation = this.budget.beginObservation(scope.owner!);
+        if (this.observationPlans && durableHint) {
+          scope.durableAttempted = true;
+          // Record the reservation before awaiting the claim so cancellation
+          // always closes it. No read ticket or venue request exists yet.
+          scope.reservation = reservation;
+          try {
+            const remainingLease = Math.min(
+              this.accountReadTimeout(),
+              Math.floor(scope.monotonicUntil - this.monotonicClock()),
+            );
+            if (remainingLease <= 0) throw this.accountDeadline();
+            scope.planLease = await this.observationPlans.begin(
+              scope.owner!,
+              signal,
+              durableHint,
+              remainingLease,
+            );
+            this.accountReadTimeout();
+            if (signal.aborted) throw signal.reason;
+            this.costPlans.claimed++;
+            if (restored) this.costPlans.restored_admitted++;
+          } catch {
+            this.costPlans.claim_failed++;
+            reservation.close(false);
+            this.invalidateCostPlan(scope);
+            throw costPlanUnavailable();
+          }
+        }
+        return reservation;
       } catch (error) {
         const retry =
           error instanceof AgentError &&

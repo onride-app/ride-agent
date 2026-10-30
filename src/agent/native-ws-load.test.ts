@@ -11,9 +11,22 @@ import {
   OrderSnapshotBudget,
   VenueOrderSnapshots,
 } from "./venue-order-snapshots.js";
-import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
+import {
+  VenueReadBudget,
+  type BudgetTimers,
+  type ReadTicket,
+} from "./venue-read-budget.js";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import { VenueReads } from "./venue-reads.js";
+import type {
+  ObservationCostPlan,
+  ObservationPlanHint,
+  ObservationPlanStore,
+} from "./account-observation-plans.js";
+import {
+  CoordinatedReadError,
+  recordCoordinatedEvidence,
+} from "./venue-read-transport.js";
 
 async function flush() {
   for (let i = 0; i < 50; i++) await Promise.resolve();
@@ -52,6 +65,86 @@ class FakeTime {
   }
 }
 
+// External budget-contract model. Core's Redis ledger preserves admission
+// timestamps during reconciliation; it has no Node observation plans or
+// unknown-response exclusive hold. Waiting is bounded by the original caller
+// signal. This is not a model of every managed-provider scheduling policy.
+class ProviderLedger {
+  private charges: { at: number; weight: number }[] = [];
+  private waiters: {
+    cost: number;
+    signal: AbortSignal;
+    resolve(ticket: ReadTicket): void;
+    reject(error: Error): void;
+    cancel(): void;
+  }[] = [];
+  private wake?: unknown;
+  constructor(
+    private readonly time: FakeTime,
+    private readonly atomicReject = false,
+  ) {}
+  snapshot() {
+    this.charges = this.charges.filter(
+      (charge) => charge.at > this.time.at - 60000,
+    );
+    return {
+      used: this.charges.reduce((sum, charge) => sum + charge.weight, 0),
+    };
+  }
+  acquire(cost: number, signal: AbortSignal): Promise<ReadTicket> {
+    if (this.atomicReject && this.snapshot().used + cost > 1000)
+      return Promise.reject(
+        new Error("Core atomic admission rejected before upstream"),
+      );
+    return new Promise((resolve, reject) => {
+      const waiter = { cost, signal, resolve, reject, cancel: () => {} };
+      waiter.cancel = () => {
+        this.waiters = this.waiters.filter((row) => row !== waiter);
+        reject(new Error("External admission cancelled before dispatch"));
+        this.pump();
+      };
+      this.waiters.push(waiter);
+      signal.addEventListener("abort", waiter.cancel, { once: true });
+      if (signal.aborted) waiter.cancel();
+      else this.pump();
+    });
+  }
+  private pump() {
+    if (this.wake !== undefined) this.time.timers.clearTimeout(this.wake);
+    this.wake = undefined;
+    while (this.waiters.length) {
+      const waiter = this.waiters[0];
+      if (this.snapshot().used + waiter.cost > 1000) break;
+      this.waiters.shift();
+      waiter.signal.removeEventListener("abort", waiter.cancel);
+      const charge = { at: this.time.at, weight: waiter.cost };
+      this.charges.push(charge);
+      waiter.resolve({
+        reservation: waiter.cost,
+        sent() {},
+        uncertain() {},
+        release() {},
+        settle: (weight) => {
+          assert.ok(
+            Number.isSafeInteger(weight) &&
+              weight >= 0 &&
+              weight <= waiter.cost,
+          );
+          charge.weight = weight; // Never renew Core's original Redis timestamp.
+          this.pump();
+        },
+      });
+    }
+    if (this.waiters.length) {
+      const next = Math.min(...this.charges.map((charge) => charge.at + 60000));
+      this.wake = this.time.timers.setTimeout(
+        () => this.pump(),
+        Math.max(1, next - this.time.at),
+      );
+    }
+  }
+}
+
 type Frame = { owner: number; round: number };
 type Attempt = {
   at: number;
@@ -68,7 +161,14 @@ type Observation = {
   weight: number;
 };
 
-async function snapshotLoad(t: TestContext, wireMs: number) {
+async function snapshotLoad(
+  t: TestContext,
+  wireMs: number,
+  dbDelayMs = 0,
+  restart = false,
+  atomicReject = false,
+  disableRestoreAfterRestart = false,
+) {
   const time = new FakeTime(),
     base = 1793200000000,
     horizon = 360000,
@@ -87,11 +187,18 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
     if (previous === undefined) delete process.env.RIDE_AGENT_UNIFIED_ENABLED;
     else process.env.RIDE_AGENT_UNIFIED_ENABLED = previous;
   });
-  const budget = new VenueReadBudget({
-      clock: time.clock,
-      timers: time.timers,
-    }),
-    trace: Attempt[] = [],
+  let budget = new VenueReadBudget({
+    clock: time.clock,
+    timers: time.timers,
+  });
+  const providerGate = restart
+    ? new ProviderLedger(time, atomicReject)
+    : undefined;
+  const deniedFrames = new Set<Frame>();
+  let noUpstreamDenials = 0,
+    invalidCleanAttempts = 0;
+  let restarted = false;
+  const trace: Attempt[] = [],
     observations: Observation[][] = [[], []],
     failures: { at: number; owner: number; code: string; retry: number }[] = [],
     sourceReads: number[][] = sources.map(() => []),
@@ -114,6 +221,7 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
           time: base + time.at,
           marginSummary: {
             accountValue: sources.includes(payload.user) ? "100" : "0",
+            totalMarginUsed: "0",
           },
           withdrawable: "0",
           assetPositions: [],
@@ -155,7 +263,45 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       data = Array.from({ length: 380 }, (_, i) => ({
         time: base - 1000 + i,
         tid: i,
+        oid: i + 1,
+        coin: "BTC",
+        side: i % 2 ? "A" : "B",
+        px: "100",
+        sz: "1",
+        startPosition: i % 2 ? "1" : "0",
+        closedPnl: "0",
+        fee: "0",
+        feeToken: "USDC",
+        dir: i % 2 ? "Close Long" : "Open Long",
       }));
+    let providerTicket: ReadTicket | undefined;
+    const coreObserved = time.at;
+    if (providerGate) {
+      const cost = readCost(payload);
+      try {
+        // Core's current startTime funding contract reserves 500/20+20=45.
+        // Node retains its independently stricter unknown-surcharge protocol.
+        providerTicket = await providerGate.acquire(
+          payload.type === "userFunding" ? 45 : cost.reserve,
+          init?.signal as AbortSignal,
+        );
+      } catch {
+        noUpstreamDenials++;
+        const frame = context.getStore();
+        if (frame) deniedFrames.add(frame);
+        throw new CoordinatedReadError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          false,
+          1000,
+        );
+      }
+      if (init?.signal?.aborted) {
+        providerTicket.release();
+        throw new CoordinatedReadError("VENUE_READ_DEADLINE", false);
+      }
+      providerTicket.sent();
+    }
+    const dispatched = time.at;
     trace.push({
       at: time.at,
       type: payload.type,
@@ -174,9 +320,20 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       current.used <= 1000,
       "all provisional and settled REST charges share the 1000/min ceiling",
     );
-    return new Promise<Response>((resolve) =>
+    const response = await new Promise<Response>((resolve) =>
       time.timers.setTimeout(() => resolve(Response.json(data)), wireMs),
     );
+    if (providerTicket) {
+      if (init?.signal?.aborted) {
+        providerTicket.uncertain();
+        providerTicket.release();
+        throw new CoordinatedReadError("VENUE_READ_DEADLINE", true);
+      }
+      providerTicket.settle(responseCost(readCost(payload), data));
+      providerTicket.release();
+      recordCoordinatedEvidence(response, base + coreObserved);
+    }
+    return response;
   }) as typeof fetch;
   const bridge = new CoreBridge(
       "https://core.test",
@@ -186,18 +343,124 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       "mainnet",
     ),
     stub = bridge as any;
-  stub.venueReads = new VenueReads(fetcher, () => base + time.at, 2, {
-    budget,
-    timers: time.timers,
-    report: () => {},
-  });
+  const rows = new Map<
+    string,
+    {
+      plan: ObservationCostPlan | null;
+      generation: number;
+      dirty: boolean;
+      at: number;
+      leaseUntil: number;
+    }
+  >();
+  const planIo = async (signal: AbortSignal) => {
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      await Promise.race([time.sleep(dbDelayMs), cancelled]);
+      if (signal.aborted) throw signal.reason;
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  };
+  const hint = (owner: string): ObservationPlanHint => {
+    const row = rows.get(owner),
+      age = row ? time.at - row.at : Infinity;
+    if (row?.dirty && row.leaseUntil > time.at)
+      throw new AgentError(
+        "VENUE_COST_PLAN_UNAVAILABLE",
+        "Fixture active metering lease",
+        true,
+        503,
+      );
+    const plan =
+      row && !row.dirty && age >= 0 && age < 600000 ? row.plan : null;
+    return {
+      owner,
+      generation: row ? String(row.generation) : null,
+      plan: plan ? structuredClone(plan) : null,
+      remainingTtlMs: plan ? 600000 - age : 0,
+    };
+  };
+  const store: ObservationPlanStore = {
+    read: async (owner, signal) => {
+      await planIo(signal);
+      return hint(owner);
+    },
+    begin: async (owner, signal, expected, maximumLeaseMs = 20000) => {
+      await planIo(signal);
+      const current = hint(owner);
+      assert.equal(current.generation, expected?.generation);
+      assert.deepEqual(current.plan, expected?.plan);
+      const generation = (rows.get(owner)?.generation ?? 0) + 1;
+      rows.set(owner, {
+        plan: current.plan,
+        generation,
+        dirty: true,
+        at: rows.get(owner)?.at ?? time.at,
+        leaseUntil: time.at + maximumLeaseMs - dbDelayMs,
+      });
+      return { ...current, generation: String(generation) };
+    },
+    complete: async (lease, plan, signal) => {
+      await planIo(signal);
+      if (context.getStore() && deniedFrames.has(context.getStore()!))
+        invalidCleanAttempts++;
+      const row = rows.get(lease.owner);
+      if (
+        !row ||
+        String(row.generation) !== lease.generation ||
+        !row.dirty ||
+        row.leaseUntil <= time.at
+      )
+        return false;
+      rows.set(lease.owner, {
+        ...row,
+        dirty: false,
+        plan: structuredClone(plan),
+        at: time.at,
+        leaseUntil: 0,
+      });
+      return true;
+    },
+  };
+  const installReader = () => {
+    stub.venueReads = new VenueReads(fetcher, () => base + time.at, 2, {
+      budget,
+      timers: time.timers,
+      report: () => {},
+      ...(dbDelayMs && !(disableRestoreAfterRestart && restarted)
+        ? {
+            observationPlans: store,
+            requireObservationPlanBinding: true,
+            monotonicClock: time.clock,
+          }
+        : {}),
+      ...(providerGate ? { transport: "core_shared_info" as const } : {}),
+    });
+  };
+  installReader();
   stub.core = async (operation: string, input: any) => {
     assert.equal(
       operation,
       "perps_account",
       "sustained observation must not perform financial writes",
     );
-    return { master: input.account_id, status: 4 };
+    return {
+      master: input.account_id,
+      status: 4,
+      ...(dbDelayMs
+        ? {
+            account_id: input.account_id,
+            agent: "0x" + "3".repeat(40),
+            network: 2,
+            wallet_generation: 1,
+          }
+        : {}),
+    };
   };
   stub.resolve = async (id: string) => ({ address: id, tags: [] });
   stub.orderSnapshots = new VenueOrderSnapshots("mainnet", {
@@ -287,27 +550,34 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       return socket as unknown as WebSocket;
     },
   });
-  stub.sourceFeed.close();
-  stub.sourceFeed = new SourceFeed((id: string) => stub.readSource(id), {
-    clock: () => base + time.at,
-    timers: {
-      setInterval(run, ms) {
-        const handle = { stopped: false, id: undefined as unknown, unref() {} };
-        const poll = () => {
-          if (handle.stopped) return;
-          run();
+  const installSourceFeed = () => {
+    stub.sourceFeed.close();
+    stub.sourceFeed = new SourceFeed((id: string) => stub.readSource(id), {
+      clock: () => base + time.at,
+      timers: {
+        setInterval(run, ms) {
+          const handle = {
+            stopped: false,
+            id: undefined as unknown,
+            unref() {},
+          };
+          const poll = () => {
+            if (handle.stopped) return;
+            run();
+            handle.id = time.timers.setTimeout(poll, ms);
+          };
           handle.id = time.timers.setTimeout(poll, ms);
-        };
-        handle.id = time.timers.setTimeout(poll, ms);
-        return handle;
+          return handle;
+        },
+        clearInterval(handle) {
+          const timer = handle as { stopped: boolean; id: unknown };
+          timer.stopped = true;
+          time.timers.clearTimeout(timer.id);
+        },
       },
-      clearInterval(handle) {
-        const timer = handle as { stopped: boolean; id: unknown };
-        timer.stopped = true;
-        time.timers.clearTimeout(timer.id);
-      },
-    },
-  });
+    });
+  };
+  installSourceFeed();
   const accountLoops = accounts.map(async (address, owner) => {
     const portfolio = {
       account_id: address,
@@ -409,9 +679,11 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       } catch (error) {
         assert.ok(error instanceof AgentError, String(error));
         assert.ok(
-          ["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_READ_DEADLINE"].includes(
-            error.code,
-          ),
+          [
+            "VENUE_READ_BUDGET_EXHAUSTED",
+            "VENUE_READ_DEADLINE",
+            ...(restart ? ["VENUE_COST_PLAN_UNAVAILABLE"] : []),
+          ].includes(error.code),
           error.code,
         );
         retry = Math.max(1, Number(error.details?.retry_after_ms ?? 5000));
@@ -485,9 +757,44 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       await time.sleep(Math.max(0, next - time.at));
     }
   })();
+  let restartEvidence: Record<string, unknown> | undefined;
+  const restartLoop = restart
+    ? (async () => {
+        await time.sleep(180000); // Fixed phase, independent of clean/dirty state.
+        restartEvidence = {
+          requestedAt: time.at,
+          rows: rows.size,
+          dirtyAtRequest: [...rows.values()].filter((row) => row.dirty).length,
+          providerUsedBeforeDrain: providerGate!.snapshot().used,
+          oldTraceCount: trace.length,
+        };
+        await stub.venueReads.drainAccounts();
+        budget = new VenueReadBudget({
+          clock: time.clock,
+          timers: time.timers,
+        });
+        restarted = true;
+        installReader();
+        installSourceFeed();
+        Object.assign(restartEvidence, {
+          restartedAt: time.at,
+          providerUsedAfterRestart: providerGate!.snapshot().used,
+          newNodeUsed: budget.snapshot().used,
+          sameProviderGate: true,
+          sameTrace: true,
+          cleanAfterDrain: [...rows.values()].filter((row) => !row.dirty)
+            .length,
+        });
+      })()
+    : Promise.resolve();
   try {
     await time.advance(horizon + 120000);
-    await Promise.all([...accountLoops, sourceLoop, fixedHistoryLoop]);
+    await Promise.all([
+      ...accountLoops,
+      sourceLoop,
+      fixedHistoryLoop,
+      restartLoop,
+    ]);
     let maximumProviderWindow = 0;
     for (const attempt of trace) {
       const weight = trace
@@ -529,8 +836,124 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
         maximum = Math.max(maximum, horizon - latest.observed);
       return maximum;
     });
+    let resumeMetrics:
+      | {
+          cutoff: number;
+          frozenAt: number | null;
+          firstTwoNewAfterRestart: number[][];
+          allOver30Points: { at: number; ages: (number | null)[] }[];
+          allOver30Intervals: {
+            owner: number;
+            from: number;
+            until: number;
+            maximumAge: number;
+          }[];
+          afterCutoffFailures: number;
+          afterFreezeFailures: number;
+          postCutoffMaximumAge: number[];
+        }
+      | undefined;
+    if (restartEvidence) {
+      const restartedAt = Number(restartEvidence.restartedAt),
+        cutoff = restartedAt + 90000;
+      const points = Array.from(
+        { length: Math.floor(horizon / 5000) + 1 },
+        (_, index) => {
+          const at = index * 5000;
+          const ages = observations.map((rows) => {
+            const completed = rows.filter((row) => row.completed <= at).at(-1);
+            return completed ? at - completed.observed : null;
+          });
+          return {
+            at,
+            ages,
+            fresh: ages.every((age) => age !== null && age < 30000),
+            newCounts: observations.map(
+              (rows) =>
+                rows.filter(
+                  (row) => row.completed > restartedAt && row.completed <= at,
+                ).length,
+            ),
+          };
+        },
+      );
+      const frozenAt =
+        points.find(
+          (point) =>
+            point.at >= restartedAt &&
+            point.newCounts.every((count) => count >= 2) &&
+            point.fresh,
+        )?.at ?? null;
+      resumeMetrics = {
+        cutoff,
+        frozenAt,
+        firstTwoNewAfterRestart: observations.map((rows) =>
+          rows
+            .filter((row) => row.completed > restartedAt)
+            .slice(0, 2)
+            .map((row) => row.completed - restartedAt),
+        ),
+        allOver30Points: points
+          .filter((point) => !point.fresh)
+          .map(({ at, ages }) => ({ at, ages })),
+        allOver30Intervals: observations.flatMap((rows, owner) =>
+          rows.flatMap((previous, index) => {
+            const until = Math.min(
+              rows[index + 1]?.completed ?? horizon,
+              horizon,
+            );
+            return until - previous.observed >= 30000
+              ? [
+                  {
+                    owner,
+                    from: Math.max(
+                      previous.completed,
+                      previous.observed + 30000,
+                    ),
+                    until,
+                    maximumAge: until - previous.observed,
+                  },
+                ]
+              : [];
+          }),
+        ),
+        afterCutoffFailures: points.filter(
+          (point) => point.at >= cutoff && !point.fresh,
+        ).length,
+        afterFreezeFailures:
+          frozenAt === null
+            ? -1
+            : points.filter((point) => point.at >= frozenAt && !point.fresh)
+                .length,
+        postCutoffMaximumAge: observations.map((_, owner) =>
+          Math.max(
+            ...points
+              .filter((point) => point.at >= cutoff)
+              .map((point) => point.ages[owner] ?? Infinity),
+          ),
+        ),
+      };
+    }
     const report = {
       wireMs,
+      dbDelayMs,
+      restartEvidence,
+      disableRestoreAfterRestart,
+      resumeMetrics,
+      providerContract: providerGate
+        ? {
+            cap: 1000,
+            reservation: "Core fills120/funding45",
+            timestamp: "original_admission",
+            admission: atomicReject
+              ? "atomic_reject_no_upstream"
+              : "declared_bounded_wait_assumption",
+          }
+        : undefined,
+      noUpstreamDenials,
+      deniedAccountFrames: deniedFrames.size,
+      invalidCleanAttempts,
+      dirtyCostRowsAtEnd: [...rows.values()].filter((row) => row.dirty).length,
       fixedHistoryCalls,
       fixedHistoryWindows: Array.from({ length: 4 }, (_, i) => {
         const start = warmup + i * 60000;
@@ -574,6 +997,7 @@ async function snapshotLoad(t: TestContext, wireMs: number) {
       socketCount: sockets.length,
     };
     t.diagnostic(JSON.stringify(report));
+    if (disableRestoreAfterRestart) return report; // Counterfactual SLOs are reported, never called a performance pass.
     assert.ok(
       observations.every(
         (rows) =>
@@ -607,3 +1031,67 @@ for (const wireMs of [300, 500])
       JSON.stringify(report.maximumAge),
     );
   });
+
+for (const wireMs of [300, 500])
+  for (const dbDelayMs of [100, 200])
+    it(`retains the complete six-source/fixed-history load with ${wireMs}ms venue and ${dbDelayMs}ms per operational-plan I/O`, async (t) => {
+      const report = await snapshotLoad(t, wireMs, dbDelayMs);
+      assert.deepEqual(report.fixedHistoryWeights, [39]);
+      assert.ok(report.fixedHistoryCalls >= 15);
+      assert.equal(report.sourceCompletions.length, 6);
+      assert.ok(
+        report.maximumAge.every((age) => age < 30000),
+        JSON.stringify(report.maximumAge),
+      );
+    });
+
+it("conditionally resumes within the fixed +90s boundary with retained Core cost/admission timestamps and a declared bounded-wait assumption", async (t) => {
+  const report = await snapshotLoad(t, 500, 200, true);
+  assert.equal(report.restartEvidence?.sameProviderGate, true);
+  assert.equal(report.restartEvidence?.sameTrace, true);
+  assert.equal(report.restartEvidence?.newNodeUsed, 0);
+  assert.ok(
+    Number(report.restartEvidence?.providerUsedAfterRestart) > 0,
+    "Provider rolling charges survive Node reconstruction",
+  );
+  assert.ok(Number(report.restartEvidence?.cleanAfterDrain) === 2);
+  assert.deepEqual(report.fixedHistoryWeights, [39]);
+  assert.ok(report.fixedHistoryCalls >= 15);
+  // Keep full-timeline transient failures visible. This new restart case tests
+  // the separately predeclared +90s resume boundary, never resets its freeze,
+  // and does not relax any original no-restart strict-30s load assertion.
+  assert.equal(report.resumeMetrics?.afterCutoffFailures, 0);
+  assert.equal(report.resumeMetrics?.afterFreezeFailures, 0);
+  assert.ok(
+    report.resumeMetrics?.frozenAt !== null &&
+      Number(report.resumeMetrics?.frozenAt) <=
+        Number(report.resumeMetrics?.cutoff),
+  );
+  assert.ok(
+    report.resumeMetrics?.firstTwoNewAfterRestart.every(
+      (times) => times.length === 2 && times.every((at) => at <= 90000),
+    ),
+  );
+});
+
+it("retains the external ledger under atomic Core rejection, learns no denied scope and reports all resume SLO failures", async (t) => {
+  const report = await snapshotLoad(t, 500, 200, true, true);
+  assert.equal(report.restartEvidence?.sameProviderGate, true);
+  assert.equal(report.restartEvidence?.sameTrace, true);
+  assert.ok(report.maximumProviderWindow <= 1000);
+  assert.ok(report.maximumWeight <= 1000);
+  assert.ok(report.noUpstreamDenials > 0);
+  assert.ok(report.deniedAccountFrames > 0);
+  assert.equal(report.invalidCleanAttempts, 0);
+  assert.deepEqual(report.fixedHistoryWeights, [39]);
+  assert.ok(report.fixedHistoryCalls >= 15);
+});
+
+it("reports the same fixed-phase external-ledger baseline without durable recovery, preserving its cold failures", async (t) => {
+  const report = await snapshotLoad(t, 500, 200, true, true, true);
+  assert.equal(report.restartEvidence?.sameProviderGate, true);
+  assert.equal(report.restartEvidence?.sameTrace, true);
+  assert.ok(report.maximumProviderWindow <= 1000);
+  assert.ok(report.maximumWeight <= 1000);
+  assert.equal(report.invalidCleanAttempts, 0);
+});

@@ -1,0 +1,48 @@
+# Operational account-cost plans across bridge restarts
+
+This change restores previously learned admission metadata. It does not establish a universal ninety-second recovery guarantee, financial acceptance, or an empty-store bootstrap shortcut. The failed original `0ec0619` cold window remains failed. No App/npm release, financial write, forced cursor advance, quota increase, or risk-policy change is part of this repair.
+
+The Agent PostgreSQL table `ride_agent_account_cost_plans` stores only an opaque owner key, cost-contract version, monotonic generation, dirty flag, demand, at most three planning peaks, DB learning time and a bounded active-claim lease. It contains no balances, positions, prices, financial snapshots, charge ledger, source-pressure samples, or launch-pacing deadlines. Rows and generations are not automatically deleted or reset.
+
+The owner binds `perps-cost-plan-v1`, the selected Info route, normalized Core origin/path, configured network, user, resolved account ID, actual Core network enum, normalized master and agent, wallet generation, bind mode, actual ledger start, sorted foreign assets and manual-handoff coins, and the existing Unified/RWA read flags. Mainnet is Core enum **2**, testnet **1**. Unbound wallets, binding operations, missing generation and older incomplete identities keep the original complete-read path without durable restoration. A policy revision does not alter this cost identity; every live account, mode, ownership and execution gate still runs.
+
+Before a real account observation is admitted, a read-only transaction locks and validates its durable hint. The DB clock is sampled after acquiring the lock. A valid clean hint must match the contract and typed demand/peaks, retain the original twenty-weight margin, and be less than ten minutes old without a future timestamp. Monotonic I/O time consumes its remaining TTL. Dirty, expired, mismatched and failed hints revoke the corresponding future local/queued reservation; a later verified clean generation can replace a conservative placeholder.
+
+The original FIFO/full-reservation gate then runs. A normal pacing or capacity deferral performs no dirty write. Only after obtaining that reservation, and before acquiring any venue read ticket, does a second transaction claim the exact loaded generation and recheck the hint under the row lock and current DB clock. It commits dirty state and a new generation first. Its absolute DB lease is bounded by the original account scope's remaining monotonic twenty-second deadline. An active claim returns unavailable rather than stealing another process's generation. A stale or expired claim cancels the zero-wire reservation and revokes its hint.
+
+Successful business work closes the metering scope only after all original full-scope/history reads and checks finish. A cost plan is eligible only when every ticket has settled with known positive cost and there was no unknown, zero-cost no-upstream hop, unsent release, swallowed denial/cancellation or unresolved queue. Normal known growth can persist the newly higher conservative demand; failure growth remains dirty. The existing three-peak learning, full demand, twenty-weight margin, source loan policy, exact fees, unknown retention and hard 1000-per-minute admission remain intact.
+
+Only the operational CAS runs as a tracked finalizer after the financial result is available. It retains the same original timer and signal, without restarting the deadline. Dirty state clears only on a real commit for the matching active generation and unexpired lease, checked after obtaining the row lock. Failed or late finalizers revoke only their own local hint, never a newer attempt's plan. They do not send more venue requests. A metadata COMMIT can succeed while its acknowledgment is lost: the caller then reports persistence failure and revokes its hint even though PostgreSQL may already be clean. This is different from an unknown financial read, which never qualifies for clean persistence.
+
+Shutdown stops new scopes, drains current scopes and their already-registered finalizers while PostgreSQL remains available, then closes it. HTTP drain is bounded at forty seconds. The forty-five-second process deadline remains unref'ed and is not canceled by socket/pool completion, since unrelated longer operations may still hold references. It does not keep an otherwise drained process alive. A forced termination before an eligible commit retains dirty state; it cannot undo a commit that genuinely succeeded before its acknowledgment was lost.
+
+Existing sixty-second `venue_read_budget` reports add only fixed numeric `cost_plans` counters: `loaded_valid`, `loaded_cold`, `load_failed`, `claimed`, `restored_admitted`, `claim_failed`, `persisted`, `persist_failed`, and `invalidated`. `restored_admitted` increments only after a valid imported hint and successful dirty claim. Reports never include owner keys, wallet/account identities or financial values. Aggregate counters do not individually attribute a restore to either original account; separate private in-memory identity/row matching remains necessary.
+
+## Local validation and explicit performance limits
+
+The unchanged two-account/six-source workload keeps complete ten-DEX guards, repeated 380-row Fixed history costing 39, its original fifteen-second offered grid, 1000 cap and strict sub-thirty-second age assertion. Adding 100/200 ms for each plan load, claim and completion yields maxima:
+
+| Venue delay | Plan I/O delay | Account maxima    |
+| ----------- | -------------- | ----------------- |
+| 300 ms      | 100 ms         | 27.200 / 27.400 s |
+| 300 ms      | 200 ms         | 27.300 / 27.600 s |
+| 500 ms      | 100 ms         | 28.366 / 28.972 s |
+| 500 ms      | 200 ms         | 28.610 / 29.881 s |
+
+Each completes twenty Fixed reads, four steady windows `[4,4,4,4]`, and progress for all six sources. The earlier awaited-CAS variant failed at 30.081 s; its RED evidence is retained. No threshold was raised to pass it.
+
+An independent restart model requests shutdown at fixed t=180000 ms while one original metering row is dirty. It drains at t=182014, recreates the Node budget and metadata cache, and retains the external provider ledger and every earlier physical request in the trace. The external cap stays 1000. Fills reserve 120; this fixture's empty funding response uses Core's existing startTime reservation 45 and actual cost 20. Reconciliation retains Core's original admission timestamp, and response evidence dates from before admission. Funding's current Core reservation is not an absolute maximum for all possible responses. Synthetic fill/state bodies include Core-required valid fields; no invalid body earns a refund.
+
+This is a cost/admission-time contract model, not a reproduction of managed-provider failover or every scheduler. Two admission policies are stated separately:
+
+| Restart model                                                 | Full-window account maxima | Fixed reads / four windows | +90 s failures | First-two-stamps freeze       | Failures after freeze |
+| ------------------------------------------------------------- | -------------------------- | -------------------------- | -------------- | ----------------------------- | --------------------- |
+| Declared bounded-wait assumption                              | 28.953 / 37.167 s          | 20 / `[4,4,4,4]`           | 0              | t=230000, before cutoff272014 | 0                     |
+| Atomic reject / proven no upstream                            | 99.063 / 75.841 s          | 15 / `[4,1,2,4]`           | **4**          | **t=300000, after cutoff**    | **1**                 |
+| Same-phase atomic baseline, no durable recovery after restart | 77.406 / 149.851 s         | 12 / `[4,1,0,3]`           | **11**         | **t=340000, after cutoff**    | 0                     |
+
+The bounded-wait model has a 37.167-second transient; it does not pass full continuity. Bounded waiting is not necessarily more conservative than immediate rejection: it can preserve a scope which a real rejection would fail and leave dirty. The atomic model remains a performance **FAIL**, despite its safety test passing: three no-upstream rejections never learn the denied account scope; cap is 929, and all six sources still advance. The baseline comparison improves aggregate recovery and throughput, but does not establish an improvement for every individual interval. All over-thirty-second intervals/points, missing initial observations, late freeze boundaries and subsequent failures remain in the reports; the freeze never resets.
+
+Actual PostgreSQL tests cover expiry, corruption, lock-delayed clocks, active leases, old-writer fencing, known growth, failed growth and pool cancellation. Real child processes test mid-wire SIGTERM through same-generation clean persistence and same-image restore with six prior source charges; SIGKILL before completion leaves a dirty lease and no recoverable hint even after its real expiry. A third child exercises the actual `startCoreBridge` signal branch after pool drain, advances the captured force boundary explicitly, and confirms it can terminate an unrelated ninety-second keepalive without changing production deadlines. These are operational fixtures, not real-account follow executions.
+
+Production acceptance must separately show natural learning for the original accounts, then a predeclared same-image bridge restart at an unselected phase. Cold-start, steady snapshot/audit freshness, source consumption, active budget windows and actual copy execution remain distinct gates. Failures remain DOING; a healthy process or passing safety fixture cannot replace them.

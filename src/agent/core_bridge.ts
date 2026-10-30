@@ -15,6 +15,11 @@ import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
+import { drainBridge } from "./bridge-shutdown.js";
+import {
+  AccountObservationPlans,
+  ACCOUNT_OBSERVATION_COST_CONTRACT,
+} from "./account-observation-plans.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
 import { notificationCancellation } from "./notification-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
@@ -128,7 +133,10 @@ const required = (key: string) => {
   return v;
 };
 export class CoreBridge {
-  private venueReads = new VenueReads();
+  private venueReads: VenueReads;
+  private observationPlans: AccountObservationPlans;
+  private readonly infoReadRoute: "official" | "core";
+  private closing?: Promise<void>;
   private orderSnapshots: VenueOrderSnapshots;
   private sourceFeed = new SourceFeed((id) => this.readSource(id));
   private pool: pg.Pool;
@@ -154,17 +162,23 @@ export class CoreBridge {
     private network: "testnet" | "mainnet",
     options: { infoReadRoute?: "official" | "core" } = {},
   ) {
-    if (options.infoReadRoute === "core")
-      this.venueReads = new VenueReads(
-        coreInfoFetcher(coreUrl, coreToken),
-        Date.now,
-        2,
-        {
-          transport: "core_shared_info",
-        },
-      );
+    this.infoReadRoute = options.infoReadRoute ?? "official";
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
+    this.observationPlans = new AccountObservationPlans(this.pool);
+    this.venueReads = new VenueReads(
+      this.infoReadRoute === "core"
+        ? coreInfoFetcher(coreUrl, coreToken)
+        : (url, init) => fetch(url, init),
+      Date.now,
+      2,
+      {
+        transport:
+          this.infoReadRoute === "core" ? "core_shared_info" : "official",
+        observationPlans: this.observationPlans,
+        requireObservationPlanBinding: true,
+      },
+    );
     this.sourceIdentities = new PerpsSourceIdentities(
       this.pool,
       salt,
@@ -181,6 +195,7 @@ export class CoreBridge {
       throw Error("Trader identity salt must contain 32 characters");
   }
   async migrate() {
+    await this.observationPlans.migrate();
     await this.sourceIdentities.migrate();
     await this.prediction.migrate();
     await this.notificationReceipts.migrate();
@@ -188,9 +203,18 @@ export class CoreBridge {
       `CREATE TABLE IF NOT EXISTS ride_agent_core_outbox (execution_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,portfolio_id TEXT NOT NULL,fingerprint TEXT NOT NULL,payload JSONB NOT NULL,response JSONB,created_at TIMESTAMPTZ NOT NULL DEFAULT now());`,
     );
   }
-  async close() {
-    this.sourceFeed.close();
-    await this.pool.end();
+  drainAccounts(): Promise<void> {
+    return this.venueReads.drainAccounts();
+  }
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.sourceFeed.close();
+      this.closing = (async () => {
+        await this.drainAccounts();
+        await this.pool.end();
+      })();
+    }
+    return this.closing;
   }
   private async control(operation: string, payload: any): Promise<any> {
     const id = `control:${payload.request_id}`;
@@ -1116,6 +1140,39 @@ export class CoreBridge {
       ]),
     );
   }
+  private perpsCostOwner(
+    user: string,
+    p: Portfolio | null,
+    bind: boolean,
+    identity: any,
+    accountId: string,
+    handoffs: ManualMarketHandoff[],
+  ): string {
+    return fingerprint([
+      ACCOUNT_OBSERVATION_COST_CONTRACT,
+      this.infoReadRoute,
+      [new URL(this.coreUrl).origin, new URL(this.coreUrl).pathname],
+      this.network,
+      user,
+      accountId,
+      identity.network,
+      identity.master.toLowerCase(),
+      identity.agent.toLowerCase(),
+      identity.wallet_generation,
+      bind,
+      p?.ledger_started_at ?? null,
+      [
+        ...new Set(
+          (p?.sleeves ?? [])
+            .flatMap((s) => s.trader.assets)
+            .filter((asset) => asset.includes(":")),
+        ),
+      ].sort(),
+      handoffs.map((handoff) => handoff.coin).sort(),
+      process.env.RIDE_AGENT_UNIFIED_ENABLED === "true",
+      process.env.RIDE_AGENT_RWA_ENABLED === "true",
+    ]);
+  }
   private async readPerpsAccount(
     user: string,
     p: Portfolio | null,
@@ -1138,6 +1195,25 @@ export class CoreBridge {
       accountId = `account_${fingerprint([user, this.network]).slice(0, 32)}`;
     }
     const handoffs = manualMarkets(identity, accountId);
+    // A persistent hint belongs to the current resolved wallet generation,
+    // never merely to a requested account ID. Wallet discovery/binding and
+    // older incomplete Core identities retain ordinary conservative admission.
+    if (
+      binding &&
+      !bind &&
+      identity.account_id === accountId &&
+      identity.network === (this.network === "mainnet" ? 2 : 1) &&
+      typeof identity.master === "string" &&
+      /^0x[0-9a-f]{40}$/i.test(identity.master) &&
+      typeof identity.agent === "string" &&
+      /^0x[0-9a-f]{40}$/i.test(identity.agent) &&
+      Number.isSafeInteger(identity.wallet_generation) &&
+      identity.wallet_generation >= 0
+    ) {
+      this.venueReads.bindAccountCostPlan(
+        this.perpsCostOwner(user, p, bind, identity, accountId, handoffs),
+      );
+    } else this.venueReads.disableAccountCostPlan();
     if (
       p?.manual_ledger?.transfers.some(
         (transfer) =>
@@ -2828,9 +2904,20 @@ export async function startCoreBridge() {
     Number(process.env.PORT ?? 3355),
     process.env.HOST ?? "127.0.0.1",
   );
+  let stopping = false;
   const stop = () => {
-    listener.close();
-    void bridge.close();
+    if (stopping) return;
+    stopping = true;
+    // Leave time for ordinary handler/scoped deadlines and durable cost-plan
+    // completion. A forced stop never clears dirty plans or financial unknowns.
+    const force = setTimeout(() => process.exit(0), 45000);
+    force.unref();
+    // Keep the unref deadline even after sockets/pool drain: an unrelated
+    // longer Core operation may still hold a reference. It cannot keep a
+    // normally drained process alive, but still bounds residual work.
+    void drainBridge(listener, bridge).catch(() => {
+      console.error("Rider bridge shutdown failed.");
+    });
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
