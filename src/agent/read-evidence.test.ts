@@ -523,6 +523,10 @@ it("CoreBridge read evidence has no account/write path and does not change legac
     assert.equal(publicSource, true);
     return f.reader.info(input);
   };
+  stub.infoWithEvidence = async (input: any, publicSource: boolean) => ({
+    value: await stub.info(input, publicSource),
+    observed_at: Date.now(),
+  });
   for (const operation of [
     "account",
     "perpsAccount",

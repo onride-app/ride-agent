@@ -2,6 +2,11 @@ import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import {
+  CoordinatedReadError,
+  coordinatedEvidence,
+  type VenueReadFetcher,
+} from "./venue-read-transport.js";
+import {
   sharedVenueReadBudget,
   readTimers,
   type BudgetTimers,
@@ -12,6 +17,12 @@ import {
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
+export type VenueReadEvidence = {
+  value: any;
+  // The original dispatch time after admission, never the completion/cache-hit
+  // time. A joined request carries the first caller's actual wire evidence.
+  observed_at: number;
+};
 type AccountReadScope = {
   id: number;
   until: number;
@@ -33,6 +44,9 @@ type Counters = {
   local_budget_denied: number;
   local_deadline_denied: number;
   local_cooldown_denied: number;
+  coordinated_denied: number;
+  coordinated_no_upstream: number;
+  coordinated_rate_limited: number;
   unsupported_method: number;
   invalid_response: number;
   reserved_weight: number;
@@ -41,6 +55,17 @@ type Counters = {
   unknown_uncertain: number;
   unknown_overrun: number;
   unknown_debt_weight: number;
+};
+type RateLimitResponse = {
+  purpose_method: string;
+  content_kind: "json" | "html" | "text" | "other" | "missing";
+  retry_after_kind: "seconds" | "date" | "invalid" | "missing";
+  retry_after_ms: number;
+  server_family:
+    "cloudflare" | "cloudfront" | "nginx" | "envoy" | "other" | "missing";
+  cloudfront_header: boolean;
+  cloudflare_header: boolean;
+  count: number;
 };
 const counters = (): Counters => ({
   calls: 0,
@@ -53,6 +78,9 @@ const counters = (): Counters => ({
   local_budget_denied: 0,
   local_deadline_denied: 0,
   local_cooldown_denied: 0,
+  coordinated_denied: 0,
+  coordinated_no_upstream: 0,
+  coordinated_rate_limited: 0,
   unsupported_method: 0,
   invalid_response: 0,
   reserved_weight: 0,
@@ -63,6 +91,7 @@ const counters = (): Counters => ({
   unknown_debt_weight: 0,
 });
 export interface VenueReadOptions {
+  transport?: "official" | "core_shared_info";
   budget?: VenueReadBudget;
   timers?: BudgetTimers;
   deadlineMs?: number;
@@ -73,20 +102,23 @@ export interface VenueReadOptions {
 // Completed account evidence is never reused. Metadata TTL and same-lane
 // single-flight are unchanged. Both HL hosts share one process weighted gate.
 export class VenueReads {
-  private flights = new Map<string, Promise<unknown>>();
+  private flights = new Map<string, Promise<VenueReadEvidence>>();
   private cache = new Map<string, Entry>();
   private readonly budget: VenueReadBudget;
   private readonly timers: BudgetTimers;
   private readonly deadlineMs: number;
+  private readonly transport: "official" | "core_shared_info";
   private readonly callerSignal?: AbortSignal;
   private readonly report: NonNullable<VenueReadOptions["report"]>;
   private counts = counters();
   private byMethod = new Map<string, Counters>();
+  private rateLimitResponses = new Map<string, RateLimitResponse>();
   private lastReport: number;
   private readonly accountScope = new AsyncLocalStorage<AccountReadScope>();
   private accountSequence = 0;
   constructor(
-    private readonly fetcher: typeof fetch = (...args) => fetch(...args),
+    private readonly fetcher: VenueReadFetcher = (url, init) =>
+      fetch(url, init),
     private readonly clock = Date.now,
     concurrency = 2,
     options: VenueReadOptions = {},
@@ -96,6 +128,7 @@ export class VenueReads {
     this.budget = options.budget ?? sharedVenueReadBudget;
     this.timers = options.timers ?? readTimers;
     this.deadlineMs = options.deadlineMs ?? 12000;
+    this.transport = options.transport ?? "official";
     this.callerSignal = options.signal;
     if (
       !Number.isSafeInteger(this.deadlineMs) ||
@@ -123,6 +156,7 @@ export class VenueReads {
     return {
       event: "venue_read_budget",
       scope: "shared_VenueReads_instances_and_HL_hosts_only",
+      transport: this.transport,
       interval_ms: Math.max(0, this.clock() - this.lastReport),
       budget: this.budget.snapshot(),
       counts: { ...this.counts },
@@ -130,6 +164,13 @@ export class VenueReads {
         purpose_method,
         ...values,
       })),
+      // Fixed classifications and numeric counters only. Never log response
+      // bodies, raw headers, edge IDs, request payloads or account identities.
+      rate_limit_responses: [...this.rateLimitResponses.values()].map(
+        (row) => ({
+          ...row,
+        }),
+      ),
     };
   }
   private maybeReport() {
@@ -141,6 +182,7 @@ export class VenueReads {
     }
     this.counts = counters();
     this.byMethod.clear();
+    this.rateLimitResponses.clear();
     this.lastReport = this.clock();
   }
   private unavailable() {
@@ -278,6 +320,14 @@ export class VenueReads {
     ttlMs = 0,
     lane: ReadLane = "account",
   ): Promise<any> {
+    return (await this.readWithEvidence(url, payload, ttlMs, lane)).value;
+  }
+  async readWithEvidence(
+    url: string,
+    payload: unknown,
+    ttlMs = 0,
+    lane: ReadLane = "account",
+  ): Promise<VenueReadEvidence> {
     let method = "unsupported";
     try {
       const cost = readCost(payload);
@@ -326,7 +376,10 @@ export class VenueReads {
             scope.observedAt ?? cached.evidenceAt,
             cached.evidenceAt,
           );
-        return structuredClone(cached.value);
+        return {
+          value: structuredClone(cached.value),
+          observed_at: cached.evidenceAt,
+        };
       }
       if (cached) this.cache.delete(key);
       let flight = this.flights.get(flightKey);
@@ -357,17 +410,26 @@ export class VenueReads {
         )
           .then((value) => {
             if (controller.signal.aborted) throw controller.signal.reason;
+            // perform() records this only at actual HTTP dispatch. A missing
+            // stamp cannot become fresh evidence just because JSON completed.
+            if (evidence.at === undefined || !Number.isFinite(evidence.at))
+              throw new AgentError(
+                "VENUE_RESPONSE_INVALID",
+                "Venue read has no original dispatch evidence.",
+                true,
+                503,
+              );
             if (ttlMs > 0) {
               if (this.cache.size >= 2000)
                 this.cache.delete(this.cache.keys().next().value!);
               this.cache.set(key, {
                 at: this.clock(),
-                evidenceAt: evidence.at ?? this.clock(),
+                evidenceAt: evidence.at,
                 value: structuredClone(value),
                 until: this.clock() + ttlMs,
               });
             }
-            return value;
+            return { value, observed_at: evidence.at };
           })
           .finally(() => this.timers.clearTimeout(timer));
         this.flights.set(flightKey, flight);
@@ -442,6 +504,8 @@ export class VenueReads {
       // Bound HTTP/JSON work to 12 seconds after admission instead of consuming
       // its wire window in the queue; the whole-operation boundary stays 20s.
       const wire = new AbortController();
+      const wireMs = this.accountReadTimeout(this.deadlineMs);
+      const wireDeadline = this.clock() + wireMs;
       wireTimer = this.timers.setTimeout(
         () =>
           wire.abort(
@@ -452,7 +516,7 @@ export class VenueReads {
               503,
             ),
           ),
-        this.accountReadTimeout(this.deadlineMs),
+        wireMs,
       );
       wireSignal = AbortSignal.any([requestSignal, wire.signal]);
       ticket.sent();
@@ -475,16 +539,34 @@ export class VenueReads {
       let response: Response;
       try {
         response = await this.abortable(
-          this.fetcher(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-            signal: wireSignal,
-            redirect: "error",
-          }),
+          this.fetcher(
+            url,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+              signal: wireSignal,
+              redirect: "error",
+            },
+            { deadline_ms: wireDeadline },
+          ),
           wireSignal,
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof CoordinatedReadError) {
+          this.count(cost.method, lane, "coordinated_denied");
+          if (!error.upstreamRequestSent) {
+            ticket.settle(0);
+            settled = true;
+            this.count(cost.method, lane, "coordinated_no_upstream");
+          }
+          if (error.code === "VENUE_RATE_LIMITED") {
+            this.count(cost.method, lane, "coordinated_rate_limited");
+            this.budget.note429(error.details?.retry_after_ms ?? 0);
+            this.cache.clear();
+          }
+          throw error;
+        }
         this.count(cost.method, lane, "transport_failure");
         if (wireSignal.aborted) throw wireSignal.reason;
         throw new AgentError(
@@ -493,6 +575,12 @@ export class VenueReads {
           true,
           503,
         );
+      }
+      const originalAt = coordinatedEvidence(response);
+      if (originalAt !== undefined) {
+        evidence.at = Math.min(evidence.at!, originalAt);
+        if (scope?.observedAt !== undefined)
+          scope.observedAt = Math.min(scope.observedAt, originalAt);
       }
       if (!response.ok) {
         void response.body?.cancel().catch(() => {});
@@ -508,6 +596,16 @@ export class VenueReads {
                 : 0;
           this.budget.note429(Math.max(0, retryMs));
           this.cache.clear();
+          try {
+            this.noteRateLimitResponse(
+              cost.method,
+              lane,
+              response.headers,
+              retryMs,
+            );
+          } catch {
+            // Diagnostics must never bypass the provider cooldown or cache invalidation.
+          }
           throw this.unavailable();
         }
         this.count(cost.method, lane, "http_failure");
@@ -582,5 +680,57 @@ export class VenueReads {
       }
       ticket?.release();
     }
+  }
+  private noteRateLimitResponse(
+    method: string,
+    lane: ReadLane,
+    headers: Headers,
+    retryMs: number,
+  ) {
+    const content = (headers.get("content-type") ?? "").toLowerCase();
+    const server = (headers.get("server") ?? "").toLowerCase();
+    const retry = headers.get("retry-after");
+    const row: RateLimitResponse = {
+      purpose_method: `${lane}:${method}`,
+      content_kind: !content
+        ? "missing"
+        : content.includes("json")
+          ? "json"
+          : content.includes("html")
+            ? "html"
+            : content.startsWith("text/")
+              ? "text"
+              : "other",
+      retry_after_kind:
+        retry == null
+          ? "missing"
+          : Number.isFinite(Number(retry)) && Number(retry) > 0
+            ? "seconds"
+            : Number.isFinite(Date.parse(retry))
+              ? "date"
+              : "invalid",
+      retry_after_ms: Number.isFinite(retryMs)
+        ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.ceil(retryMs)))
+        : 0,
+      server_family: !server
+        ? "missing"
+        : server.includes("cloudflare")
+          ? "cloudflare"
+          : server.includes("cloudfront")
+            ? "cloudfront"
+            : server.includes("nginx")
+              ? "nginx"
+              : server.includes("envoy")
+                ? "envoy"
+                : "other",
+      cloudfront_header: Boolean(headers.get("x-amz-cf-id")),
+      cloudflare_header: Boolean(headers.get("cf-ray")),
+      count: 1,
+    };
+    const key = JSON.stringify({ ...row, count: 0 });
+    const previous = this.rateLimitResponses.get(key);
+    if (previous) previous.count++;
+    else if (this.rateLimitResponses.size < 200)
+      this.rateLimitResponses.set(key, row);
   }
 }

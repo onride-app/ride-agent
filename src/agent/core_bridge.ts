@@ -15,6 +15,7 @@ import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
 import { VenueReads } from "./venue-reads.js";
+import { coreInfoFetcher } from "./core-info-reads.js";
 import { VenueOrderSnapshots } from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
 import { sourceEvidenceReady } from "./source-observations.js";
@@ -136,7 +137,17 @@ export class CoreBridge {
     database: string,
     private salt: string,
     private network: "testnet" | "mainnet",
+    options: { infoReadRoute?: "official" | "core" } = {},
   ) {
+    if (options.infoReadRoute === "core")
+      this.venueReads = new VenueReads(
+        coreInfoFetcher(coreUrl, coreToken),
+        Date.now,
+        2,
+        {
+          transport: "core_shared_info",
+        },
+      );
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
     this.prediction = new PredictionVenue(
@@ -230,7 +241,7 @@ export class CoreBridge {
     }
     return body;
   }
-  private async info(payload: unknown, source = false): Promise<any> {
+  private infoRequest(payload: unknown, source: boolean) {
     const url =
       source || this.network === "mainnet"
         ? "https://api.hyperliquid.xyz/info"
@@ -241,12 +252,19 @@ export class CoreBridge {
       : type === "allMids"
         ? 1000
         : 0;
-    return this.venueReads.read(
+    return {
       url,
-      payload,
       ttl,
-      source ? "source" : "account",
-    );
+      lane: source ? ("source" as const) : ("account" as const),
+    };
+  }
+  private async info(payload: unknown, source = false): Promise<any> {
+    const { url, ttl, lane } = this.infoRequest(payload, source);
+    return this.venueReads.read(url, payload, ttl, lane);
+  }
+  private infoWithEvidence(payload: unknown, source = false) {
+    const { url, ttl, lane } = this.infoRequest(payload, source);
+    return this.venueReads.readWithEvidence(url, payload, ttl, lane);
   }
   private traderId(address: string) {
     return `trader_${createHash("sha256").update(`${this.salt}:perps:${address.toLowerCase()}`).digest("hex").slice(0, 32)}`;
@@ -323,10 +341,18 @@ export class CoreBridge {
     )
       return this.prediction.source(id);
     const row = await this.resolve(id),
-      state = await this.info(
+      native = await this.infoWithEvidence(
         { type: "clearinghouseState", user: row.address },
         true,
-      );
+      ),
+      state = native.value,
+      scopeTimes = new Map<string, number>([["", native.observed_at]]);
+    // Preserve the dispatch time of each position's actual state read. Later
+    // scopes or cached metadata must never relabel earlier financial evidence.
+    const positionTimes = new Map<unknown, number>();
+    if (Array.isArray(state?.assetPositions))
+      for (const item of state.assetPositions)
+        positionTimes.set(item?.position, native.observed_at);
     const perpsDexes = [""];
     if (
       process.env.RIDE_AGENT_RWA_ENABLED === "true" &&
@@ -351,7 +377,7 @@ export class CoreBridge {
         const observations = await Promise.all(
           scopes.slice(offset, offset + 3).map(async (dex) => ({
             dex,
-            state: await this.info(
+            evidence: await this.infoWithEvidence(
               { type: "clearinghouseState", user: row.address, dex },
               true,
             ),
@@ -359,9 +385,11 @@ export class CoreBridge {
           })),
         );
         for (const observation of observations) {
+          const observedState = observation.evidence.value;
+          scopeTimes.set(observation.dex, observation.evidence.observed_at);
           if (observation.meta.collateralToken !== 0) {
             if (
-              observation.state.assetPositions?.some(
+              observedState.assetPositions?.some(
                 (x: any) => !D(x.position?.szi ?? 0).isZero(),
               )
             )
@@ -372,8 +400,8 @@ export class CoreBridge {
             continue;
           }
           if (
-            !Array.isArray(observation.state.assetPositions) ||
-            observation.state.marginSummary?.accountValue == null
+            !Array.isArray(observedState.assetPositions) ||
+            observedState.marginSummary?.accountValue == null
           )
             throw new AgentError(
               "SOURCE_STALE",
@@ -382,18 +410,19 @@ export class CoreBridge {
             );
           perpsDexes.push(observation.dex);
           state.marginSummary.accountValue = D(state.marginSummary.accountValue)
-            .plus(observation.state.marginSummary.accountValue)
+            .plus(observedState.marginSummary.accountValue)
             .toString();
           state.assetPositions.push(
-            ...observation.state.assetPositions.map((item: any) => ({
-              ...item,
-              position: {
+            ...observedState.assetPositions.map((item: any) => {
+              const position = {
                 ...item.position,
                 coin: item.position.coin.includes(":")
                   ? item.position.coin
                   : observation.dex + ":" + item.position.coin,
-              },
-            })),
+              };
+              positionTimes.set(position, observation.evidence.observed_at);
+              return { ...item, position };
+            }),
           );
         }
       }
@@ -407,7 +436,22 @@ export class CoreBridge {
         "Trader account state is incomplete.",
         true,
       );
-    const at = now();
+    const completedAt = now(),
+      at = Math.min(...scopeTimes.values());
+    if (
+      [...scopeTimes.values()].some(
+        (observedAt) =>
+          !Number.isFinite(observedAt) ||
+          observedAt > completedAt ||
+          completedAt - observedAt > 5000,
+      )
+    )
+      throw new AgentError(
+        "SOURCE_STALE",
+        "Complete source scope evidence expired during observation.",
+        true,
+        503,
+      );
     const activePositions = state.assetPositions
       .map((item: any) => item.position)
       .filter((x: any) => x && !D(x.szi).isZero());
@@ -433,7 +477,7 @@ export class CoreBridge {
         x.leverage?.value != null &&
         Number.isFinite(Number(x.leverage.value)) &&
         Number(x.leverage.value) >= 1,
-      observed_at: at,
+      observed_at: positionTimes.get(x)!,
       source_revision: "",
     }));
     const revision = fingerprint(
@@ -865,7 +909,7 @@ export class CoreBridge {
           user: address,
           startTime: cursor,
           endTime: end,
-          aggregateByTime: false,
+          ...(type === "userFillsByTime" ? { aggregateByTime: false } : {}),
         },
         source,
       );
@@ -2322,12 +2366,16 @@ export class CoreBridge {
   }
 }
 export async function startCoreBridge() {
+  const infoReadRoute = process.env.RIDE_AGENT_INFO_READ_ROUTE ?? "official";
+  if (infoReadRoute !== "official" && infoReadRoute !== "core")
+    throw new Error("RIDE_AGENT_INFO_READ_ROUTE must be official or core");
   const bridge = new CoreBridge(
     required("RIDE_AGENT_CORE_URL"),
     required("RIDE_AGENT_CORE_SERVICE_TOKEN"),
     required("RIDE_AGENT_DATABASE_URL"),
     required("RIDE_AGENT_TRADER_ID_SALT"),
     process.env.RIDE_AGENT_NETWORK === "mainnet" ? "mainnet" : "testnet",
+    { infoReadRoute },
   );
   await bridge.migrate();
   const token = required("RIDE_AGENT_EXECUTOR_TOKEN");

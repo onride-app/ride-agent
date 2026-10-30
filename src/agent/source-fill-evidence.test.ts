@@ -329,6 +329,10 @@ it("uses precisely the native / RWA scopes observed by readSource, including suc
           ];
         assert.fail("Unexpected read " + input.type);
       };
+      stub.infoWithEvidence = async (input: any, isSource: boolean) => ({
+        value: await stub.info(input, isSource),
+        observed_at: now(),
+      });
       try {
         const observation = await bridge.source("fixture");
         const scopes = enabled && tagged ? ["", "xyz"] : [""];
@@ -440,6 +444,10 @@ it("does not use the global RWA switch as evidence that a crypto source observed
       ],
     };
   };
+  stub.infoWithEvidence = async (input: any, isSource: boolean) => ({
+    value: await stub.info(input, isSource),
+    observed_at: now(),
+  });
   try {
     await assert.rejects(bridge.source("fixture"), { code: "SOURCE_STALE" });
   } finally {
