@@ -12,7 +12,10 @@ export interface MonitorTimingRecord {
   duration_ms: number;
   outcome: "ok" | "error";
   error_category?: string;
+  emitted_at_ms?: number;
   account_age_ms?: number;
+  account_observed_at_ms?: number;
+  account_stage?: "returned" | "published";
   source_slot?: number;
   source_checked_at_ms?: number;
   source_observed_at_ms?: number;
@@ -110,10 +113,13 @@ function category(error: unknown): string {
 }
 function emit(
   trace: Trace,
-  record: Omit<MonitorTimingRecord, "event" | "tick_ref">,
+  record: Omit<MonitorTimingRecord, "event" | "tick_ref" | "emitted_at_ms">,
+  capturedAt?: number,
 ): void {
   // Diagnostics must never change transaction, execution or retry behavior.
   try {
+    const at = capturedAt ?? Date.now();
+    if (!Number.isSafeInteger(at) || at <= 0) return;
     trace.report({
       event: "agent_monitor_timing",
       tick_ref: trace.ref,
@@ -121,6 +127,7 @@ function emit(
         ? {}
         : { parent_phase: trace.parentPhase }),
       ...record,
+      emitted_at_ms: at,
     });
   } catch {}
 }
@@ -217,16 +224,31 @@ export function noteMonitorAccountAge(
   stage: "returned" | "published" = "returned",
 ): void {
   const trace = traces.getStore();
-  const age = Date.now() - observedAt;
-  if (!trace || !Number.isFinite(age)) return;
-  emit(trace, {
-    kind: "account_age",
-    phase: stage === "published" ? "audit_control" : trace.phase,
-    ...(stage === "published" ? { parent_phase: "tick" } : {}),
-    duration_ms: 0,
-    outcome: "ok",
-    account_age_ms: Math.round(Math.max(0, age)),
-  });
+  if (
+    !trace ||
+    !Number.isSafeInteger(observedAt) ||
+    observedAt <= 0 ||
+    (stage !== "returned" && stage !== "published")
+  )
+    return;
+  try {
+    const at = Date.now();
+    if (!Number.isSafeInteger(at) || at <= 0) return;
+    emit(
+      trace,
+      {
+        kind: "account_age",
+        phase: stage === "published" ? "audit_control" : trace.phase,
+        ...(stage === "published" ? { parent_phase: "tick" } : {}),
+        duration_ms: 0,
+        outcome: "ok",
+        account_age_ms: Math.round(Math.max(0, at - observedAt)),
+        account_observed_at_ms: observedAt,
+        account_stage: stage,
+      },
+      at,
+    );
+  } catch {}
 }
 
 // Evidence at the existing consumption guard, distinct from historical
@@ -250,7 +272,8 @@ export function noteMonitorSourceEvidence(
     return;
   const age = checkedAt - observedAt;
   const positionAge = checkedAt - minimumPositionObservedAt;
-  const valid = age >= 0 && age <= 5000 && positionAge >= 0 && positionAge <= 5000;
+  const valid =
+    age >= 0 && age <= 5000 && positionAge >= 0 && positionAge <= 5000;
   emit(trace, {
     kind: "source_age",
     phase: trace.phase,

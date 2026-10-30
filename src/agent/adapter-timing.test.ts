@@ -57,6 +57,10 @@ function assertSafe(records: MonitorTimingRecord[]) {
     assert.equal(record.event, "agent_monitor_timing");
     assert.match(record.tick_ref, /^[0-9a-f-]{36}$/);
     assert.ok(
+      Number.isSafeInteger(record.emitted_at_ms) && record.emitted_at_ms! > 0,
+      "producer wall time must be a positive safe-integer millisecond value",
+    );
+    assert.ok(
       Object.keys(record).every((key) =>
         [
           "event",
@@ -68,6 +72,7 @@ function assertSafe(records: MonitorTimingRecord[]) {
           "duration_ms",
           "outcome",
           "error_category",
+          "emitted_at_ms",
         ].includes(key),
       ),
       "adapter diagnostics must contain only the timing schema",
@@ -89,6 +94,8 @@ it("does not emit adapter timing outside a monitor trace", async (t) => {
 });
 
 it("records complete adapter fetch and JSON time under a random monitor trace without user payloads", async (t) => {
+  const emittedAt = 1800000000000;
+  t.mock.method(Date, "now", () => emittedAt);
   const f = fixture(t),
     result = snapshot();
   let sentBody: unknown;
@@ -126,6 +133,7 @@ it("records complete adapter fetch and JSON time under a random monitor trace wi
     operation: "account",
     duration_ms: 350,
     outcome: "ok",
+    emitted_at_ms: emittedAt,
   });
   assert.equal(new Set(f.records.map((record) => record.tick_ref)).size, 1);
   assertSafe(f.records);

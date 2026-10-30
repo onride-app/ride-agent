@@ -15,7 +15,8 @@ async function flush() {
   for (let i = 0; i < 100; i++) await Promise.resolve();
 }
 class Clock {
-  at = 0;
+  // Keep synthetic wall times positive without changing elapsed retry intervals.
+  at = 1;
   private sequence = 0;
   readonly events = new Map<number, { at: number; run(): void }>();
   constructor(t: TestContext) {
@@ -248,7 +249,7 @@ it("keeps all three financial transactions after a successful audit", async (t) 
   ]);
   assert.equal(
     (await f.repository.read("alice")).portfolios[0].snapshot?.observed_at,
-    0,
+    1,
   );
   assert.equal(f.adapter.submitCount, 0);
 });
@@ -306,7 +307,7 @@ it("reacquires concurrent state in durable_notify without planning a new unaudit
   });
   assert.equal(current.portfolios[1].sleeves[0].fixed_last_fill_at, -1234);
   assert.equal(current.portfolios[1].executions.length, 0);
-  assert.deepEqual(f.accounts, [0]);
+  assert.deepEqual(f.accounts, [1]);
   assert.equal(sources, 1, "only the original audit may prefetch sources");
   assert.equal(profiles, 0);
   assert.equal(
@@ -355,7 +356,7 @@ for (const delay of [216, 5200])
       await running;
       assert.deepEqual(
         f.accounts,
-        [600, delay === 216 ? 3200 : 6400],
+        [601, delay === 216 ? 3201 : 6401],
         "finish first, then wait only the remaining absolute retry delay",
       );
       assert.deepEqual(f.ids, ["original_uncertain", "original_uncertain"]);
