@@ -14,6 +14,7 @@
     "start:backend": "node dist/backend.js",
     "start:bridge": "node dist/bridge.js",
     "check": "tsc --noEmit -p tsconfig.test.json",
+    "inventory:prediction": "node dist/cli/prediction-inventory.js",
     "dev": "tsx src/server.ts",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:release": "node scripts/verify-release.mjs"
