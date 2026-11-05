@@ -1,7 +1,11 @@
 import { readAccountBalances } from "./account_balances.js";
 import { D } from "./agent/domain.js";
 import { z } from "zod";
-import { AgentError, result, type Result } from "./agent/contracts.js";
+import { AgentError, failure, result, type Result } from "./agent/contracts.js";
+import {
+  coreAuthenticationError,
+  isCoreAuthenticationError,
+} from "./core_auth.js";
 
 export const accountCopiesInput = z
   .object({
@@ -61,10 +65,17 @@ export async function readAccountCopies(
       signal: AbortSignal.timeout(15000),
       redirect: "error",
     });
+    const httpAuthentication = coreAuthenticationError(response.status);
+    if (httpAuthentication) throw httpAuthentication;
     const body = (await response.json()) as {
       data?: Record<string, any>;
       errors?: unknown[];
     };
+    const authentication = coreAuthenticationError(
+      response.status,
+      body?.errors,
+    );
+    if (authentication) throw authentication;
     if (!response.ok || body.errors?.length || !body.data)
       throw new AgentError(
         "ACCOUNT_READ_UNAVAILABLE",
@@ -101,6 +112,9 @@ export async function readAccountCopies(
     query(perpsQuery, {}, true),
   ]);
   const prediction = reads[0];
+  for (const read of reads)
+    if (read.status === "rejected" && isCoreAuthenticationError(read.reason))
+      throw read.reason;
   if (prediction.status !== "fulfilled" || !prediction.value.me?.id)
     throw new AgentError(
       "ACCOUNT_READ_UNAVAILABLE",
@@ -233,14 +247,28 @@ export async function invokeAccountRead(
     readAccountCopies(graphqlUrl, token, {}, fetcher),
     readAccountBalances(graphqlUrl, token, fetcher),
   ]);
-  const portfolio =
+  let portfolio =
     reads[0].status === "fulfilled"
       ? reads[0].value
-      : result({ portfolio: null }, "stale", [
-          "Agent portfolio read is unavailable; App accounts are read separately.",
-        ]);
+      : {
+          ...failure(reads[0].reason),
+          data: { portfolio: null },
+          warnings: [
+            "Agent portfolio read is unavailable; App accounts are read separately.",
+          ],
+        };
   const app = reads[1].status === "fulfilled" ? reads[1].value : null;
   const balances = reads[2].status === "fulfilled" ? reads[2].value : null;
+  const accountAuthentication = reads
+    .slice(1)
+    .find(
+      (read) =>
+        read.status === "rejected" && isCoreAuthenticationError(read.reason),
+    );
+  if (accountAuthentication?.status === "rejected") {
+    const auth = failure(accountAuthentication.reason);
+    portfolio = { ...portfolio, status: auth.status, error: auth.error };
+  }
   const hasAppCopies = app
     ? [app.data.perps, app.data.prediction].some(
         (m: any) => (m?.configs?.length ?? 0) + (m?.positions?.length ?? 0) > 0,
@@ -251,22 +279,28 @@ export async function invokeAccountRead(
     app.status === "stale" ||
     !balances ||
     !balances.summary.coverage_complete;
-  return result(
+  const authRequired = portfolio.error?.code === "AUTH_REQUIRED";
+  const combined = result(
     {
       ...portfolio.data,
-      account: balances?.account ??
-        app?.data.account ?? { authenticated: true },
+      account: authRequired
+        ? { authenticated: false }
+        : (balances?.account ?? app?.data.account ?? { authenticated: true }),
       query_scope: "agent_portfolio_and_ride_app",
       agent_portfolio_status: portfolio.status,
       account_coverage_status: partial ? "partial" : "complete",
       status_breakdown: {
-        authentication: "authenticated",
+        authentication: authRequired
+          ? "authentication_required"
+          : "authenticated",
         plan: portfolio.data.plan_status ?? "none",
         agent_portfolio: portfolio.status,
         account_coverage: partial ? "partial" : "complete",
-        explanation: partial
-          ? "部分账户数据不完整，不代表登录失效或推荐方案过期。请分别查看方案有效期和余额覆盖范围。"
-          : "账户数据完整；方案有效期与交易执行状态分别显示。",
+        explanation: authRequired
+          ? "Ride 会话已失效，请重新连接后重试账户读取。"
+          : partial
+            ? "部分账户数据不完整，不代表登录失效或推荐方案过期。请分别查看方案有效期和余额覆盖范围。"
+            : "账户数据完整；方案有效期与交易执行状态分别显示。",
       },
       app_copies: app?.data ?? {
         coverage_complete: false,
@@ -303,7 +337,9 @@ export async function invokeAccountRead(
     [
       ...portfolio.warnings,
       ...(app?.warnings ?? [
-        "Signed in. Ride App copies could not be read; retry the query without repeating login.",
+        authRequired
+          ? "Ride authentication is required before App accounts can be read."
+          : "Signed in. Ride App copies could not be read; retry the query without repeating login.",
       ]),
       ...(balances
         ? [
@@ -312,6 +348,10 @@ export async function invokeAccountRead(
         : ["Account balances are unavailable; no missing source is zero."]),
     ],
   );
+  // Preserve an authoritative Agent failure (including Core authentication)
+  // while keeping the independently read App/balance coverage visible.
+  if (portfolio.error) combined.error = portfolio.error;
+  return combined;
 }
 
 function maskAddresses(value: unknown): unknown {

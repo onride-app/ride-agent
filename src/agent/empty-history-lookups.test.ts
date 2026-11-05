@@ -258,7 +258,7 @@ it("returns a fresh complete snapshot without looking up 500 failed historical t
     );
   assert.equal(
     f.reads.filter((read) => read.type === "userAbstraction").length,
-    2,
+    3,
   );
   assert.ok(
     f.portfolio.executions.every((execution) => execution.status === "failed"),

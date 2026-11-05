@@ -1,7 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { Interface, solidityPackedKeccak256 } from "ethers";
-import { strToU8, zipSync } from "fflate";
+import { D } from "./domain.js";
 import {
   historicalMark,
   canonicalOutcomeSlot,
@@ -370,14 +370,6 @@ it("reads archive boundaries and whole inventories even when PnL funding/history
           data,
           pagination: { has_more: false, next_cursor: null },
         });
-      if (u.pathname === "/v1/accounting/snapshot")
-        return new Response(
-          zipSync({
-            "equity.csv": strToU8(
-              `cashBalance,positionsValue,equity,valuationTime\n1000,500,1500,${new Date(end * 1000).toISOString()}\n`,
-            ),
-          }),
-        );
       if (u.pathname === "/v2/positions")
         return page([
           {
@@ -435,11 +427,18 @@ it("reads archive boundaries and whole inventories even when PnL funding/history
       assert.fail(`Unexpected source ${u.pathname}`);
     },
   );
-  const reader = new PredictionEquityHistory("https://rpc.test/", async () => ({
-    collateral: cash,
-    wrapped_collateral: wrapped,
-    conditional_tokens: ctf,
-  }));
+  const reader = new PredictionEquityHistory(
+    "https://rpc.test/",
+    async () => ({
+      collateral: cash,
+      wrapped_collateral: wrapped,
+      conditional_tokens: ctf,
+    }),
+    async (owner) => {
+      assert.equal(owner, wallet);
+      return { wallet: owner, equity: D(1500), at: end * 1000 };
+    },
+  );
   const result = await reader.load(wallet);
   assert.equal(result.metrics.source_drawdown_pct, 0);
   assert.equal(result.metrics.source_roi_pct, 20);
@@ -469,4 +468,17 @@ it("reads archive boundaries and whole inventories even when PnL funding/history
   const curve = (transition.evidence as any).curve;
   assert(Math.abs(Number(curve[10].equity) - 1400) < 1e-9);
   assert.equal(Number(curve[15].equity), 1375);
+});
+
+it("does not request a retired archive or scan chain history without an independent accounting anchor", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    assert.fail("Unanchored reconstruction must stop before HTTP"),
+  );
+  const reader = new PredictionEquityHistory("https://rpc.test", async () =>
+    assert.fail("No unanchored scan"),
+  );
+  await assert.rejects(
+    reader.load("0x" + "a".repeat(40)),
+    /accounting_snapshot_retired/,
+  );
 });

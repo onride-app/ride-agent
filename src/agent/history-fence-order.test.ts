@@ -287,7 +287,7 @@ it("fences all complete histories after the financial responses and before the e
     ),
   );
   assert.ok(firstHistory >= Math.max(...financial.map((read) => read.end)));
-  for (const method of ["frontendOpenOrders", "meta", "userDexAbstraction"])
+  for (const method of ["frontendOpenOrders", "meta"])
     assert.ok(
       f.reads
         .filter((read) => read.type === method)
@@ -303,8 +303,15 @@ it("fences all complete histories after the financial responses and before the e
   );
   assert.equal(
     f.reads.filter((read) => read.type === "userAbstraction").length,
-    2,
+    3,
   );
+  assert.ok(
+    f.reads
+      .filter((read) => read.type === "userAbstraction")
+      .slice(1)
+      .every((read) => read.start >= lastHistory),
+  );
+  assert(!f.reads.some((read) => read.type === "userDexAbstraction"));
   assert.ok(
     snapshot.observed_at <= Math.min(...financial.map((read) => read.start)),
     "the original evidence timestamp cannot be moved to the end of the frame",
@@ -373,7 +380,7 @@ it("retains incomplete-history coverage instead of upgrading it to a complete ac
   assert.ok(f.actions.some((row) => row.operation === "foreign_snapshot"));
   assert.equal(
     f.reads.filter((read) => read.type === "userAbstraction").length,
-    2,
+    3,
   );
 });
 

@@ -148,7 +148,7 @@ it("a saved RWA source keeps its complete observed foreign scopes and original n
   const observedScopes: string[] = [];
   f.stub.taxonomy = async () => new Map([["xyz:TSLA", "stocks"]]);
   f.stub.info = async (input: any) => {
-    if (input.type === "userAbstraction") return "standard";
+    if (input.type === "userAbstraction") return "disabled";
     if (input.type === "userDexAbstraction") return false;
     if (input.type === "meta") return { collateralToken: 0 };
     assert.fail("Unexpected fixture read");
@@ -197,7 +197,7 @@ function completeRwaReads(
   let nativeReads = 0;
   f.stub.taxonomy = async () => new Map([["xyz:TSLA", "stocks"]]);
   f.stub.info = async (input: any) => {
-    if (input.type === "userAbstraction") return "standard";
+    if (input.type === "userAbstraction") return "disabled";
     if (input.type === "userDexAbstraction") return false;
     if (input.type === "meta") return { collateralToken: 0 };
     assert.fail("Unexpected fixture read");

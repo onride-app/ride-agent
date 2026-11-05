@@ -28,7 +28,10 @@ it("completes SDK OAuth PKCE through the loopback callback and refreshes without
   if (!addr || typeof addr === "string") throw Error("No port");
   const base = new URL(`http://127.0.0.1:${addr.port}`);
   const provider = new RideOAuthProvider({
-    validateRideToken: async (token) => ({ subject: token }),
+    validateRideToken: async (token) => {
+      assert.equal(token, "core-test-session");
+      return { subject: "alice" };
+    },
     exchangePrivyToken: async (input) => ({
       rideAuthToken: "core-test-session",
       identity: { subject: input.privyId },

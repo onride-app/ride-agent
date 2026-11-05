@@ -1,22 +1,33 @@
 import { AgentError } from "./contracts.js";
 import { D, cash } from "./domain.js";
 
+// The current userAbstraction enum includes DEX abstraction itself. A missing
+// legacy boolean, unknown enum, or successful HTTP status is not disabled proof.
+export function perpsAbstractionState(
+  value: unknown,
+): "standard" | "unified" | "dex_abstraction" | "portfolio_margin" | "unknown" {
+  if (value && typeof value === "object") {
+    const row = value as Record<string, unknown>;
+    const states = ["abstraction", "userAbstraction", "mode", "response"]
+      .filter((key) => Object.hasOwn(row, key))
+      .map((key) => perpsAbstractionState(row[key]));
+    return states.length && states.every((state) => state === states[0])
+      ? states[0]
+      : "unknown";
+  }
+  const mode = typeof value === "string" ? value.toLowerCase() : "";
+  if (["disabled", "default"].includes(mode)) return "standard";
+  if (["unifiedaccount", "unified", "u"].includes(mode)) return "unified";
+  if (mode === "dexabstraction") return "dex_abstraction";
+  if (mode === "portfoliomargin") return "portfolio_margin";
+  return "unknown";
+}
+
 export function perpsAccountMode(
   value: unknown,
 ): "standard" | "unified" | "unsupported" {
-  if (value && typeof value === "object") {
-    const row = value as Record<string, unknown>;
-    return perpsAccountMode(
-      row.abstraction ?? row.userAbstraction ?? row.mode ?? row.response,
-    );
-  }
-  const mode =
-    typeof value === "string"
-      ? value.replace(/[^a-z0-9]/gi, "").toLowerCase()
-      : "";
-  if (["disabled", "default"].includes(mode)) return "standard";
-  if (["unifiedaccount", "unified", "u"].includes(mode)) return "unified";
-  return "unsupported";
+  const state = perpsAbstractionState(value);
+  return state === "standard" || state === "unified" ? state : "unsupported";
 }
 
 // Unified accounts report the single USDC balance and all holds in spot state.

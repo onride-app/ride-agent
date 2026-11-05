@@ -268,20 +268,8 @@ export async function readSelectedPlanEvidence(
             );
             continue;
           }
-          if (mode === "standard") {
-            const dexAbstraction = await info({
-              type: "userDexAbstraction",
-              user: identity.address,
-            });
-            if (![false, null].includes(dexAbstraction as any)) {
-              sources[at] = unavailable(
-                trader,
-                "SOURCE_DEX_ABSTRACTION_UNVERIFIED",
-                mode,
-              );
-              continue;
-            }
-          }
+          // userAbstraction's explicit default/disabled enum establishes
+          // Standard mode without the legacy userDexAbstraction request.
           const state = await info({
             type: "clearinghouseState",
             user: identity.address,

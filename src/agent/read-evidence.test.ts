@@ -15,7 +15,6 @@ function fixture(
     mode?: string;
     time?: number;
     leverage?: number | null;
-    dex?: boolean;
     hold?: string;
   } = {},
 ) {
@@ -55,8 +54,6 @@ function fixture(
           return { BTC: "42000", ETH: "2000" };
         case "userAbstraction":
           return options.mode ?? "disabled";
-        case "userDexAbstraction":
-          return options.dex ?? false;
         case "clearinghouseState":
           return structuredClone(state);
         case "spotClearinghouseState":
@@ -140,10 +137,11 @@ it("verifies Unified USDC independently without double counting and discloses mi
   );
 });
 
-it("fails unknown modes, unverified Standard abstraction and invalid Unified balances closed", async () => {
+it("fails unknown modes, explicit DEX abstraction and invalid Unified balances closed", async () => {
   for (const options of [
     { mode: "portfolioMargin" },
-    { dex: true },
+    { mode: "dexAbstraction" },
+    { mode: "futureMode" },
     { mode: "unifiedAccount", hold: "1000" },
   ]) {
     const f = fixture(options);
@@ -152,6 +150,18 @@ it("fails unknown modes, unverified Standard abstraction and invalid Unified bal
     assert.equal(result.sources[0].snapshot, null);
     assert.equal(result.sources[0].equity_verified, false);
   }
+});
+
+it("reads the current Standard default enum without the retired boolean endpoint", async () => {
+  const f = fixture({ mode: "default" });
+  const value = await readSelectedPlanEvidence([selected()], f.reader);
+  assert.equal(value.sources[0].status, "available");
+  assert.equal(value.sources[0].account_mode, "standard");
+  assert.equal(
+    f.calls.filter((call) => call.type === "userAbstraction").length,
+    1,
+  );
+  assert(!f.calls.some((call) => call.type === "userDexAbstraction"));
 });
 
 it("keeps stale timestamps and missing actual source leverage distinguishable from verified data", async () => {

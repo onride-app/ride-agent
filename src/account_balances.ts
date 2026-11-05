@@ -1,6 +1,8 @@
 import { D, cash, fingerprint } from "./agent/domain.js";
 import { AgentError } from "./agent/contracts.js";
 import { VenueReads } from "./agent/venue-reads.js";
+import { readPredictionPositionsV2 } from "./agent/polymarket-data.js";
+import { coreAuthenticationError } from "./core_auth.js";
 
 const address = (v: unknown): v is string =>
   typeof v === "string" && /^0x[a-fA-F0-9]{40}$/.test(v);
@@ -44,6 +46,7 @@ export async function readAccountBalances(
       deadlineMs: 10000,
       signal: deadline,
     });
+  let authenticationFailure: AgentError | undefined;
   const query = async (document: string, embedded = false) => {
     const response = await request(graphql, {
       method: "POST",
@@ -56,7 +59,20 @@ export async function readAccountBalances(
       redirect: "error",
       signal: AbortSignal.any([deadline, AbortSignal.timeout(15000)]),
     });
+    const httpAuthentication = coreAuthenticationError(response.status);
+    if (httpAuthentication) {
+      authenticationFailure = httpAuthentication;
+      throw httpAuthentication;
+    }
     const body = (await response.json()) as any;
+    const authentication = coreAuthenticationError(
+      response.status,
+      body?.errors,
+    );
+    if (authentication) {
+      authenticationFailure = authentication;
+      throw authentication;
+    }
     if (!response.ok || body.errors?.length || !body.data)
       throw Error("Account source unavailable");
     return body.data;
@@ -276,42 +292,16 @@ export async function readAccountBalances(
     };
   };
   const inventory = async (owner: string) => {
-    const positions = new Map<string, string>();
-    for (let offset = 0; offset <= 10000; offset += 500) {
-      deadline.throwIfAborted();
-      const url = new URL("https://data-api.polymarket.com/positions");
-      for (const [k, v] of Object.entries({
-        user: owner,
-        sizeThreshold: "0",
-        includeArchived: "true",
-        limit: "500",
-        offset: String(offset),
-        sortBy: "TOKENS",
-        sortDirection: "DESC",
-      }))
-        url.searchParams.set(k, v);
-      const rows = await publicJson(url.href);
-      if (!Array.isArray(rows) || rows.length > 500)
-        throw Error("Prediction inventory unavailable");
-      const previous = positions.size;
-      for (const row of rows) {
-        if (
-          String(row.proxyWallet).toLowerCase() !== owner.toLowerCase() ||
-          typeof row.asset !== "string" ||
-          !row.asset
-        )
-          throw Error("Unverified position owner");
-        const value = number(row.currentValue);
-        if (value.lt(0)) throw Error("Invalid position value");
-        if (positions.has(row.asset) && !D(positions.get(row.asset)!).eq(value))
-          throw Error("Inconsistent inventory page");
-        positions.set(row.asset, value.toString());
-      }
-      if (rows.length < 500) return positions;
-      if (positions.size === previous)
-        throw Error("Prediction inventory pagination did not advance");
-    }
-    throw Error("Prediction inventory truncated");
+    const evidence = await readPredictionPositionsV2(owner, {
+      request,
+      signal: deadline,
+    });
+    return new Map(
+      evidence.rows.map((row) => [
+        row.asset as string,
+        number(row.currentValue).toString(),
+      ]),
+    );
   };
   const readPrediction = async () => {
     const owners = [
@@ -446,10 +436,9 @@ export async function readAccountBalances(
         (reason ?? "") +
         " Complete Prediction inventory is temporarily unavailable.";
     }
-    const value =
-      cashValue && holdings !== null
-        ? cash(number(cashValue.allOwnedBalance).plus(holdings))
-        : null;
+    // Inactive markets are excluded from every v2 positions cohort. Retain
+    // verified cash and servable holdings as subtotals, never a full valuation.
+    const value = null;
     return {
       module: "prediction",
       status: value === null ? "partial" : "ok",
@@ -463,13 +452,16 @@ export async function readAccountBalances(
         : null,
       occupied_or_reserved_usdc: null,
       retained_wallet_cash_usdc: cashValue?.retainedCash ?? null,
-      app_display_value_usd:
+      app_display_value_usd: null,
+      known_app_display_subtotal_usd:
         cashValue && holdings !== null
           ? cash(D(cashValue.totalBalance).plus(holdings))
           : null,
       app_difference_reason:
         "App displays current trading-wallet cash plus owned positions. MCP equity also includes verified cash in retained Prediction wallets; retained cash is not current trading availability.",
-      positions_value_usd: holdings,
+      positions_value_usd: null,
+      known_positions_value_usd: holdings,
+      positions_coverage: "servable_markets_only",
       trading_collateral_basis:
         "Owned Ride Prediction wallet: pUSD + USDC.e verified at one Polygon block; pending-order reservations are not supplied by this API",
       non_trading_native_usdc:
@@ -483,11 +475,12 @@ export async function readAccountBalances(
       observed_at: null,
       fetched_at: new Date().toISOString(),
       reason:
-        reason ??
-        "Open-order reserve is unavailable. Native USDC is funding cash and is excluded from trading equity. Retained-wallet cash is included in equity, separately from current-wallet trading availability.",
+        (reason ?? "") +
+        " Inactive-market holdings and open-order reserves are unavailable. Prediction values are verified subtotals, not complete account equity. Native USDC remains excluded from trading equity.",
     };
   };
   const reads = await Promise.allSettled([readPerps(), readPrediction()]);
+  if (authenticationFailure) throw authenticationFailure;
   const markets: any = {
     perps:
       reads[0].status === "fulfilled"

@@ -5,7 +5,7 @@ import {
   solidityPackedKeccak256,
 } from "ethers";
 import { D, now, type Candidate } from "./domain.js";
-import { accountingEquity, type Metrics } from "./prediction_history.js";
+import type { Metrics } from "./prediction_history.js";
 
 const DAY = 86400;
 const abi20 = new Interface([
@@ -269,8 +269,13 @@ export class PredictionEquityHistory {
   constructor(
     private rpcUrl: string,
     private contracts: () => Promise<Contracts>,
+    private accountingAnchor?: (
+      wallet: string,
+      signal: AbortSignal,
+    ) => Promise<{ wallet: string; equity: ReturnType<typeof D>; at: number }>,
   ) {}
   async load(wallet: string): Promise<{ metrics: Metrics; evidence: unknown }> {
+    if (!this.accountingAnchor) throw new Error("accounting_snapshot_retired");
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(new Error("equity_history_timeout")),
@@ -473,12 +478,7 @@ export class PredictionEquityHistory {
         this.blockStarts.delete(this.blockStarts.keys().next().value!);
     }
     const startBlock = await startPromise;
-    const snapshotUrl = new URL(
-      "/v1/accounting/snapshot",
-      "https://data-api.polymarket.com",
-    );
-    snapshotUrl.searchParams.set("user", wallet);
-    const [open, lost, activity, snapshotBytes] = await Promise.all([
+    const [open, lost, activity, snapshot] = await Promise.all([
       paged("/v2/positions", {
         user: wallet,
         status: "OPEN",
@@ -493,9 +493,19 @@ export class PredictionEquityHistory {
         exclude_deposits_withdrawals: "false",
         sort_direction: "ASC",
       }),
-      read(snapshotUrl),
+      this.accountingAnchor!(wallet, signal),
     ]);
-    const snapshot = accountingEquity(snapshotBytes);
+    check(
+      lower(snapshot.wallet) === lower(wallet),
+      "accounting_anchor_owner_mismatch",
+    );
+    check(
+      Number.isSafeInteger(snapshot.at) &&
+        snapshot.at > 0 &&
+        snapshot.equity.isFinite() &&
+        snapshot.equity.gt(0),
+      "invalid_accounting_anchor",
+    );
     check(Math.abs(snapshot.at / 1000 - end) <= 180, "stale_inventory_anchor");
     const addresses = [
       c.collateral,

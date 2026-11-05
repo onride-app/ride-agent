@@ -11,6 +11,7 @@ import {
   InvalidRequestError,
   InvalidScopeError,
   InvalidTokenError,
+  TemporarilyUnavailableError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type {
   AuthorizationParams,
@@ -110,6 +111,19 @@ type AccessTokenRecord = {
 
 type RefreshTokenRecord = AccessTokenRecord;
 
+function storedCoreTokenExpired(token: string): boolean {
+  // Only a previously verified credential read from our own OAuth store reaches
+  // this check. Expiry can deny an opaque session; decoded claims never grant
+  // identity or scopes. Unknown/non-JWT credentials still require Core's guard.
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3 || !/^[A-Za-z0-9_-]+$/.test(parts[1])) return false;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return Number.isSafeInteger(payload?.exp) && payload.exp >= 0 &&
+      payload.exp <= Math.floor(Date.now() / 1000);
+  } catch { return false; }
+}
+
 export type RideOAuthStats = {
   store: "memory" | "redis";
   registeredClients: number;
@@ -134,6 +148,7 @@ export type RideOAuthStateStore = {
   getRefreshToken: (token: string) => Promise<RefreshTokenRecord | undefined>;
   setRefreshToken: (token: string, record: RefreshTokenRecord) => Promise<void>;
   deleteRefreshToken: (token: string) => Promise<void>;
+  consumeRefreshToken: (token: string, expected: RefreshTokenRecord) => Promise<boolean>;
   getStats?: () => Promise<RideOAuthStats>;
 };
 
@@ -196,6 +211,21 @@ export class InMemoryOAuthStateStore implements RideOAuthStateStore {
 
   async deleteRefreshToken(token: string): Promise<void> {
     this.refreshTokens.delete(token);
+  }
+
+  async consumeRefreshToken(
+    token: string,
+    expected: RefreshTokenRecord,
+  ): Promise<boolean> {
+    const current = this.refreshTokens.get(token);
+    if (
+      !current ||
+      serializeAccessTokenRecord(current) !==
+        serializeAccessTokenRecord(expected)
+    )
+      return false;
+    this.refreshTokens.delete(token);
+    return true;
   }
 
   async getStats(): Promise<RideOAuthStats> {
@@ -284,6 +314,22 @@ class RedisOAuthStateStore implements RideOAuthStateStore {
 
   async deleteRefreshToken(token: string): Promise<void> {
     await this.client.del(this.key("refresh-token", token));
+  }
+
+  async consumeRefreshToken(
+    token: string,
+    expected: RefreshTokenRecord,
+  ): Promise<boolean> {
+    // Validate first, then consume exactly that generation atomically. Competing
+    // gateways cannot both rotate one grant, or delete a replaced record.
+    const consumed = await this.client.eval(
+      "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+      {
+        keys: [this.key("refresh-token", token)],
+        arguments: [serializeAccessTokenRecord(expected)],
+      },
+    );
+    return consumed === 1;
   }
 
   async getStats(): Promise<RideOAuthStats> {
@@ -394,8 +440,9 @@ export async function createRedisOAuthStateStore(options: {
   keyPrefix?: string;
 }): Promise<RideOAuthStateStore> {
   const client = createClient({ url: options.url });
-  client.on("error", (error) => {
-    console.error("Rider OAuth Redis error:", error);
+  client.on("error", () => {
+    try { console.error("Rider OAuth Redis connection failure."); }
+    catch { /* Diagnostics cannot replace an OAuth operation's result. */ }
   });
   await client.connect();
   return new RedisOAuthStateStore(client as RedisClientType, options.keyPrefix ?? "ride:mcp:oauth");
@@ -620,7 +667,36 @@ export class RideOAuthProvider implements OAuthServerProvider {
       );
     }
 
-    await this.store.deleteRefreshToken(refreshToken);
+    let identity: RideTokenIdentity;
+    try {
+      // Stored OAuth grants contain only the Core access token, no Core refresh
+      // credential. Reissuing an outer token cannot renew an expired inner JWT.
+      identity = await this.options.validateRideToken(record.rideAuthToken);
+    } catch (error) {
+      if (error instanceof AgentError && error.code === "AUTH_REQUIRED")
+        throw new InvalidGrantError(
+          "Ride session requires authentication. Reconnect Rider to continue.",
+        );
+      if (error instanceof AgentError && error.code === "UPGRADE_REQUIRED")
+        throw new InvalidRequestError(
+          "Ride client update is required before this session can be renewed.",
+        );
+      // Preserve the original grant during genuine Core outages. The host must
+      // be able to retry it, rather than being forced into another login loop.
+      throw new TemporarilyUnavailableError(
+        "Ride session verification is temporarily unavailable. Retry refresh without reconnecting.",
+      );
+    }
+    if (!identity.subject || identity.subject !== record.identity.subject)
+      throw new InvalidGrantError(
+        "Ride session owner changed. Reconnect Rider to continue.",
+      );
+    if (record.expiresAt <= Date.now())
+      throw new InvalidGrantError("Invalid or expired refresh token.");
+    if (!(await this.store.consumeRefreshToken(refreshToken, record)))
+      throw new InvalidGrantError(
+        "Refresh token was already consumed or replaced.",
+      );
     return this.issueTokens({
       ...record,
       scopes: requestedScopes,
@@ -647,6 +723,8 @@ export class RideOAuthProvider implements OAuthServerProvider {
     if (!record || record.expiresAt < Date.now()) {
       throw new InvalidTokenError("Invalid or expired access token.");
     }
+    if (storedCoreTokenExpired(record.rideAuthToken))
+      throw new InvalidTokenError("Ride session expired. Reconnect Rider to continue.");
 
     return {
       token,

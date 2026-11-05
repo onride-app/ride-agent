@@ -449,6 +449,33 @@ it("waits only within the original session for false control state produced afte
   assert.equal(proof?.server_time, 10050);
   assert.equal(f.sockets.length, 1);
 });
+
+it("does not manufacture false abstraction proof from the current webData3 shape without that field", async () => {
+  const f = fixture();
+  f.advance(10000);
+  const work = f.reads.readAbstraction(user, signal(), 10000);
+  const socket = f.sockets[0];
+  socket.emit("open");
+  // Current public response shape: financial scopes and server time survive,
+  // while dexAbstractionEnabled is absent. Only REST can supply the mode proof.
+  socket.message({
+    channel: "webData3",
+    data: {
+      userState: {
+        user,
+        serverTime: 10000,
+        agentAddress: null,
+        agentValidUntil: null,
+        cumLedger: "0",
+        isVault: false,
+      },
+      perpDexStates: [],
+    },
+  });
+  assert.equal(await work, undefined);
+  assert.equal(f.reports[0].outcome, "invalid");
+  assert.equal(socket.terminated, 1);
+});
 it("does not reset the original control timeout while ignoring a snapshot older than the history boundary", async () => {
   const f = fixture();
   f.advance(10000);

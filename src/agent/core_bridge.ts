@@ -41,7 +41,11 @@ import {
   inObservedPerpsScope,
   scopedSourceFills,
 } from "./source-fill-evidence.js";
-import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
+import {
+  perpsAbstractionState,
+  perpsAccountMode,
+  unifiedUsdc,
+} from "./perps_account.js";
 import { readSelectedPlanEvidence } from "./read-evidence.js";
 import {
   checkPerpsOrder,
@@ -406,14 +410,11 @@ export class CoreBridge {
     return values;
   }
   private async standardMode(address: string, source = false) {
-    const [mode, abstraction] = await Promise.all([
-      this.info({ type: "userAbstraction", user: address }, source),
-      this.info({ type: "userDexAbstraction", user: address }, source),
-    ]);
-    if (
-      !["standard", "disabled"].includes(mode) ||
-      ![false, null].includes(abstraction)
-    )
+    const abstraction = await this.info(
+      { type: "userAbstraction", user: address },
+      source,
+    );
+    if (perpsAbstractionState(abstraction) !== "standard")
       throw new AgentError(
         "ACCOUNT_MODE_UNSUPPORTED",
         "This dedicated RWA flow requires Standard mode; unified or portfolio-margin balances cannot be counted as separate DEX collateral.",
@@ -1509,7 +1510,21 @@ export class CoreBridge {
           }
         }
         this.venueReads.accountReadTimeout();
-        return this.info({ type: "userDexAbstraction", user: identity.master });
+        // webData3 no longer always supplies the legacy boolean. Keep that
+        // optional proof strict and re-read the authoritative current enum via
+        // the same account budget/deadline after history, never infer false
+        // from the field's absence or reuse the earlier account-mode read.
+        const current = await this.info({
+          type: "userAbstraction",
+          user: identity.master,
+        });
+        if (perpsAbstractionState(current) !== "unified")
+          throw new AgentError(
+            "ACCOUNT_STALE",
+            "Account abstraction changed or could not be verified during the balance observation.",
+            true,
+          );
+        return false;
       };
       const [spot, dexAbstraction, dexes] = await Promise.all([
         financialPrefix

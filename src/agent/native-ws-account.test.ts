@@ -185,7 +185,7 @@ it("uses one early explicit native and foreign batch before every history fence,
   );
   assert.equal(snapshot.observed_at, f.nativeDispatch);
   assert.equal(snapshot.account_value_usdc, "100.000000");
-  assert.equal(f.reads.filter((x) => x.type === "userAbstraction").length, 2);
+  assert.equal(f.reads.filter((x) => x.type === "userAbstraction").length, 3);
 });
 for (const issue of [
   "nonempty",
@@ -297,10 +297,7 @@ it("rejects an otherwise fresh false proof produced before every history respons
           .map((x) => x.at + 100),
       ),
   );
-  assert.equal(
-    f.reads.filter((x) => x.type === "userDexAbstraction").length,
-    1,
-  );
+  assert.equal(f.reads.filter((x) => x.type === "userAbstraction").length, 3);
   assert.equal(snapshot.observed_at, f.nativeDispatch);
 });
 it("accepts an explicit false proof at the real history-completion boundary without requiring a newer server clock", async (t) => {
@@ -316,8 +313,50 @@ it("accepts an explicit false proof at the real history-completion boundary with
     server_time: notBefore,
   });
   await f.bridge.perpsAccount("alice", f.portfolio);
-  assert.equal(
-    f.reads.filter((x) => x.type === "userDexAbstraction").length,
-    0,
-  );
+  assert.equal(f.reads.filter((x) => x.type === "userAbstraction").length, 2);
 });
+
+it("uses fresh budgeted userAbstraction after missing WS control proof without calling the retired endpoint", async (t) => {
+  const f = fixture(t);
+  (f.bridge as any).orderSnapshots.readAbstraction = async () => undefined;
+  const snapshot = await f.bridge.perpsAccount("alice", f.portfolio);
+  assert.equal(snapshot.coverage_complete, true);
+  const modeReads = f.reads.filter((read) => read.type === "userAbstraction");
+  assert.equal(modeReads.length, 3);
+  assert(
+    modeReads[1].at >=
+      Math.max(
+        ...f.actions
+          .filter((action) => action.type !== "ws")
+          .map((action) => action.at + 100),
+      ),
+  );
+  assert(!f.reads.some((read) => read.type === "userDexAbstraction"));
+  assert.equal(snapshot.observed_at, f.nativeDispatch);
+});
+
+for (const mode of [
+  "default",
+  "dexAbstraction",
+  "portfolioMargin",
+  "futureMode",
+  null,
+])
+  it(`rejects ${mode} as disabled-DEX proof when Unified fallback re-reads the current enum`, async (t) => {
+    const f = fixture(t);
+    const stub = f.bridge as any,
+      info = stub.info;
+    let modes = 0;
+    stub.orderSnapshots.readAbstraction = async () => undefined;
+    stub.info = async (payload: any) => {
+      if (payload.type === "userAbstraction" && ++modes > 1) return mode;
+      return info(payload);
+    };
+    await assert.rejects(f.bridge.perpsAccount("alice", f.portfolio), {
+      code: "ACCOUNT_STALE",
+    });
+    assert(!f.reads.some((read) => read.type === "userDexAbstraction"));
+    assert(
+      !f.actions.some((action) => /bind|configure|submit/.test(action.type)),
+    );
+  });
