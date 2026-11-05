@@ -111,7 +111,7 @@ function fixture(
             ],
           }
         : payload.type === "userAbstraction"
-          ? "standard"
+          ? "disabled"
           : payload.type === "userDexAbstraction"
             ? false
             : payload.type === "meta"

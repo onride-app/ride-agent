@@ -47,10 +47,40 @@ for (const scenario of [
       }),
     auth: true,
   },
+  ...[
+    "NO_TOKEN",
+    "ACCESS_TOKEN_EXPIRED",
+    "REFRESH_TOKEN_EXPIRED",
+    "EPOCH_OUTDATED",
+    "INVALID_SIGNATURE",
+    "MALFORMED_TOKEN",
+    "INVALID_TOKEN_USE",
+    "SESSION_REVOKED",
+    "SESSION_NOT_FOUND",
+  ].map((code) => ({
+    name: `Core GraphQL ${code} despite partial identity data`,
+    response: () =>
+      Response.json({
+        ...valid,
+        errors: [{ message: "private upstream detail", extensions: { code } }],
+      }),
+    auth: true,
+    reasonCode: code,
+  })),
   {
     name: "HTTP 503 JSON",
     response: () =>
       Response.json({ error: "database unavailable" }, { status: 503 }),
+  },
+  {
+    name: "HTTP 503 with an unrelated authentication-looking payload",
+    response: () =>
+      Response.json(
+        {
+          errors: [{ extensions: { code: "ACCESS_TOKEN_EXPIRED" } }],
+        },
+        { status: 503 },
+      ),
   },
   {
     name: "HTTP 502 HTML",
@@ -89,6 +119,11 @@ for (const scenario of [
   { name: "invalid JSON", response: () => new Response("invalid-json") },
   { name: "null payload", response: () => Response.json(null) },
   {
+    name: "malformed errors object",
+    response: () =>
+      Response.json({ ...valid, errors: { code: "AUTH_REQUIRED" } }),
+  },
+  {
     name: "network failure",
     response: () => {
       throw new Error("private network detail");
@@ -107,6 +142,8 @@ for (const scenario of [
         );
         assert.equal(error.httpStatus, scenario.auth ? 401 : 503);
         assert.equal(error.retryable, !scenario.auth);
+        if ("reasonCode" in scenario)
+          assert.deepEqual(error.details, { reason_code: scenario.reasonCode });
         assert(!error.message.includes("private"));
         assert(!error.message.includes("fixture-token"));
         return true;
@@ -114,3 +151,21 @@ for (const scenario of [
     );
   });
 }
+
+it("keeps Core upgrade requirements distinct from authentication and outages", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    Response.json({
+      ...valid,
+      errors: [{ extensions: { code: "UPGRADE_REQUIRED" } }],
+    }),
+  );
+  await assert.rejects(
+    validateCoreIdentity("fixture-token", "https://core.example/graphql"),
+    {
+      code: "UPGRADE_REQUIRED",
+      httpStatus: 403,
+      retryable: false,
+      details: { reason_code: "UPGRADE_REQUIRED" },
+    },
+  );
+});

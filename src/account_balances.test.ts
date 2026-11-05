@@ -141,20 +141,24 @@ function fixture(
       assert(
         [proxy, "0x" + "3".repeat(40)].includes(u.searchParams.get("user")!),
       );
-      return Response.json([
-        {
-          proxyWallet: options.foreignPosition
-            ? owner
-            : u.searchParams.get("user"),
-          asset: "token",
-          currentValue: 3,
-        },
-        {
-          proxyWallet: u.searchParams.get("user"),
-          asset: "token",
-          currentValue: 3,
-        },
-      ]);
+      assert.equal(u.pathname, "/v2/positions");
+      assert(!u.searchParams.has("offset"));
+      const row = {
+        proxy_wallet: options.foreignPosition
+          ? owner
+          : u.searchParams.get("user"),
+        token_id: "123",
+        condition_id: "0x" + "a".repeat(64),
+        status: "OPEN",
+        current_size: 10,
+        current_price: 0.3,
+        current_value: 3,
+        avg_price: 0.2,
+      };
+      return Response.json({
+        data: u.searchParams.get("status") === "OPEN" ? [row, row] : [],
+        pagination: { has_more: false, next_cursor: null },
+      });
     }
     throw Error("Unexpected source");
   }) as typeof fetch;
@@ -171,8 +175,8 @@ it("reads the App's 43 USD Perps separately from 7 USDC Prediction cash and neve
   assert.equal(out.markets.perps.available_trading_usdc, "40.000000");
   assert.equal(out.markets.perps.wallets.length, 1);
   assert.equal(out.markets.prediction.available_trading_usdc, "7.000000");
-  assert.equal(out.markets.prediction.positions_value_usd, "3.000000");
-  assert.equal(out.markets.prediction.account_value_usd, "10.000000");
+  assert.equal(out.markets.prediction.known_positions_value_usd, "3.000000");
+  assert.equal(out.markets.prediction.account_value_usd, null);
   assert.equal(out.summary.known_subtotal_usd, "53.000000");
   assert.equal(out.summary.account_value_usd, null);
   assert.equal(out.markets.meme.account_value_usd, null);
@@ -223,7 +227,7 @@ it("reports failed market reads and unpriced holdings as unavailable while retai
         f.request,
       );
     assert.equal(out.markets.perps.account_value_usd, null);
-    assert.equal(out.markets.prediction.account_value_usd, "10.000000");
+    assert.equal(out.markets.prediction.account_value_usd, null);
     assert.equal(out.summary.supported_markets_complete, false);
   }
 });
@@ -259,9 +263,12 @@ it("includes retained Prediction cash once and explains the difference from App 
     "fixture",
     f.request,
   );
-  assert.equal(out.markets.prediction.account_value_usd, "18.000000");
+  assert.equal(out.markets.prediction.known_subtotal_usd, "18.000000");
   assert.equal(out.markets.prediction.available_trading_usdc, "7.000000");
   assert.equal(out.markets.prediction.retained_wallet_cash_usdc, "5.000000");
-  assert.equal(out.markets.prediction.app_display_value_usd, "13.000000");
+  assert.equal(
+    out.markets.prediction.known_app_display_subtotal_usd,
+    "13.000000",
+  );
   assert.equal(out.markets.prediction.position_wallet_count, 2);
 });

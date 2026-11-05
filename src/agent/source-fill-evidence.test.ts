@@ -312,7 +312,7 @@ it("uses precisely the native / RWA scopes observed by readSource, including suc
         reads.push(input.type + ":" + (input.dex ?? ""));
         if (input.type === "clearinghouseState")
           return { marginSummary: { accountValue: "100" }, assetPositions: [] };
-        if (input.type === "userAbstraction") return "standard";
+        if (input.type === "userAbstraction") return "disabled";
         if (input.type === "userDexAbstraction") return false;
         if (input.type === "perpCategories")
           return [

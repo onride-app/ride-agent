@@ -249,8 +249,6 @@ export function predictionMetrics(
 }
 
 export class PredictionHistory {
-  private cache = new Map<string, { until: number; value: Metrics }>();
-  private pending = new Map<string, Promise<Metrics>>();
   private reconstructed = new Map<string, EquityHistoryRecord>();
   private hydrated = new Map<string, Promise<void>>();
   private reconstructing = new Map<string, Promise<void>>();
@@ -343,101 +341,14 @@ export class PredictionHistory {
         "polygon_transfers_and_polymarket_historical_marks"
     );
   }
-  private async nativeMetrics(wallet: string): Promise<Metrics> {
-    const key = wallet.toLowerCase(),
-      cached = this.cache.get(key);
-    if (cached && cached.until > now()) return cached.value;
-    const existing = this.pending.get(key);
-    if (existing) return existing;
-    const promise = this.load(key)
-      .catch((e): Metrics => ({
-        source_roi_pct: null,
-        source_drawdown_pct: null,
-        metric_unavailable_reason:
-          e instanceof Error && /^[a-z_]+$/.test(e.message)
-            ? e.message
-            : "history_source_unavailable",
-      }))
-      .then((value) => {
-        this.cache.set(key, {
-          until: value.metric_window
-            ? Math.min(
-                now() + 10 * 60_000,
-                value.metric_window.end_at + 36 * 3_600_000,
-              )
-            : now() + 60_000,
-          value,
-        });
-        // This is a bounded display cache, never an execution source snapshot.
-        if (this.cache.size > 100)
-          this.cache.delete(this.cache.keys().next().value!);
-        return value;
-      })
-      .finally(() => this.pending.delete(key));
-    this.pending.set(key, promise);
-    return promise;
-  }
-  private async load(wallet: string): Promise<Metrics> {
-    const signal = AbortSignal.timeout(6000);
-    const read = async (
-      path: string,
-      params: Record<string, string>,
-      zip = false,
-    ) => {
-      const url = new URL(path, "https://data-api.polymarket.com");
-      for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-      const r = await fetch(url, { signal, redirect: "error" });
-      requireData(r.ok && r.body, "history_source_unavailable");
-      let size = 0;
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of r.body as any as AsyncIterable<Uint8Array>) {
-        size += chunk.length;
-        requireData(size <= 4 * 1024 * 1024, "history_response_too_large");
-        chunks.push(chunk);
-      }
-      const body = Buffer.concat(chunks);
-      return zip ? accountingEquity(body) : JSON.parse(body.toString("utf8"));
+  private async nativeMetrics(_wallet: string): Promise<Metrics> {
+    // The accounting ZIP route retired with Data API v1. v2 position/PnL
+    // responses are not equivalent accounting snapshots. Keep risk unavailable
+    // while the existing independent Polygon reconstruction supplies evidence.
+    return {
+      source_roi_pct: null,
+      source_drawdown_pct: null,
+      metric_unavailable_reason: "accounting_snapshot_retired",
     };
-    const [pnl, snapshot] = await Promise.all([
-      read("/v2/user-pnl", { user: wallet, interval: "1m", fidelity: "1d" }),
-      read("/v1/accounting/snapshot", { user: wallet }, true),
-    ]);
-    const flows: Flow[] = [],
-      seen = new Set<string>();
-    let cursor: string | null = null;
-    for (let page = 0; page < 10; page++) {
-      const response = await read("/v2/activity", {
-        user: wallet,
-        start: "1",
-        end: String(Math.ceil(snapshot.at / 1000)),
-        type: "DEPOSIT,WITHDRAWAL",
-        exclude_deposits_withdrawals: "false",
-        limit: "1000",
-        sort_direction: "ASC",
-        ...(cursor ? { cursor } : {}),
-      });
-      requireData(
-        Array.isArray(response.data) &&
-          response.data.length <= 1000 &&
-          typeof response.pagination?.has_more === "boolean",
-        "incomplete_funding_ledger",
-      );
-      flows.push(...response.data);
-      const next = response.pagination.next_cursor;
-      if (!response.pagination.has_more) {
-        requireData(next === null, "incomplete_funding_ledger");
-        return predictionMetrics(wallet, pnl.data, flows, snapshot, now());
-      }
-      requireData(
-        typeof next === "string" &&
-          next.length > 0 &&
-          !seen.has(next) &&
-          response.data.length > 0,
-        "incomplete_funding_ledger",
-      );
-      seen.add(next);
-      cursor = next;
-    }
-    throw new Error("funding_ledger_page_limit");
   }
 }

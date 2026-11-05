@@ -3,7 +3,7 @@ import { AgentError } from "./contracts.js";
 
 // Bump when the request graph, cost contracts, margin or plan algorithm changes.
 // Account/network/route/scope identity is additionally part of the opaque owner.
-export const ACCOUNT_OBSERVATION_COST_CONTRACT = "perps-cost-plan-v1";
+export const ACCOUNT_OBSERVATION_COST_CONTRACT = "perps-cost-plan-v2";
 export const ACCOUNT_OBSERVATION_PLAN_TTL_MS = 600000;
 
 export type ObservationCostPlan = { demand: number; peaks: number[] };

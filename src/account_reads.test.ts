@@ -5,7 +5,12 @@ import {
   invokeAccountRead,
   readAccountCopies,
 } from "./account_reads.js";
-import { publicResult, result } from "./agent/contracts.js";
+import {
+  AgentError,
+  failure,
+  publicResult,
+  result,
+} from "./agent/contracts.js";
 
 const address = "0x" + "a".repeat(40);
 function fixtureFetch(failEmbedded = false): typeof fetch {
@@ -276,3 +281,104 @@ it("keeps authoritative execution states even when account balance coverage is p
     );
   }
 });
+
+it("preserves Core outage and expired-session failures through portfolio aggregation", async () => {
+  for (const [code, rejected] of [
+    ["AUTH_REQUIRED", false],
+    ["BACKEND_UNAVAILABLE", false],
+    ["UPGRADE_REQUIRED", false],
+    ["AUTH_REQUIRED", true],
+    ["BACKEND_UNAVAILABLE", true],
+    ["UPGRADE_REQUIRED", true],
+  ] as const) {
+    const cause = new AgentError(
+      code,
+      "Safe Core failure.",
+      code === "BACKEND_UNAVAILABLE",
+      code === "AUTH_REQUIRED" ? 401 : code === "UPGRADE_REQUIRED" ? 403 : 503,
+      code === "AUTH_REQUIRED"
+        ? { reason_code: "ACCESS_TOKEN_EXPIRED" }
+        : undefined,
+    );
+    const error = failure(cause);
+    const value = publicResult(
+      await invokeAccountRead(
+        "get_portfolio",
+        {},
+        "fixture-session",
+        "https://core.test/graphql",
+        async () => {
+          if (rejected) throw cause;
+          return error;
+        },
+        (async () =>
+          Response.json({ errors: [{}] }, { status: 503 })) as typeof fetch,
+      ),
+    );
+    assert.equal(value.status, "failed");
+    assert.deepEqual(value.error, error.error);
+    assert.equal(value.data.agent_portfolio_status, "failed");
+    assert.equal(
+      (value.data.account as any).authenticated,
+      code !== "AUTH_REQUIRED",
+    );
+    assert.equal(
+      (value.data.status_breakdown as any).authentication,
+      code === "AUTH_REQUIRED" ? "authentication_required" : "authenticated",
+    );
+    if (code === "AUTH_REQUIRED") {
+      assert(!value.warnings.some((warning) => warning.includes("Signed in.")));
+      assert(
+        !String((value.data.status_breakdown as any).explanation).includes(
+          "不代表登录失效",
+        ),
+      );
+    }
+  }
+});
+
+for (const [label, fetcher] of [
+  [
+    "Core expired JWT",
+    async () =>
+      Response.json({
+        errors: [{ extensions: { code: "ACCESS_TOKEN_EXPIRED" } }],
+      }),
+  ],
+  [
+    "Core HTTP 401 HTML",
+    async () => new Response("private auth body", { status: 401 }),
+  ],
+] as const) {
+  it(`propagates ${label} from App copies instead of reporting an authenticated empty account`, async () => {
+    await assert.rejects(
+      readAccountCopies(
+        "https://core.test/graphql",
+        "fixture-token",
+        {},
+        fetcher as typeof fetch,
+      ),
+      { code: "AUTH_REQUIRED", httpStatus: 401, retryable: false },
+    );
+    const saved = result({ portfolio: null }, "empty");
+    const combined = await invokeAccountRead(
+      "get_portfolio",
+      {},
+      "fixture-token",
+      "https://core.test/graphql",
+      async () => saved,
+      fetcher as typeof fetch,
+    );
+    assert.equal(combined.error?.code, "AUTH_REQUIRED");
+    assert.equal(combined.status, "failed");
+    assert.equal((combined.data.account as any).authenticated, false);
+    assert.equal(
+      saved.status,
+      "empty",
+      "aggregation must not mutate the original Agent result",
+    );
+    assert(
+      !combined.warnings.some((warning) => warning.includes("Signed in.")),
+    );
+  });
+}

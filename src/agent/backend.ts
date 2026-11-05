@@ -26,69 +26,9 @@ import {
   requestBodyErrorHandler,
 } from "../http_security.js";
 
-export async function validateCoreIdentity(
-  token: string,
-  graphqlUrl: string,
-): Promise<string> {
-  const unavailable = () =>
-    new AgentError(
-      "BACKEND_UNAVAILABLE",
-      "Ride identity verification is temporarily unavailable. Retry without signing in again.",
-      true,
-      503,
-    );
-  const unauthenticated = () =>
-    new AgentError(
-      "AUTH_REQUIRED",
-      "A valid Ride session is required.",
-      false,
-      401,
-    );
-  const response = await fetch(graphqlUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      query:
-        "query AgentIdentity { copyTradeSummary { totalConfigs } me { id } }",
-    }),
-    signal: AbortSignal.timeout(12000),
-    redirect: "error",
-  }).catch(() => {
-    throw unavailable();
-  });
-  // A Core outage must not invalidate a healthy OAuth session or start a login loop.
-  if (response.status === 401) throw unauthenticated();
-  if (!response.ok) throw unavailable();
-  const payload = (await response.json().catch(() => {
-    throw unavailable();
-  })) as {
-    data?: { me?: { id?: string }; copyTradeSummary?: unknown };
-    errors?: Array<{ extensions?: { code?: string } }>;
-  } | null;
-  if (!payload || typeof payload !== "object") throw unavailable();
-  if (
-    Array.isArray(payload.errors) &&
-    payload.errors.some(
-      (error) =>
-        error?.extensions?.code === "UNAUTHENTICATED" ||
-        error?.extensions?.code === "UNAUTHORIZED",
-    )
-  )
-    throw unauthenticated();
-  if (payload.errors?.length) throw unavailable();
-  const user = payload.data?.me?.id;
-  // Preserve both existing identity checks; incomplete responses never grant access.
-  if (
-    !payload.data?.copyTradeSummary ||
-    typeof user !== "string" ||
-    !user.trim()
-  )
-    throw unavailable();
-  return user;
-}
+import { validateCoreIdentity } from "../core_identity.js";
+export { validateCoreIdentity } from "../core_identity.js";
+
 export function backendApp(
   service: AgentService,
   identity: (token: string) => Promise<string>,

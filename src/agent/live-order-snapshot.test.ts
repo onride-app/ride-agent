@@ -180,7 +180,7 @@ it("uses fresh native and every foreign-DEX pair while retaining complete histor
   ]);
   assert.equal(
     f.reads.filter((read) => read.type === "userAbstraction").length,
-    2,
+    3,
   );
   assert.deepEqual(f.writes, []);
 });

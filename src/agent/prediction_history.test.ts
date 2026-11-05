@@ -197,43 +197,22 @@ it("replays real official daily observations with an anonymized identity", () =>
   assert(Math.abs(r.source_drawdown_pct! - 0.04876968145497429) < 1e-9);
   assert(r.metric_provenance!.reconciliation_difference_pct < 1);
 });
-it("walks funding cursors with identical filters, caches results, and refuses incomplete pages", async (t) => {
-  const calls: URL[] = [];
-  let broken = false;
-  t.mock.method(globalThis, "fetch", async (url: URL) => {
-    calls.push(url);
-    if (url.pathname.includes("snapshot")) return new Response(archive());
-    if (url.pathname.includes("user-pnl"))
-      return Response.json({ data: history() });
-    assert.equal(url.searchParams.get("start"), "1");
-    assert.equal(url.searchParams.get("type"), "DEPOSIT,WITHDRAWAL");
-    assert.equal(url.searchParams.get("exclude_deposits_withdrawals"), "false");
-    assert.equal(url.searchParams.get("sort_direction"), "ASC");
-    if (!url.searchParams.has("cursor"))
-      return Response.json({
-        data: [flow()],
-        pagination: { has_more: true, next_cursor: broken ? null : "page2" },
-      });
-    return Response.json({
-      data: [],
-      pagination: { has_more: false, next_cursor: null },
-    });
-  });
-  t.mock.method(Date, "now", () => at);
+it("does not call the retired accounting archive or invent equivalent v2 metrics", async (t) => {
+  t.mock.method(globalThis, "fetch", async () =>
+    assert.fail("Retired accounting must not be requested"),
+  );
   const reader = new PredictionHistory();
-  const [a, b] = await Promise.all([
+  for (const value of await Promise.all([
     reader.metrics(wallet),
     reader.metrics(wallet),
-  ]);
-  assert.equal(a.source_drawdown_pct, 0);
-  assert.deepEqual(a, b);
-  assert.equal(calls.length, 4);
-  await reader.metrics(wallet);
-  assert.equal(calls.length, 4);
-  broken = true;
-  const invalid = await new PredictionHistory().metrics(wallet);
-  assert.equal(invalid.source_drawdown_pct, null);
-  assert.equal(invalid.metric_unavailable_reason, "incomplete_funding_ledger");
+  ])) {
+    assert.equal(value.source_roi_pct, null);
+    assert.equal(value.source_drawdown_pct, null);
+    assert.equal(
+      value.metric_unavailable_reason,
+      "accounting_snapshot_retired",
+    );
+  }
 });
 it("serves verified reconstructed metrics after background completion and across process restarts", async () => {
   const records = new Map<string, any>();

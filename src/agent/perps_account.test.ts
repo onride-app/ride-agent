@@ -1,6 +1,49 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { perpsAccountMode, unifiedUsdc } from "./perps_account.js";
+import {
+  perpsAbstractionState,
+  perpsAccountMode,
+  unifiedUsdc,
+} from "./perps_account.js";
+
+it("maps every current userAbstraction enum explicitly and never treats unknown data as Standard", () => {
+  for (const [value, expected] of [
+    ["default", "standard"],
+    ["disabled", "standard"],
+    ["unifiedAccount", "unified"],
+    ["dexAbstraction", "dex_abstraction"],
+    ["portfolioMargin", "portfolio_margin"],
+  ])
+    assert.equal(perpsAbstractionState(value), expected);
+  for (const value of [
+    null,
+    undefined,
+    false,
+    true,
+    0,
+    {},
+    [],
+    "",
+    "futureMode",
+    "d-i-s-a-b-l-e-d",
+  ])
+    assert.equal(perpsAbstractionState(value), "unknown");
+  for (const value of ["dexAbstraction", "portfolioMargin", "futureMode", null])
+    assert.equal(perpsAccountMode(value), "unsupported");
+  for (const value of [
+    { abstraction: "default", mode: "portfolioMargin" },
+    { abstraction: "default", response: { mode: "dexAbstraction" } },
+    { abstraction: "default", userAbstraction: "futureMode" },
+    { abstraction: null, response: "default" },
+  ]) {
+    assert.equal(perpsAbstractionState(value), "unknown");
+    assert.equal(perpsAccountMode(value), "unsupported");
+  }
+  assert.equal(
+    perpsAbstractionState({ abstraction: "disabled", mode: "default" }),
+    "standard",
+  );
+});
 
 it("counts unified USDC once and deducts all spot holds", () => {
   assert.deepEqual(

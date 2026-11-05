@@ -1,3 +1,4 @@
+import { readPredictionPositionsV2 } from "./polymarket-data.js";
 import pg from "pg";
 import { JsonRpcProvider, Contract, Interface } from "ethers";
 import { AgentError } from "./contracts.js";
@@ -87,50 +88,8 @@ export class PredictionVenue {
   private id(address: string) {
     return `trader_${fingerprint([this.salt, "prediction", address.toLowerCase()]).slice(0, 32)}`;
   }
-  private async data(
-    path: string,
-    params: Record<string, string>,
-  ): Promise<any> {
-    const url = new URL(path, "https://data-api.polymarket.com");
-    for (const [key, value] of Object.entries(params))
-      url.searchParams.set(key, value);
-    const r = await fetch(url, {
-      signal: AbortSignal.timeout(12000),
-      redirect: "error",
-    });
-    if (!r.ok)
-      throw new AgentError(
-        "VENUE_UNAVAILABLE",
-        "Prediction data is unavailable.",
-        true,
-        503,
-      );
-    return r.json();
-  }
-  private async positions(address: string): Promise<any[]> {
-    const out: any[] = [];
-    for (let offset = 0; offset <= 10000; offset += 500) {
-      const rows = await this.data("/positions", {
-        user: address,
-        sizeThreshold: "0",
-        includeArchived: "true",
-        limit: "500",
-        offset: String(offset),
-      });
-      if (!Array.isArray(rows))
-        throw new AgentError(
-          "SOURCE_STALE",
-          "Prediction positions are incomplete.",
-          true,
-        );
-      out.push(...rows);
-      if (rows.length < 500) return out;
-    }
-    throw new AgentError(
-      "SOURCE_STALE",
-      "Prediction position coverage exceeds the supported page window.",
-      true,
-    );
+  private async positions(address: string) {
+    return readPredictionPositionsV2(address);
   }
   private async cashBalance(
     address: string,
@@ -233,7 +192,16 @@ export class PredictionVenue {
   }
   async source(id: string) {
     const row = await this.resolve(id);
-    const rows = await this.positions(row.address);
+    const positionEvidence = await this.positions(row.address);
+    if (!positionEvidence.coverage_complete)
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "Prediction source holdings exclude inactive markets. New copying is paused until complete holdings and equity can be verified.",
+        true,
+        503,
+        { reason_code: "PREDICTION_SERVABLE_ONLY" },
+      );
+    const rows = positionEvidence.rows;
     const positions: PositionIntent[] = [];
     for (const row of rows.filter((r) => D(r.size).gt(0))) {
       const meta = await this.remember(row);
@@ -363,8 +331,17 @@ export class PredictionVenue {
       ),
     };
     let identity = await this.core("prediction_wallet", input);
-    const positionsRows = await this.positions(identity.wallet);
+    const positionEvidence = await this.positions(identity.wallet);
+    const positionsRows = positionEvidence.rows;
     if (bind) {
+      if (!positionEvidence.coverage_complete)
+        throw new AgentError(
+          "ACCOUNT_NOT_READY",
+          "Prediction holdings are incomplete because inactive markets are excluded. Copying cannot start until complete holdings are verified.",
+          true,
+          503,
+          { reason_code: "PREDICTION_SERVABLE_ONLY" },
+        );
       if (positionsRows.some((r) => D(r.size).gt(0)))
         throw new AgentError(
           "OWNERSHIP_CONFLICT",
@@ -413,12 +390,13 @@ export class PredictionVenue {
         const bid = bids.length ? D.max(...bids) : null,
           ask = asks.length ? D.min(...asks) : null;
         if (bid && ask) prices[ref.key] = bid.plus(ask).div(2).toString();
-        else if (row?.curPrice > 0) prices[ref.key] = String(row.curPrice);
+        else if (row && row.curPrice > 0)
+          prices[ref.key] = String(row.curPrice);
         min[ref.key] = cash(
           D(book.min_order_size ?? 5).times(prices[ref.key] ?? 1),
         );
       } catch {
-        if (row?.curPrice > 0) prices[ref.key] = String(row.curPrice);
+        if (row && row.curPrice > 0) prices[ref.key] = String(row.curPrice);
         else if (!D(positions[ref.key]).isZero())
           throw new AgentError(
             "STALE_PRICE",
@@ -441,9 +419,7 @@ export class PredictionVenue {
       account_value_usdc: D(balances).plus(marketValue).toString(),
       available_usdc: balances,
       available_by_market: { prediction: balances },
-      dedicated:
-        ownership?.portfolio_id === p.id ||
-        (!positionsRows.some((r) => D(r.size).gt(0)) && !ownership),
+      dedicated: ownership?.portfolio_id === p.id,
       eligible: identity.eligible === true,
       positions,
       prices,
@@ -456,7 +432,8 @@ export class PredictionVenue {
       fills: evidence.fills,
       funding: [],
       flows: evidence.flows,
-      coverage_complete: evidence.complete,
+      coverage_complete:
+        evidence.complete && positionEvidence.coverage_complete,
     };
   }
   private async settlement(
