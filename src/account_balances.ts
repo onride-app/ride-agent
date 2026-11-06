@@ -3,6 +3,87 @@ import { AgentError } from "./agent/contracts.js";
 import { VenueReads } from "./agent/venue-reads.js";
 import { readPredictionPositionsV2 } from "./agent/polymarket-data.js";
 import { coreAuthenticationError } from "./core_auth.js";
+import { randomUUID } from "node:crypto";
+
+type PerpsReadMode =
+  "standard" | "dex_abstraction" | "unified" | "portfolio_margin";
+// Read accounting is broader than execution support. Never infer a balance
+// basis from an arbitrary nonempty value (the UI label "Classic" is ambiguous).
+function perpsReadMode(value: unknown): PerpsReadMode | undefined {
+  if (typeof value !== "string") return;
+  switch (value.toLowerCase()) {
+    case "default":
+    case "disabled":
+    case "standard":
+      return "standard";
+    case "dexabstraction":
+    case "dex_abstraction":
+      return "dex_abstraction";
+    case "unifiedaccount":
+    case "unified_account":
+    case "unified":
+    case "u":
+      return "unified";
+    case "portfoliomargin":
+    case "portfolio_margin":
+    case "portfolio":
+      return "portfolio_margin";
+  }
+}
+
+type ReadStage =
+  | "core_query"
+  | "ownership"
+  | "snapshot"
+  | "wallet"
+  | "account_mode"
+  | "spot_snapshot"
+  | "spot_valuation"
+  | "economics";
+type ReadReason =
+  | "CORE_HTTP_FAILURE"
+  | "CORE_RATE_LIMITED"
+  | "CORE_INVALID_RESPONSE"
+  | "CORE_GRAPHQL_ERROR"
+  | "CORE_TIMEOUT"
+  | "CORE_TRANSPORT_FAILURE"
+  | "OWNERSHIP_UNVERIFIED"
+  | "ACCOUNT_SNAPSHOT_UNAVAILABLE"
+  | "ACCOUNT_SNAPSHOT_STALE"
+  | "WALLET_UNAVAILABLE"
+  | "ACCOUNT_MODE_UNSUPPORTED"
+  | "SPOT_SNAPSHOT_UNAVAILABLE"
+  | "SPOT_VALUATION_UNAVAILABLE"
+  | "VENUE_RATE_LIMITED"
+  | "INVALID_ECONOMICS";
+class BalanceReadFailure extends Error {
+  constructor(
+    readonly stage: ReadStage,
+    readonly reasonCode: ReadReason,
+    readonly upstreamStatus?: number,
+  ) {
+    super(reasonCode);
+  }
+}
+export type AccountBalanceReadDiagnostic = {
+  event: "account_balance_read_failure";
+  module: "perps";
+  request_id: string;
+  wallet_selector: "default" | "embedded-v1";
+  stage: ReadStage;
+  reason_code: ReadReason;
+  upstream_http_status?: number;
+};
+const stageReason: Record<ReadStage, ReadReason> = {
+  core_query: "CORE_GRAPHQL_ERROR",
+  ownership: "OWNERSHIP_UNVERIFIED",
+  snapshot: "ACCOUNT_SNAPSHOT_UNAVAILABLE",
+  wallet: "WALLET_UNAVAILABLE",
+  account_mode: "ACCOUNT_MODE_UNSUPPORTED",
+  spot_snapshot: "SPOT_SNAPSHOT_UNAVAILABLE",
+  spot_valuation: "SPOT_VALUATION_UNAVAILABLE",
+  economics: "INVALID_ECONOMICS",
+};
 
 const address = (v: unknown): v is string =>
   typeof v === "string" && /^0x[a-fA-F0-9]{40}$/.test(v);
@@ -37,6 +118,9 @@ export async function readAccountBalances(
   token: string,
   request: typeof fetch = fetch,
   venueReads?: VenueReads,
+  options: {
+    reportReadFailure?: (diagnostic: AccountBalanceReadDiagnostic) => void;
+  } = {},
 ) {
   // Pagination and wallet reads share one deadline, below the widget tool timeout.
   const deadline = AbortSignal.timeout(22000);
@@ -58,13 +142,38 @@ export async function readAccountBalances(
       body: JSON.stringify({ query: document, variables: {} }),
       redirect: "error",
       signal: AbortSignal.any([deadline, AbortSignal.timeout(15000)]),
+    }).catch((error: unknown) => {
+      throw new BalanceReadFailure(
+        "core_query",
+        error instanceof Error &&
+          ["AbortError", "TimeoutError"].includes(error.name)
+          ? "CORE_TIMEOUT"
+          : "CORE_TRANSPORT_FAILURE",
+      );
     });
     const httpAuthentication = coreAuthenticationError(response.status);
     if (httpAuthentication) {
       authenticationFailure = httpAuthentication;
       throw httpAuthentication;
     }
-    const body = (await response.json()) as any;
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {});
+      throw new BalanceReadFailure(
+        "core_query",
+        response.status === 429 ? "CORE_RATE_LIMITED" : "CORE_HTTP_FAILURE",
+        response.status,
+      );
+    }
+    const body = (await response.json().catch((error: unknown) => {
+      throw new BalanceReadFailure(
+        "core_query",
+        error instanceof Error &&
+          ["AbortError", "TimeoutError"].includes(error.name)
+          ? "CORE_TIMEOUT"
+          : "CORE_INVALID_RESPONSE",
+        response.status,
+      );
+    })) as any;
     const authentication = coreAuthenticationError(
       response.status,
       body?.errors,
@@ -73,8 +182,17 @@ export async function readAccountBalances(
       authenticationFailure = authentication;
       throw authentication;
     }
-    if (!response.ok || body.errors?.length || !body.data)
-      throw Error("Account source unavailable");
+    if (body?.errors?.length || !body?.data)
+      throw new BalanceReadFailure(
+        "core_query",
+        Array.isArray(body?.errors) &&
+          body.errors.some(
+            (e: any) => e?.extensions?.code === "HYPERLIQUID_RATE_LIMITED",
+          )
+          ? "CORE_RATE_LIMITED"
+          : "CORE_GRAPHQL_ERROR",
+        response.status,
+      );
     return body.data;
   };
   const publicJson = async (url: string, init?: RequestInit) => {
@@ -139,16 +257,59 @@ export async function readAccountBalances(
       query(perpsQuery),
       query(perpsQuery, true),
     ]);
-    const seen = new Set<string>();
-    const wallets: any[] = [];
+    const observedModes = new Map<string, PerpsReadMode>();
+    const countedWallets = new Map<string, any>();
+    const requestId = randomUUID();
+    const diagnostics: AccountBalanceReadDiagnostic[] = [];
+    const recordFailure = (error: unknown, index: number, stage: ReadStage) => {
+      // Only fixed classifications cross the logging/tool boundary. Do not
+      // include upstream text, modes, GraphQL, URLs, tokens or account IDs.
+      const failure = error instanceof BalanceReadFailure ? error : undefined;
+      const diagnostic: AccountBalanceReadDiagnostic = {
+        event: "account_balance_read_failure",
+        module: "perps",
+        request_id: requestId,
+        wallet_selector: index === 0 ? "default" : "embedded-v1",
+        stage: failure?.stage ?? stage,
+        reason_code:
+          failure?.reasonCode ??
+          (error instanceof AgentError && error.code === "VENUE_RATE_LIMITED"
+            ? "VENUE_RATE_LIMITED"
+            : stageReason[stage]),
+        ...(failure?.upstreamStatus !== undefined
+          ? { upstream_http_status: failure.upstreamStatus }
+          : {}),
+      };
+      diagnostics.push(diagnostic);
+      try {
+        (
+          options.reportReadFailure ??
+          ((value) => console.warn(JSON.stringify(value)))
+        )(diagnostic);
+      } catch {
+        // Reporting cannot replace the original read result or auth failure.
+      }
+    };
     let verifiedAbsent = 0;
     let missing = reads.some((r) => r.status === "rejected");
-    for (const r of reads) {
-      if (r.status !== "fulfilled") continue;
+    for (const [index, r] of reads.entries()) {
+      if (r.status !== "fulfilled") {
+        if (!(
+          r.reason instanceof AgentError &&
+          ["AUTH_REQUIRED", "UPGRADE_REQUIRED"].includes(r.reason.code)
+        ))
+          recordFailure(r.reason, index, "core_query");
+        continue;
+      }
+      let stage: ReadStage = "snapshot";
       try {
         const state = r.value.hyperliquidAccountState;
-        if (state?.userId !== me.id || state.isStale)
-          throw Error("Missing, stale or foreign Perps account");
+        if (!state) throw Error("Missing Perps account");
+        stage = "ownership";
+        if (state.userId !== me.id) throw Error("Foreign Perps account");
+        if (state.isStale)
+          throw new BalanceReadFailure("snapshot", "ACCOUNT_SNAPSHOT_STALE");
+        stage = "wallet";
         const owner = state.wallet?.masterWalletAddress;
         if (!address(owner)) {
           if (
@@ -162,9 +323,30 @@ export async function readAccountBalances(
           }
           throw Error("Owned wallet is not available");
         }
+        stage = "account_mode";
+        const mode = perpsReadMode(state.accountAbstraction);
+        if (!mode)
+          throw new BalanceReadFailure(
+            "account_mode",
+            "ACCOUNT_MODE_UNSUPPORTED",
+          );
         const key = owner.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
+        // Validate each selector before deduplicating the physical wallet.
+        // An unknown mode in an alias is still missing accounting evidence.
+        const previousMode = observedModes.get(key);
+        if (previousMode && previousMode !== mode) {
+          // Neither conflicting basis can remain a verified subtotal.
+          countedWallets.delete(key);
+          throw new BalanceReadFailure(
+            "account_mode",
+            "ACCOUNT_MODE_UNSUPPORTED",
+          );
+        }
+        observedModes.set(key, mode);
+        // A failed selector has not counted this wallet. A later complete
+        // alias can still supply a subtotal, without upgrading missing reads.
+        if (countedWallets.has(key)) continue;
+        stage = "spot_snapshot";
         const raw =
           typeof state.rawResponseJson === "string"
             ? JSON.parse(state.rawResponseJson)
@@ -174,42 +356,27 @@ export async function readAccountBalances(
           (await info({ type: "spotClearinghouseState", user: owner }));
         if (!Array.isArray(spot?.balances))
           throw Error("Spot balances unavailable");
-        const abstraction = String(
-          state.accountAbstraction ?? "",
-        ).toLowerCase();
-        // This is the same Classic/Unified distinction used by the App account card.
-        const unified = [
-          "unifiedaccount",
-          "unified_account",
-          "unified",
-          "u",
-          "portfoliomargin",
-          "portfolio_margin",
-          "portfolio",
-        ].includes(abstraction);
-        if (
-          !abstraction &&
-          spot.balances.some(
-            (b: any) => b.coin === "USDC" && number(b.total).gt(0),
-          )
-        )
-          throw Error(
-            "Account mode is unavailable; spot USDC could overlap with Perps equity",
-          );
+        // Core reports spot USDC (not all spot assets) as accountValue and
+        // withdrawable in these two modes. Add other priced assets once.
+        const unified = mode === "unified" || mode === "portfolio_margin";
+        stage = "economics";
         let total = number(state.accountValue),
           available = number(state.withdrawable);
         const perpsValue = total;
         const withdrawable = available;
         let spotHold = D(0);
         for (const holding of spot.balances) {
+          stage = "economics";
           const quantity = number(holding.total);
           if (quantity.isZero()) continue;
           if (quantity.lt(0)) throw Error("Invalid spot holding");
           const cashToken = String(holding.coin).toUpperCase() === "USDC";
           if (cashToken && unified) continue;
+          stage = "spot_valuation";
           total = total.plus(
             quantity.times(cashToken ? 1 : await spotPrice(holding.coin)),
           );
+          stage = "economics";
           if (cashToken) {
             const hold = number(holding.hold);
             if (hold.lt(0) || hold.gt(quantity))
@@ -220,7 +387,7 @@ export async function readAccountBalances(
         }
         const gross = number(state.totalNtlPos).abs();
         const sourceTime = raw.time ?? raw.clearinghouseState?.time;
-        wallets.push({
+        countedWallets.set(key, {
           wallet_ref: `owned_${fingerprint(key).slice(0, 16)}`,
           generation: state.wallet.walletGeneration,
           account_value_usd: cash(total),
@@ -238,12 +405,14 @@ export async function readAccountBalances(
           fetched_at: new Date().toISOString(),
           source:
             "Ride hyperliquidAccountState + owned Hyperliquid spot balances",
-          account_mode: abstraction || "unknown",
+          account_mode: mode,
         });
-      } catch {
+      } catch (error) {
         missing = true;
+        recordFailure(error, index, stage);
       }
     }
+    const wallets = [...countedWallets.values()];
     if (!wallets.length && !missing && verifiedAbsent === 2)
       return {
         module: "perps",
@@ -259,14 +428,24 @@ export async function readAccountBalances(
           "Core verified that neither owned Perps wallet generation is created.",
       };
     if (!wallets.length)
-      return unavailable(
-        "perps",
-        "Perps equity, account mode or complete owned spot valuation is temporarily unavailable. No missing value is zero.",
-      );
+      return {
+        ...unavailable(
+          "perps",
+          "Perps equity, account mode or complete owned spot valuation is temporarily unavailable. No missing value is zero.",
+        ),
+        diagnostic_request_id: requestId,
+        read_diagnostics: diagnostics,
+      };
     const sum = (key: string) =>
       cash(wallets.reduce((n, w) => n.plus(w[key]), D(0)));
     return {
       module: "perps",
+      ...(diagnostics.length
+        ? {
+            diagnostic_request_id: requestId,
+            read_diagnostics: diagnostics,
+          }
+        : {}),
       status: missing ? "partial" : "ok",
       account_value_usd: missing ? null : sum("account_value_usd"),
       known_subtotal_usd: sum("account_value_usd"),
