@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { readAccountBalances } from "./account_balances.js";
+import { AgentError } from "./agent/contracts.js";
+import type { VenueReads } from "./agent/venue-reads.js";
+import {
+  readAccountBalances,
+  type AccountBalanceReadDiagnostic,
+} from "./account_balances.js";
 const owner = "0x" + "1".repeat(40),
   proxy = "0x" + "2".repeat(40);
 function fixture(
@@ -13,6 +18,12 @@ function fixture(
     rpcFailure?: boolean;
     foreignPosition?: boolean;
     unpriced?: boolean;
+    mode?: unknown;
+    secondaryMode?: unknown;
+    spotBalances?: { coin: string; total: string; hold: string }[];
+    embeddedSpot?: boolean;
+    price?: string;
+    perpsOverride?: Record<string, unknown>;
   } = {},
 ) {
   let publicCalls = 0;
@@ -84,7 +95,23 @@ function fixture(
                 status: "ACTIVE",
               },
               positions: [],
-              rawResponseJson: JSON.stringify({ time: Date.now() }),
+              rawResponseJson: JSON.stringify({
+                time: Date.now(),
+                ...(options.embeddedSpot
+                  ? {
+                      spotClearinghouseState: {
+                        balances: options.spotBalances,
+                      },
+                    }
+                  : {}),
+              }),
+              ...(Object.hasOwn(options, "mode")
+                ? { accountAbstraction: options.mode }
+                : {}),
+              ...(embedded && Object.hasOwn(options, "secondaryMode")
+                ? { accountAbstraction: options.secondaryMode }
+                : {}),
+              ...options.perpsOverride,
             },
           },
         });
@@ -126,7 +153,7 @@ function fixture(
       if (body.type === "spotClearinghouseState") {
         assert.equal(body.user, owner);
         return Response.json({
-          balances: [
+          balances: options.spotBalances ?? [
             { coin: "USDC", total: "3", hold: "0" },
             ...(options.unpriced
               ? [{ coin: "UNKNOWN", total: "1", hold: "0" }]
@@ -135,7 +162,20 @@ function fixture(
         });
       }
       if (body.type === "spotMetaAndAssetCtxs")
-        return Response.json([{ tokens: [], universe: [] }, []]);
+        return Response.json(
+          options.price === undefined
+            ? [{ tokens: [], universe: [] }, []]
+            : [
+                {
+                  tokens: [
+                    { index: 0, name: "USDC" },
+                    { index: 1, name: "HYPE" },
+                  ],
+                  universe: [{ tokens: [1, 0] }],
+                },
+                [{ midPx: options.price }],
+              ],
+        );
     }
     if (u.hostname === "data-api.polymarket.com") {
       assert(
@@ -271,4 +311,382 @@ it("includes retained Prediction cash once and explains the difference from App 
     "13.000000",
   );
   assert.equal(out.markets.prediction.position_wallet_count, 2);
+});
+
+const readFixture = (
+  f: ReturnType<typeof fixture>,
+  diagnostics: AccountBalanceReadDiagnostic[] = [],
+) =>
+  readAccountBalances(
+    "https://core.test/graphql",
+    "fixture",
+    f.request,
+    undefined,
+    {
+      reportReadFailure: (value) => diagnostics.push(value),
+    },
+  );
+
+it("requires an explicit supported read accounting mode, even for an empty spot wallet", async () => {
+  for (const mode of [
+    undefined,
+    null,
+    "",
+    "unknown",
+    "futureMode",
+    "classic",
+    1,
+    {},
+    [],
+  ]) {
+    const diagnostics: AccountBalanceReadDiagnostic[] = [];
+    const out = await readFixture(
+      fixture({ mode, spotBalances: [] }),
+      diagnostics,
+    );
+    assert.equal(out.markets.perps.status, "unavailable");
+    assert.equal(out.markets.perps.account_value_usd, null);
+    assert.equal(out.markets.perps.available_trading_usdc, null);
+    assert.equal(diagnostics.length, 1);
+    assert.equal(diagnostics[0].stage, "account_mode");
+    assert.equal(diagnostics[0].reason_code, "ACCOUNT_MODE_UNSUPPORTED");
+    assert.equal(out.summary.account_value_usd, null);
+    assert.equal(out.summary.copy_ready_usdc, null);
+  }
+});
+
+it("never treats unknown or future nonempty modes as Classic and adds overlapping USDC", async () => {
+  for (const mode of ["unknown", "futureMode"]) {
+    const out = await readFixture(fixture({ mode }));
+    assert.equal(out.markets.perps.status, "unavailable");
+    assert.equal(out.markets.perps.known_subtotal_usd, undefined);
+    assert.equal(out.markets.perps.available_trading_usdc, null);
+    assert.equal(out.markets.prediction.available_trading_usdc, "7.000000");
+  }
+});
+
+it("reads Standard and Dex abstraction with separate Perps and spot USDC bases", async () => {
+  for (const mode of [
+    "default",
+    "disabled",
+    "standard",
+    "dexAbstraction",
+    "dex_abstraction",
+  ]) {
+    const out = await readFixture(
+      fixture({
+        mode,
+        spotBalances: [
+          { coin: "USDC", total: "3", hold: "1" },
+          { coin: "HYPE", total: "2", hold: "0" },
+        ],
+        price: "3",
+      }),
+    );
+    assert.equal(out.markets.perps.status, "ok");
+    assert.equal(out.markets.perps.account_value_usd, "49.000000");
+    assert.equal(out.markets.perps.available_trading_usdc, "39.000000");
+    assert.equal(out.markets.perps.occupied_or_reserved_usdc, "4.000000");
+  }
+});
+
+it("reads Unified and Portfolio Margin without double-counting USDC or omitting other priced spot assets", async () => {
+  for (const mode of [
+    "unifiedAccount",
+    "unified_account",
+    "unified",
+    "u",
+    "portfolioMargin",
+    "portfolio_margin",
+    "portfolio",
+  ]) {
+    const f = fixture({
+      mode,
+      unified: true,
+      sameWallet: true,
+      embeddedSpot: true,
+      spotBalances: [
+        { coin: "USDC", total: "43", hold: "3" },
+        { coin: "HYPE", total: "2", hold: "0" },
+      ],
+      price: "3",
+    });
+    let externalSpotReads = 0;
+    const original = f.request;
+    f.request = (async (url: any, init: any) => {
+      if (
+        String(url).includes("api.hyperliquid.xyz") &&
+        JSON.parse(init.body).type === "spotClearinghouseState"
+      )
+        externalSpotReads++;
+      return original(url, init);
+    }) as typeof fetch;
+    const out = await readFixture(f);
+    assert.equal(out.markets.perps.status, "ok");
+    assert.equal(out.markets.perps.account_value_usd, "49.000000");
+    assert.equal(out.markets.perps.available_trading_usdc, "40.000000");
+    assert.equal(out.markets.perps.occupied_or_reserved_usdc, "3.000000");
+    assert.equal(out.markets.perps.wallets.length, 1);
+    assert.equal(
+      externalSpotReads,
+      0,
+      "reuse Core spot evidence in Unified/PM",
+    );
+  }
+});
+
+it("validates each wallet selector's mode before deduplication and keeps partial availability explicit", async () => {
+  for (const modes of [
+    { mode: "disabled", secondaryMode: "futureMode" },
+    { mode: "unknown", secondaryMode: "disabled" },
+    { mode: "disabled", secondaryMode: "unifiedAccount" },
+  ]) {
+    const out = await readFixture(fixture({ sameWallet: true, ...modes }));
+    assert.equal(out.markets.perps.status, "partial");
+    assert.equal(out.markets.perps.account_value_usd, null);
+    assert.equal(out.markets.perps.available_trading_usdc, null);
+    assert.equal(out.markets.perps.known_subtotal_usd, "43.000000");
+    assert.equal(out.markets.perps.known_available_trading_usdc, "40.000000");
+    assert.equal(out.markets.perps.wallets.length, 1);
+    assert.equal(out.summary.copy_ready_usdc, null);
+  }
+});
+
+it("keeps a venue rate-limit failure distinct from Core errors and never promotes partial valuation to available cash", async () => {
+  const f = fixture();
+  const diagnostics: AccountBalanceReadDiagnostic[] = [];
+  const reads = {
+    read: async () => {
+      throw new AgentError(
+        "VENUE_RATE_LIMITED",
+        "private venue body",
+        true,
+        429,
+      );
+    },
+  } as unknown as VenueReads;
+  const out = await readAccountBalances(
+    "https://core.test/graphql",
+    "fixture",
+    f.request,
+    reads,
+    {
+      reportReadFailure: (value) => diagnostics.push(value),
+    },
+  );
+  assert.equal(out.markets.perps.status, "unavailable");
+  assert.equal(out.markets.perps.account_value_usd, null);
+  assert.equal(out.markets.perps.available_trading_usdc, null);
+  assert.equal(diagnostics[0].stage, "spot_snapshot");
+  assert.equal(diagnostics[0].reason_code, "VENUE_RATE_LIMITED");
+  assert(!JSON.stringify(diagnostics).includes("private venue body"));
+});
+
+it("retains confirmed zero for supported empty accounts and verified uncreated wallet generations", async () => {
+  const zero = await readFixture(
+    fixture({
+      mode: "default",
+      spotBalances: [],
+      perpsOverride: { accountValue: "0", withdrawable: "0" },
+    }),
+  );
+  assert.equal(zero.markets.perps.status, "ok");
+  assert.equal(zero.markets.perps.account_value_usd, "0.000000");
+  const absent = await readFixture(
+    fixture({
+      mode: undefined,
+      perpsOverride: {
+        wallet: { status: "NOT_CREATED", masterWalletAddress: null },
+        accountValue: "0",
+        withdrawable: "0",
+      },
+    }),
+  );
+  assert.equal(absent.markets.perps.status, "ok");
+  assert.equal(absent.markets.perps.account_value_usd, "0.000000");
+  assert.deepEqual(absent.markets.perps.wallets, []);
+});
+
+it("classifies Core failures using fixed safe diagnostics and a per-read request ID", async () => {
+  const secret = "upstream-private-body-token-wallet-graphql";
+  const cases: {
+    response: () => Response | never;
+    reason: string;
+    status?: number;
+  }[] = [
+    {
+      response: () => new Response(secret, { status: 503 }),
+      reason: "CORE_HTTP_FAILURE",
+      status: 503,
+    },
+    {
+      response: () =>
+        Response.json(
+          { errors: [{ extensions: { code: "HYPERLIQUID_RATE_LIMITED" } }] },
+          { status: 503 },
+        ),
+      reason: "CORE_HTTP_FAILURE",
+      status: 503,
+    },
+    {
+      response: () => new Response(secret, { status: 429 }),
+      reason: "CORE_RATE_LIMITED",
+      status: 429,
+    },
+    {
+      response: () =>
+        Response.json({
+          errors: [
+            {
+              message: secret,
+              extensions: { code: "HYPERLIQUID_RATE_LIMITED" },
+            },
+          ],
+        }),
+      reason: "CORE_RATE_LIMITED",
+      status: 200,
+    },
+    {
+      response: () =>
+        Response.json({
+          errors: [{ message: secret, extensions: { code: secret } }],
+        }),
+      reason: "CORE_GRAPHQL_ERROR",
+      status: 200,
+    },
+    {
+      response: () => new Response(secret),
+      reason: "CORE_INVALID_RESPONSE",
+      status: 200,
+    },
+    {
+      response: () => {
+        throw Error(secret);
+      },
+      reason: "CORE_TRANSPORT_FAILURE",
+    },
+    {
+      response: () => {
+        throw new DOMException(secret, "TimeoutError");
+      },
+      reason: "CORE_TIMEOUT",
+    },
+  ];
+  for (const c of cases) {
+    const f = fixture(),
+      original = f.request;
+    f.request = (async (url: any, init: any) => {
+      if (
+        String(url).includes("core.test") &&
+        JSON.parse(init.body).query.includes("RideOwnedPerpsBalance")
+      )
+        return c.response();
+      return original(url, init);
+    }) as typeof fetch;
+    const diagnostics: AccountBalanceReadDiagnostic[] = [];
+    const out = await readFixture(f, diagnostics);
+    assert.equal(out.markets.perps.status, "unavailable");
+    assert.equal(out.markets.prediction.available_trading_usdc, "7.000000");
+    assert.equal(diagnostics.length, 2);
+    for (const d of diagnostics) {
+      assert.equal(d.stage, "core_query");
+      assert.equal(d.reason_code, c.reason);
+      assert.equal(d.upstream_http_status, c.status);
+      assert.match(d.request_id, /^[0-9a-f-]{36}$/);
+      assert.equal(d.request_id, out.markets.perps.diagnostic_request_id);
+    }
+    assert.equal(new Set(diagnostics.map((d) => d.wallet_selector)).size, 2);
+    assert.deepEqual(out.markets.perps.read_diagnostics, diagnostics);
+    for (const privateValue of [
+      secret,
+      owner,
+      proxy,
+      "Bearer fixture",
+      "core.test",
+    ])
+      assert(!JSON.stringify(diagnostics).includes(privateValue));
+  }
+});
+
+it("distinguishes ownership, stale snapshots, spot valuation and economics failures without leaking source data", async () => {
+  const cases = [
+    {
+      flags: { perpsOverride: { userId: "other-user" } },
+      reason: "OWNERSHIP_UNVERIFIED",
+      stage: "ownership",
+    },
+    {
+      flags: { perpsOverride: { isStale: true } },
+      reason: "ACCOUNT_SNAPSHOT_STALE",
+      stage: "snapshot",
+    },
+    {
+      flags: { perpsOverride: { rawResponseJson: "private-invalid-json" } },
+      reason: "SPOT_SNAPSHOT_UNAVAILABLE",
+      stage: "spot_snapshot",
+    },
+    {
+      flags: { unpriced: true },
+      reason: "SPOT_VALUATION_UNAVAILABLE",
+      stage: "spot_valuation",
+    },
+    {
+      flags: { spotBalances: [{ coin: "USDC", total: "3", hold: "4" }] },
+      reason: "INVALID_ECONOMICS",
+      stage: "economics",
+    },
+  ];
+  for (const c of cases) {
+    const diagnostics: AccountBalanceReadDiagnostic[] = [];
+    const out = await readFixture(fixture(c.flags), diagnostics);
+    assert.equal(out.markets.perps.status, "unavailable");
+    assert.equal(diagnostics[0].reason_code, c.reason);
+    assert.equal(diagnostics[0].stage, c.stage);
+    assert(!JSON.stringify(diagnostics).includes("private-invalid-json"));
+    assert(!JSON.stringify(diagnostics).includes("other-user"));
+  }
+});
+
+it("keeps genuine Core authentication failures as AUTH_REQUIRED without balance-failure diagnostics", async () => {
+  for (const response of [
+    () => new Response("private-invalid-json", { status: 401 }),
+    () =>
+      Response.json({
+        errors: [{ extensions: { code: "ACCESS_TOKEN_EXPIRED" } }],
+      }),
+  ]) {
+    const f = fixture(),
+      original = f.request;
+    f.request = (async (url: any, init: any) => {
+      if (
+        String(url).includes("core.test") &&
+        JSON.parse(init.body).query.includes("RideOwnedPerpsBalance")
+      )
+        return response();
+      return original(url, init);
+    }) as typeof fetch;
+    const diagnostics: AccountBalanceReadDiagnostic[] = [];
+    await assert.rejects(
+      readFixture(f, diagnostics),
+      (e: any) => e.code === "AUTH_REQUIRED",
+    );
+    assert.deepEqual(diagnostics, []);
+  }
+});
+
+it("does not allow a broken diagnostic sink to turn missing accounting into success", async () => {
+  const f = fixture({ mode: "futureMode" });
+  const out = await readAccountBalances(
+    "https://core.test/graphql",
+    "fixture",
+    f.request,
+    undefined,
+    {
+      reportReadFailure() {
+        throw Error("sink unavailable");
+      },
+    },
+  );
+  assert.equal(out.markets.perps.status, "unavailable");
+  assert.equal(out.markets.perps.account_value_usd, null);
 });
