@@ -257,8 +257,8 @@ export async function readAccountBalances(
       query(perpsQuery),
       query(perpsQuery, true),
     ]);
-    const seen = new Map<string, PerpsReadMode>();
-    const wallets: any[] = [];
+    const observedModes = new Map<string, PerpsReadMode>();
+    const countedWallets = new Map<string, any>();
     const requestId = randomUUID();
     const diagnostics: AccountBalanceReadDiagnostic[] = [];
     const recordFailure = (error: unknown, index: number, stage: ReadStage) => {
@@ -333,14 +333,19 @@ export async function readAccountBalances(
         const key = owner.toLowerCase();
         // Validate each selector before deduplicating the physical wallet.
         // An unknown mode in an alias is still missing accounting evidence.
-        const previousMode = seen.get(key);
-        if (previousMode && previousMode !== mode)
+        const previousMode = observedModes.get(key);
+        if (previousMode && previousMode !== mode) {
+          // Neither conflicting basis can remain a verified subtotal.
+          countedWallets.delete(key);
           throw new BalanceReadFailure(
             "account_mode",
             "ACCOUNT_MODE_UNSUPPORTED",
           );
-        if (previousMode) continue;
-        seen.set(key, mode);
+        }
+        observedModes.set(key, mode);
+        // A failed selector has not counted this wallet. A later complete
+        // alias can still supply a subtotal, without upgrading missing reads.
+        if (countedWallets.has(key)) continue;
         stage = "spot_snapshot";
         const raw =
           typeof state.rawResponseJson === "string"
@@ -382,7 +387,7 @@ export async function readAccountBalances(
         }
         const gross = number(state.totalNtlPos).abs();
         const sourceTime = raw.time ?? raw.clearinghouseState?.time;
-        wallets.push({
+        countedWallets.set(key, {
           wallet_ref: `owned_${fingerprint(key).slice(0, 16)}`,
           generation: state.wallet.walletGeneration,
           account_value_usd: cash(total),
@@ -407,6 +412,7 @@ export async function readAccountBalances(
         recordFailure(error, index, stage);
       }
     }
+    const wallets = [...countedWallets.values()];
     if (!wallets.length && !missing && verifiedAbsent === 2)
       return {
         module: "perps",

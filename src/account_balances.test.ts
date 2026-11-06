@@ -439,7 +439,6 @@ it("validates each wallet selector's mode before deduplication and keeps partial
   for (const modes of [
     { mode: "disabled", secondaryMode: "futureMode" },
     { mode: "unknown", secondaryMode: "disabled" },
-    { mode: "disabled", secondaryMode: "unifiedAccount" },
   ]) {
     const out = await readFixture(fixture({ sameWallet: true, ...modes }));
     assert.equal(out.markets.perps.status, "partial");
@@ -450,6 +449,57 @@ it("validates each wallet selector's mode before deduplication and keeps partial
     assert.equal(out.markets.perps.wallets.length, 1);
     assert.equal(out.summary.copy_ready_usdc, null);
   }
+});
+
+it("allows a complete alias to supply a subtotal after the same wallet's first selector fails valuation", async () => {
+  const f = fixture({ sameWallet: true }),
+    original = f.request;
+  f.request = (async (url: any, init: any) => {
+    const response = await original(url, init);
+    if (
+      String(url).includes("core.test") &&
+      JSON.parse(init.body).query.includes("RideOwnedPerpsBalance") &&
+      !new Headers(init.headers).has("x-hyperliquid-wallet-mode")
+    ) {
+      const body = await response.json();
+      body.data.hyperliquidAccountState.rawResponseJson =
+        "invalid-spot-snapshot";
+      return Response.json(body);
+    }
+    return response;
+  }) as typeof fetch;
+  const out = await readFixture(f);
+  assert.equal(out.markets.perps.status, "partial");
+  assert.equal(out.markets.perps.account_value_usd, null);
+  assert.equal(out.markets.perps.available_trading_usdc, null);
+  assert.equal(out.markets.perps.known_subtotal_usd, "43.000000");
+  assert.equal(out.markets.perps.known_available_trading_usdc, "40.000000");
+  assert.equal(out.markets.perps.wallets.length, 1);
+  assert.equal(
+    out.markets.perps.read_diagnostics[0].reason_code,
+    "SPOT_SNAPSHOT_UNAVAILABLE",
+  );
+});
+
+it("removes the wallet's previously counted subtotal when duplicate selectors disagree on a known accounting mode", async () => {
+  const out = await readFixture(
+    fixture({
+      sameWallet: true,
+      mode: "disabled",
+      secondaryMode: "unifiedAccount",
+    }),
+  );
+  assert.equal(out.markets.perps.status, "unavailable");
+  assert.equal(out.markets.perps.account_value_usd, null);
+  assert.equal(out.markets.perps.available_trading_usdc, null);
+  assert.equal(out.markets.perps.known_subtotal_usd, undefined);
+  assert.equal(out.markets.perps.known_available_trading_usdc, undefined);
+  assert.equal(
+    out.markets.perps.read_diagnostics[0].reason_code,
+    "ACCOUNT_MODE_UNSUPPORTED",
+  );
+  assert.equal(out.markets.prediction.available_trading_usdc, "7.000000");
+  assert.equal(out.summary.copy_ready_usdc, null);
 });
 
 it("keeps a venue rate-limit failure distinct from Core errors and never promotes partial valuation to available cash", async () => {

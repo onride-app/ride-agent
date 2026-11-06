@@ -8,7 +8,7 @@
 
 - Standard / Dex abstraction 保留独立 Perps 账户值，再加可完整估值的 Spot 资产；Spot USDC 扣除其 hold 后计入可用金额。
 - 当前 Core `hyperliquidAccountState` 的 Unified / Portfolio Margin 分支将 Spot **USDC** 的 total / available 分别映射到 `accountValue` / `withdrawable`，并附带 `spotClearinghouseState`。因此 USDC 不再加入一次，其他正余额 Spot 资产仍须独立定价；缺价或缺证据保持不可用，不新增现金回退规则。
-- 同一物理钱包只计一次，但每个 selector 都须先通过模式验证。重复钱包模式矛盾仍属于缺证据，不能提升市场完整性。
+- 同一物理钱包只计一次，但每个 selector 都须先通过模式验证。首个 selector 读取失败后，完整的同模式 alias 仍可提供已核实小计；完整总额仍未知。明确的重复钱包模式矛盾会剔除该钱包此前的小计，不影响其他独立钱包。
 - 部分钱包失败时，原有已核实小计仍可保留；完整总额、完整可用金额和跟单额度不因此变成已知。借贷或其他无法用现有核算规则证明的金额不会补零。
 
 [Hyperliquid 官方模式文档](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/account-abstraction-modes) 说明独立余额与统一余额的区别，并规定 Unified / Portfolio Margin 的余额和 holds 位于 Spot clearinghouse。Core 的 USDC 映射另以 `predictly_server` 的 `crates/api/src/schema/query.rs` 中 `hyperliquid_abstraction_uses_unified_balance` 分支核对；若 Core 改为全资产总额，必须同步更改此读端与契约测试。
