@@ -73,6 +73,21 @@ export class NotificationDispatcher {
   private readonly preparedBatches = new Map<string, Update[]>();
   private readonly completed = new Map<string, CompletedBatch>();
 
+  acknowledgementIds(user: string): string[] {
+    return (this.completed.get(user)?.claimed ?? []).map((event) => event.id);
+  }
+  private transaction<T>(
+    user: string,
+    work: (state: State) => Promise<T>,
+    ids: string[] = [],
+  ): Promise<T> {
+    return this.repository.transactMonitor
+      ? this.repository.transactMonitor(user, work, [
+          ...this.acknowledgementIds(user),
+          ...ids,
+        ])
+      : this.repository.transact(user, work);
+  }
   private due(state: State): Update[] {
     const at = this.clock();
     return state.updates
@@ -221,9 +236,7 @@ export class NotificationDispatcher {
     await this.idle();
     for (const [user, batch] of [...this.completed]) {
       await monitorPhase("notification_ack", () =>
-        this.repository.transact(user, async (state) =>
-          this.merge(state, batch),
-        ),
+        this.transaction(user, async (state) => this.merge(state, batch)),
       );
       if (this.completed.get(user) === batch) this.completed.delete(user);
     }
@@ -311,7 +324,7 @@ export class NotificationDispatcher {
   }
   private async claim(user: string, signal: AbortSignal): Promise<Update[]> {
     return monitorPhase("notification_claim", () =>
-      this.repository.transact(user, async (state) =>
+      this.transaction(user, async (state) =>
         signal.aborted || this.stopped ? [] : this.assign(state),
       ),
     );
@@ -326,9 +339,14 @@ export class NotificationDispatcher {
     if (prepared) {
       // Ordinary read only: never queue another owner row-lock transaction.
       // A delayed job cannot send after cancellation, expiry or replacement.
-      const current = await this.repository.read(user);
+      const updates = this.repository.readNotifications
+        ? await this.repository.readNotifications(
+            user,
+            claimed.map((event) => event.id),
+          )
+        : (await this.repository.read(user)).updates;
       claimed = claimed.filter((original) => {
-        const update = current.updates.find((item) => item.id === original.id);
+        const update = updates.find((item) => item.id === original.id);
         return (
           update?.notification === "pending" &&
           update.notification_claim?.token ===
@@ -375,7 +393,11 @@ export class NotificationDispatcher {
       return;
     }
     await monitorPhase("notification_ack", () =>
-      this.repository.transact(user, async (state) => this.merge(state, batch)),
+      this.transaction(
+        user,
+        async (state) => this.merge(state, batch),
+        batch.claimed.map((e) => e.id),
+      ),
     );
   }
 

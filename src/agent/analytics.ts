@@ -48,6 +48,7 @@ export interface Decision {
   target_quantity: string | null;
   source_entry_price: string | null;
   follower_mark: string;
+  observation_episode?: { first_at: number; last_at: number; count: number };
 }
 export const configAt = (s: Sleeve) => ({
   trader_id: s.trader.id,
@@ -224,7 +225,8 @@ export function recordDecision(
   target: string | null,
   reason: string,
 ): void {
-  (p.decisions ??= []).push({
+  const decisions = (p.decisions ??= []);
+  const value: Decision = {
     at: now(),
     copy_id: s.copy_id,
     key: x.key,
@@ -235,7 +237,36 @@ export function recordDecision(
     follower_mark: mark,
     reason,
     config: configAt(s),
-  });
+  };
+  let previous: Decision | undefined;
+  for (let i = decisions.length - 1; i >= 0; i--) {
+    const d = decisions[i];
+    if (
+      d.copy_id === value.copy_id &&
+      d.key === value.key &&
+      d.reason !== "__cold_history_guard"
+    ) {
+      previous = d;
+      break;
+    }
+  }
+  if (previous) {
+    const {
+      at: _oldAt,
+      observation_episode: _episode,
+      ...oldBusiness
+    } = previous;
+    const { at: _newAt, ...newBusiness } = value;
+    if (fingerprint(oldBusiness) === fingerprint(newBusiness)) {
+      previous.observation_episode = {
+        first_at: previous.observation_episode?.first_at ?? previous.at,
+        last_at: value.at,
+        count: (previous.observation_episode?.count ?? 1) + 1,
+      };
+      return;
+    }
+  }
+  decisions.push(value);
 }
 export function localDay(
   at: number,

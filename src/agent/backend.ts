@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import express from "express";
+import type { Server } from "node:http";
 import { VERSION } from "../version.js";
 import { requestDiagnostics } from "../request_diagnostics.js";
 import { z } from "zod";
@@ -259,7 +260,22 @@ export function backendApp(
   app.use(requestBodyErrorHandler);
   return app;
 }
-export async function startBackend(): Promise<void> {
+export interface ManagedBackend {
+  listener: Server;
+  closed: Promise<void>;
+  close(): Promise<void>;
+}
+
+/** App-owned startup: no process signal handlers or environment mutation. */
+export async function startManagedBackend(
+  options: {
+    host?: string;
+    port?: number;
+    executorUrl?: string;
+    privateHttpHost?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<ManagedBackend> {
   if (process.env.RIDE_AGENT_ENABLED !== "true")
     throw new Error("Explicit Agent service activation is required");
   const required = (key: string) => {
@@ -268,52 +284,121 @@ export async function startBackend(): Promise<void> {
     return v;
   };
   const repository = new PgRepository(required("RIDE_AGENT_DATABASE_URL"));
-  await repository.migrate();
-  const service = new AgentService(
-    repository,
-    new BridgeAdapter(
-      required("RIDE_AGENT_EXECUTOR_URL"),
-      required("RIDE_AGENT_EXECUTOR_TOKEN"),
-      process.env.RIDE_AGENT_PRIVATE_HTTP_HOST,
-    ),
-    required("PUBLIC_BASE_URL"),
-    new Cursor(required("RIDE_AGENT_CURSOR_KEY")),
-  );
-  const app = backendApp(
-    service,
-    (token) => validateCoreIdentity(token, required("RIDE_GRAPHQL_URL")),
-    process.env.HOST ?? "127.0.0.1",
-    process.env.RIDE_AGENT_READ_ONLY === "true",
-  );
-  const controller = new AbortController(),
-    runner = new AgentRunner(service);
-  const listener = app.listen(
-    Number(process.env.PORT ?? 3344),
-    process.env.HOST ?? "127.0.0.1",
-  );
-  const shutdown = () => {
+  let listener: Server;
+  let startupListener: Server | undefined;
+  const controller = new AbortController();
+  const stopFromOwner = () => controller.abort();
+  options.signal?.addEventListener("abort", stopFromOwner, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  try {
+    await repository.migrate();
+    if (controller.signal.aborted)
+      throw new Error("Agent owner stopped during startup");
+    const service = new AgentService(
+      repository,
+      new BridgeAdapter(
+        options.executorUrl ?? required("RIDE_AGENT_EXECUTOR_URL"),
+        required("RIDE_AGENT_EXECUTOR_TOKEN"),
+        options.privateHttpHost ?? process.env.RIDE_AGENT_PRIVATE_HTTP_HOST,
+      ),
+      required("PUBLIC_BASE_URL"),
+      new Cursor(required("RIDE_AGENT_CURSOR_KEY")),
+    );
+    const host = options.host ?? process.env.HOST ?? "127.0.0.1";
+    const app = backendApp(
+      service,
+      (token) => validateCoreIdentity(token, required("RIDE_GRAPHQL_URL")),
+      host,
+      process.env.RIDE_AGENT_READ_ONLY === "true",
+    );
+    listener = await new Promise<Server>((resolve, reject) => {
+      const server = app.listen(
+        options.port ?? Number(process.env.PORT ?? 3344),
+        host,
+        () => {
+          server.off("error", reject);
+          resolve(server);
+        },
+      );
+      server.once("error", reject);
+    });
+    startupListener = listener;
+    const runner = new AgentRunner(service);
+    const running =
+      process.env.RIDE_AGENT_READ_ONLY === "true"
+        ? new Promise<void>((resolve) => {
+            if (controller.signal.aborted) resolve();
+            else
+              controller.signal.addEventListener("abort", () => resolve(), {
+                once: true,
+              });
+          })
+        : runner.run(controller.signal);
+    // The owner observes closed; avoid an unhandled rejection during startup.
+    void running.catch(() => {});
+    let rejectListener: (error: Error) => void;
+    const failed = new Promise<never>((_, reject) => {
+      rejectListener = reject;
+    });
+    const onError = (error: Error) => rejectListener(error);
+    listener.on("error", onError);
+    const onClose = () => {
+      if (!controller.signal.aborted)
+        rejectListener(new Error("Agent backend listener closed unexpectedly"));
+    };
+    listener.on("close", onClose);
+    let stopping: Promise<void> | undefined;
+    const close = () =>
+      (stopping ??= (async () => {
+        controller.abort();
+        const handlers = new Promise<void>((resolve) =>
+          listener.close(() => resolve()),
+        );
+        listener.closeIdleConnections();
+        // Start closing readers before awaiting the runner; it can be blocked
+        // receiving a large state. Existing callbacks keep the durable path.
+        const database = repository.close();
+        const results = await Promise.allSettled([running, database, handlers]);
+        listener.off("error", onError);
+        listener.off("close", onClose);
+        options.signal?.removeEventListener("abort", stopFromOwner);
+        const failure = results.find((r) => r.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      })());
+    const closed = Promise.race([running, failed]).then(
+      () => close(),
+      async (error) => {
+        await close().catch(() => {});
+        throw error;
+      },
+    );
+    void closed.catch(() => {});
+    return { listener, closed, close };
+  } catch (error) {
+    options.signal?.removeEventListener("abort", stopFromOwner);
     controller.abort();
-    listener.close();
-    // Closing tracked database sockets must start before the runner returns:
-    // its current state SELECT may be blocked sending a large response.
-    void repository.close().catch(() => {
+    startupListener?.closeAllConnections();
+    startupListener?.close();
+    await repository.close().catch(() => {});
+    throw error;
+  }
+}
+
+/** Preserve the standalone CLI contract while the App uses managed handles. */
+export async function startBackend(): Promise<void> {
+  const backend = await startManagedBackend();
+  const shutdown = () => {
+    void backend.close().catch(() => {
       console.error("Rider database shutdown failed.");
+      process.exitCode = 1;
     });
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
   try {
-    if (process.env.RIDE_AGENT_READ_ONLY === "true") {
-      await new Promise<void>((resolve) => {
-        controller.signal.addEventListener("abort", () => resolve(), {
-          once: true,
-        });
-      });
-    } else {
-      await runner.run(controller.signal);
-    }
+    await backend.closed;
   } finally {
-    listener.close();
-    await repository.close();
+    process.off("SIGTERM", shutdown);
+    process.off("SIGINT", shutdown);
   }
 }

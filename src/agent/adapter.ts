@@ -115,7 +115,9 @@ function bridgeInput(input: unknown): unknown {
   // implementation reads it, and its growth must not block account refreshes
   // or execution. Omit it on the wire without touching the persisted object.
   const portfolio = Object.fromEntries(
-    Object.entries(input.portfolio).filter(([key]) => key !== "decisions"),
+    Object.entries(input.portfolio).filter(
+      ([key]) => key !== "decisions" && key !== "__decision_history_version",
+    ),
   );
   return { ...input, portfolio };
 }

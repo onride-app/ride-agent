@@ -2,6 +2,14 @@ import pg from "pg";
 import { randomBytes, timingSafeEqual, createHmac } from "node:crypto";
 import type { Plan, Portfolio } from "./domain.js";
 import { AgentError, type Preferences } from "./contracts.js";
+import {
+  migrateHistorySchema,
+  migrateInlineHistory,
+  hydrateHistory,
+  saveHistory,
+  fullStateSql,
+  legacyEligibilitySql,
+} from "./cold-history.js";
 import { monitorPhase } from "./monitor-diagnostics.js";
 
 export interface Proposal {
@@ -46,6 +54,13 @@ export interface Update {
   next_notification_at?: number;
   notification_error?: string;
   notification_claim?: { token: string; expires_at: number };
+  notification_superseded_by?: string;
+  observation_episode?: {
+    first_at: number;
+    last_at: number;
+    count: number;
+    latest_data: Record<string, unknown>;
+  };
 }
 export interface HoldingCheckpoint {
   at: number;
@@ -103,6 +118,12 @@ export const emptyState = (): State => ({
 export interface Repository {
   read(user: string): Promise<State>;
   transact<T>(user: string, fn: (state: State) => Promise<T>): Promise<T>;
+  transactMonitor?<T>(
+    user: string,
+    fn: (state: State) => Promise<T>,
+    acknowledgementIds?: string[],
+  ): Promise<T>;
+  readNotifications?(user: string, ids: string[]): Promise<Update[]>;
   users(): Promise<string[]>;
   close(): Promise<void>;
 }
@@ -113,6 +134,7 @@ export class PgRepository implements Repository {
     "reading" | "callback"
   >();
   private closing?: Promise<void>;
+  private schemaReady?: Promise<void>;
   constructor(
     url: string,
     timeouts: { statementTimeoutMs?: number; queryTimeoutMs?: number } = {},
@@ -170,25 +192,37 @@ export class PgRepository implements Repository {
       } catch {}
     });
   }
-  async migrate(): Promise<void> {
-    await this.pool.query(
-      `CREATE TABLE IF NOT EXISTS ride_agent_state (user_id TEXT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now());`,
-    );
+  migrate(): Promise<void> {
+    return (this.schemaReady ??= (async () => {
+      await migrateHistorySchema(this.pool);
+    })());
   }
   async read(user: string): Promise<State> {
     // Inspections neither create an account row nor lock/update saved plans.
-    const value = await this.pool.query(
-      "SELECT state FROM ride_agent_state WHERE user_id=$1",
-      [user],
-    );
+    await this.migrate();
+    const value = await this.pool.query(fullStateSql, [user]);
     return structuredClone(
       (value.rows[0]?.state as State | undefined) ?? emptyState(),
     );
   }
-  async transact<T>(
+  transact<T>(user: string, fn: (state: State) => Promise<T>): Promise<T> {
+    return this.transaction(user, fn, false, []);
+  }
+  transactMonitor<T>(
     user: string,
     fn: (state: State) => Promise<T>,
+    acknowledgementIds: string[] = [],
   ): Promise<T> {
+    return this.transaction(user, fn, true, acknowledgementIds);
+  }
+  private async transaction<T>(
+    user: string,
+    fn: (state: State) => Promise<T>,
+    monitor: boolean,
+    acknowledgementIds: string[],
+  ): Promise<T> {
+    if (this.closing) throw new Error("Repository is closing");
+    await this.migrate();
     if (this.closing) throw new Error("Repository is closing");
     const c = await this.pool.connect();
     if (this.closing) {
@@ -212,6 +246,11 @@ export class PgRepository implements Repository {
         "INSERT INTO ride_agent_state(user_id,state) VALUES($1,$2) ON CONFLICT DO NOTHING",
         [user, emptyState()],
       );
+      await c.query(
+        "SELECT user_id FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
+        [user],
+      );
+      await migrateInlineHistory(c, user);
       const r = await monitorPhase("db_state_read", () =>
         c.query(
           "SELECT state FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
@@ -220,13 +259,33 @@ export class PgRepository implements Repository {
       );
       if (this.closing) throw new Error("Repository is closing");
       const s = r.rows[0].state as State;
+      const history = await hydrateHistory(
+        c,
+        user,
+        s,
+        monitor,
+        acknowledgementIds,
+      );
       this.transactions.set(c, "callback");
       const out = await monitorPhase("db_callback", () => fn(s));
       if (connectionError) throw connectionError;
       await monitorPhase("db_commit", async () => {
+        const hot = await saveHistory(c, user, s, history);
+        if (JSON.stringify(hot) !== history.originalHot) {
+          await c.query(
+            "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
+            [user, hot],
+          );
+        }
+        const eligible =
+          hot.portfolios.some((p) => p.state !== "closed") ||
+          hot.notification_preferences?.daily_digest === true;
         await c.query(
-          "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",
-          [user, s],
+          `UPDATE ride_agent_state s SET monitor_eligible=($2 OR EXISTS (
+            SELECT 1 FROM ride_agent_updates u WHERE u.user_id=s.user_id AND u.active AND u.notification='pending'))
+          WHERE s.user_id=$1 AND s.monitor_eligible IS DISTINCT FROM ($2 OR EXISTS (
+            SELECT 1 FROM ride_agent_updates u WHERE u.user_id=s.user_id AND u.active AND u.notification='pending'))`,
+          [user, eligible],
         );
         await c.query("COMMIT");
       });
@@ -241,10 +300,21 @@ export class PgRepository implements Repository {
       c.removeListener("error", onError);
     }
   }
+  async readNotifications(user: string, ids: string[]): Promise<Update[]> {
+    await this.migrate();
+    const rows = await this.pool.query(
+      `SELECT payload FROM ride_agent_updates
+      WHERE user_id=$1 AND active AND id=ANY($2::text[])`,
+      [user, ids],
+    );
+    return rows.rows.map((row) => row.payload as Update);
+  }
   async users(): Promise<string[]> {
+    await this.migrate();
     return (
       await this.pool.query(
-        "SELECT user_id FROM ride_agent_state WHERE EXISTS (SELECT 1 FROM jsonb_array_elements(state->'portfolios') p WHERE p->>'state' <> 'closed') OR EXISTS (SELECT 1 FROM jsonb_array_elements(state->'updates') u WHERE u->>'notification' = 'pending') OR state->'notification_preferences'->>'daily_digest' = 'true'",
+        `SELECT user_id FROM ride_agent_state WHERE monitor_eligible
+         UNION ALL SELECT user_id FROM ride_agent_state s WHERE monitor_eligible IS NULL AND (${legacyEligibilitySql})`,
       )
     ).rows.map((x) => x.user_id);
   }

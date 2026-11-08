@@ -70,13 +70,17 @@ test(
       await repository.transact(user, async (state) => {
         state.portfolios.push(p);
       });
-      const transact = repository.transact.bind(repository);
+      const transact = repository.transactMonitor.bind(repository);
       let transactions = 0;
-      repository.transact = (owner, callback) =>
-        transact(owner, async (state) => {
-          if (++transactions === 2) enterPlanning();
-          return callback(state);
-        });
+      repository.transactMonitor = (owner, callback, ids) =>
+        transact(
+          owner,
+          async (state) => {
+            if (++transactions === 2) enterPlanning();
+            return callback(state);
+          },
+          ids,
+        );
       const runner = new AgentRunner(
         new AgentService(
           repository,
@@ -241,10 +245,10 @@ test(
       await repository.transact(user, async (state) => {
         state.portfolios.push(p);
       });
-      const transact = repository.transact.bind(repository);
+      const transact = repository.transactMonitor.bind(repository);
       let changed = false;
-      repository.transact = async (owner, callback) => {
-        const result = await transact(owner, callback);
+      repository.transactMonitor = async (owner, callback, ids) => {
+        const result = await transact(owner, callback, ids);
         if (!changed) {
           changed = true;
           await external.transact(owner, async (state) => {

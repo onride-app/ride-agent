@@ -1191,7 +1191,10 @@ export class AgentService {
             x.fill.at < end,
         );
         const decisions = (p.decisions ?? []).filter(
-          (x) => x.copy_id === sleeve.copy_id && x.at >= start && x.at < end,
+          (x) =>
+            x.copy_id === sleeve.copy_id &&
+            x.at < end &&
+            (x.observation_episode?.last_at ?? x.at) >= start,
         );
         const began = p.audit_started_at ?? Infinity;
         const followerComplete =
