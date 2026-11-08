@@ -92,7 +92,7 @@ export type PrivyAuthorizationInput = {
   accessCode?: string;
 };
 
-type AuthorizationCodeRecord = {
+export type AuthorizationCodeRecord = {
   client: OAuthClientInformationFull;
   params: AuthorizationParams;
   rideAuthToken: string;
@@ -100,7 +100,7 @@ type AuthorizationCodeRecord = {
   expiresAt: number;
 };
 
-type AccessTokenRecord = {
+export type AccessTokenRecord = {
   clientId: string;
   scopes: string[];
   rideAuthToken: string;
@@ -109,7 +109,7 @@ type AccessTokenRecord = {
   resource?: URL;
 };
 
-type RefreshTokenRecord = AccessTokenRecord;
+export type RefreshTokenRecord = AccessTokenRecord;
 
 function storedCoreTokenExpired(token: string): boolean {
   // Only a previously verified credential read from our own OAuth store reaches
@@ -150,6 +150,7 @@ export type RideOAuthStateStore = {
   deleteRefreshToken: (token: string) => Promise<void>;
   consumeRefreshToken: (token: string, expected: RefreshTokenRecord) => Promise<boolean>;
   getStats?: () => Promise<RideOAuthStats>;
+  close?: () => Promise<void>;
 };
 
 class InMemoryClientsStore implements OAuthRegisteredClientsStore {
@@ -332,6 +333,10 @@ class RedisOAuthStateStore implements RideOAuthStateStore {
     return consumed === 1;
   }
 
+  async close(): Promise<void> {
+    await this.client.quit();
+  }
+
   async getStats(): Promise<RideOAuthStats> {
     const [
       registeredClients,
@@ -448,14 +453,14 @@ export async function createRedisOAuthStateStore(options: {
   return new RedisOAuthStateStore(client as RedisClientType, options.keyPrefix ?? "ride:mcp:oauth");
 }
 
-function serializeAuthorizationCodeRecord(record: AuthorizationCodeRecord): string {
+export function serializeAuthorizationCodeRecord(record: AuthorizationCodeRecord): string {
   return JSON.stringify({
     ...record,
     params: serializeAuthorizationParams(record.params),
   });
 }
 
-function deserializeAuthorizationCodeRecord(value: string): AuthorizationCodeRecord {
+export function deserializeAuthorizationCodeRecord(value: string): AuthorizationCodeRecord {
   const parsed = JSON.parse(value) as Omit<AuthorizationCodeRecord, "params"> & {
     params: ReturnType<typeof serializeAuthorizationParams>;
   };
@@ -465,14 +470,14 @@ function deserializeAuthorizationCodeRecord(value: string): AuthorizationCodeRec
   };
 }
 
-function serializeAccessTokenRecord(record: AccessTokenRecord): string {
+export function serializeAccessTokenRecord(record: AccessTokenRecord): string {
   return JSON.stringify({
     ...record,
     resource: record.resource?.toString(),
   });
 }
 
-function deserializeAccessTokenRecord(value: string): AccessTokenRecord {
+export function deserializeAccessTokenRecord(value: string): AccessTokenRecord {
   const parsed = JSON.parse(value) as Omit<AccessTokenRecord, "resource"> & {
     resource?: string;
   };

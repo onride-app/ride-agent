@@ -75,7 +75,16 @@ export class AgentRunner {
     const transact = <T>(
       phase: "audit_control" | "observe_plan" | "durable_notify",
       work: (state: State) => Promise<T>,
-    ) => monitorPhase(phase, () => repository.transact(user, work));
+    ) =>
+      monitorPhase(phase, () =>
+        repository.transactMonitor
+          ? repository.transactMonitor(
+              user,
+              work,
+              this.notifications.acknowledgementIds(user),
+            )
+          : repository.transact(user, work),
+      );
     // Planning is committed before any submission. A process crash cannot
     // erase a possibly submitted execution identifier or its frozen payload.
     const prefetches = new Map<string, ReturnType<typeof observeSources>>();
@@ -1619,21 +1628,45 @@ function checkpoint(s: State, p: Portfolio, key: string, at: number): void {
     ]),
   });
 }
-function eventOnce(
+export function eventOnce(
   s: State,
   kind: string,
   pid: string,
   message: string,
   data: Record<string, unknown> = {},
 ): void {
-  if (
-    !s.updates.some(
-      (e) =>
-        e.kind === kind &&
-        e.portfolio_id === pid &&
-        fingerprint(e.data) === fingerprint(data) &&
-        now() - e.at < 3600_000,
+  const at = now();
+  const episode =
+    kind === "VENUE_READ_BUDGET_EXHAUSTED" || kind === "VENUE_RATE_LIMITED";
+  const comparable = (value: Record<string, unknown>) => {
+    if (
+      !episode ||
+      !value.diagnostics ||
+      typeof value.diagnostics !== "object" ||
+      Array.isArray(value.diagnostics)
     )
-  )
-    event(s, kind, pid, message, data);
+      return value;
+    // Countdown hints vary every observation. Everything else, including scope,
+    // operation, execution identities and budget type, remains part of identity.
+    const { retry_after_ms: _countdown, ...diagnostics } =
+      value.diagnostics as Record<string, unknown>;
+    return { ...value, diagnostics };
+  };
+  const target = fingerprint(comparable(data));
+  for (let i = s.updates.length - 1; i >= 0; i--) {
+    const e = s.updates[i];
+    // Cheap exclusions precede hashing; the target is hashed just once.
+    if (e.kind !== kind || e.portfolio_id !== pid || at - e.at >= 3600_000)
+      continue;
+    if (fingerprint(comparable(e.data)) !== target) continue;
+    if (episode)
+      e.observation_episode = {
+        first_at: e.observation_episode?.first_at ?? e.at,
+        last_at: at,
+        count: (e.observation_episode?.count ?? 1) + 1,
+        latest_data: data,
+      };
+    return;
+  }
+  event(s, kind, pid, message, data);
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import express from "express";
+import type { Server } from "node:http";
 import { VERSION } from "../version.js";
 import { firebaseAccount } from "./firebase.js";
 import pg from "pg";
@@ -2850,10 +2851,25 @@ export class CoreBridge {
     }
   }
 }
-export async function startCoreBridge() {
+export interface ManagedCoreBridge {
+  listener: Server;
+  closed: Promise<void>;
+  close(): Promise<void>;
+}
+
+/** App-owned startup keeps all existing authentication and operation gates. */
+export async function startManagedCoreBridge(
+  options: {
+    host?: string;
+    port?: number;
+  } = {},
+): Promise<ManagedCoreBridge> {
   const infoReadRoute = process.env.RIDE_AGENT_INFO_READ_ROUTE ?? "official";
   if (infoReadRoute !== "official" && infoReadRoute !== "core")
     throw new Error("RIDE_AGENT_INFO_READ_ROUTE must be official or core");
+  const token = required("RIDE_AGENT_EXECUTOR_TOKEN");
+  if (token.length < 32)
+    throw Error("Executor token must contain 32 characters");
   const bridge = new CoreBridge(
     required("RIDE_AGENT_CORE_URL"),
     required("RIDE_AGENT_CORE_SERVICE_TOKEN"),
@@ -2862,10 +2878,12 @@ export async function startCoreBridge() {
     process.env.RIDE_AGENT_NETWORK === "mainnet" ? "mainnet" : "testnet",
     { infoReadRoute },
   );
-  await bridge.migrate();
-  const token = required("RIDE_AGENT_EXECUTOR_TOKEN");
-  if (token.length < 32)
-    throw Error("Executor token must contain 32 characters");
+  try {
+    await bridge.migrate();
+  } catch (error) {
+    await bridge.close().catch(() => {});
+    throw error;
+  }
   const app = express();
   app.disable("x-powered-by");
   app.get("/health", (_req, res) =>
@@ -2915,25 +2933,83 @@ export async function startCoreBridge() {
       cancellation?.close();
     }
   });
-  const listener = app.listen(
-    Number(process.env.PORT ?? 3355),
-    process.env.HOST ?? "127.0.0.1",
-  );
-  let stopping = false;
+  let listener: Server;
+  try {
+    listener = await new Promise<Server>((resolve, reject) => {
+      const server = app.listen(
+        options.port ?? Number(process.env.PORT ?? 3355),
+        options.host ?? process.env.HOST ?? "127.0.0.1",
+        () => {
+          server.off("error", reject);
+          resolve(server);
+        },
+      );
+      server.once("error", reject);
+    });
+  } catch (error) {
+    await bridge.close().catch(() => {});
+    throw error;
+  }
+  let resolveClosed: () => void;
+  let rejectClosed: (error: unknown) => void;
+  const closed = new Promise<void>((resolve, reject) => {
+    resolveClosed = resolve;
+    rejectClosed = reject;
+  });
+  void closed.catch(() => {});
+  let stopping: Promise<void> | undefined;
+  const close = () =>
+    (stopping ??= (async () => {
+      try {
+        await drainBridge(listener, bridge);
+        resolveClosed();
+      } catch (error) {
+        rejectClosed(error);
+        throw error;
+      }
+    })());
+  listener.on("error", (error) => {
+    rejectClosed(error);
+    void close().catch(() => {});
+  });
+  listener.on("close", () => {
+    if (!stopping) {
+      rejectClosed(
+        new Error("Private Agent bridge listener closed unexpectedly"),
+      );
+      void close().catch(() => {});
+    }
+  });
+  return { listener, closed, close };
+}
+
+/** Standalone bridge remains compatible with its existing entrypoint. */
+export async function startCoreBridge(): Promise<void> {
+  const bridge = await startManagedCoreBridge();
+  let force: ReturnType<typeof setTimeout> | undefined;
   const stop = () => {
-    if (stopping) return;
-    stopping = true;
-    // Leave time for ordinary handler/scoped deadlines and durable cost-plan
-    // completion. A forced stop never clears dirty plans or financial unknowns.
-    const force = setTimeout(() => process.exit(0), 45000);
+    if (force) return;
+    force = setTimeout(() => process.exit(0), 45000);
     force.unref();
-    // Keep the unref deadline even after sockets/pool drain: an unrelated
-    // longer Core operation may still hold a reference. It cannot keep a
-    // normally drained process alive, but still bounds residual work.
-    void drainBridge(listener, bridge).catch(() => {
+    void bridge.close().catch(() => {
       console.error("Rider bridge shutdown failed.");
+      process.exitCode = 1;
     });
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
+  // Existing callers await startup readiness, not the lifetime of the server.
+  // Keep the unref force boundary after successful pool/HTTP drain: unrelated
+  // work can still hold this standalone process alive.
+  void bridge.closed.then(
+    () => {
+      process.off("SIGTERM", stop);
+      process.off("SIGINT", stop);
+    },
+    () => {
+      console.error("Rider bridge stopped unexpectedly.");
+      process.exitCode = 1;
+      stop();
+    },
+  );
 }

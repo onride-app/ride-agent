@@ -11,6 +11,7 @@ export type HumanHandoff = {
 export interface HumanHandoffs {
   issue(value: HumanHandoff): Promise<string>;
   consume(ticket: string): Promise<HumanHandoff | undefined>;
+  close?(): Promise<void>;
 }
 export class MemoryHumanHandoffs implements HumanHandoffs {
   private values = new Map<string, HumanHandoff>();
@@ -33,6 +34,9 @@ export async function redisHumanHandoffs(url: string): Promise<HumanHandoffs> {
   await client.connect();
   const prefix = "ride:agent:human-handoff:";
   return {
+    async close() {
+      await client.quit();
+    },
     async issue(value) {
       const ticket = randomBytes(32).toString("base64url");
       await client.set(prefix + ticket, JSON.stringify(value), { PX: 60_000 });

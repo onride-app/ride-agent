@@ -26,7 +26,8 @@ import { invokeAccountRead } from "./account_reads.js";
 import { mountAgentProxy } from "./agent/http.js";
 import { mountHumanConfirmation } from "./agent/human.js";
 import { redisHumanHandoffs } from "./agent/human_handoffs.js";
-import { validateCoreIdentity } from "./agent/backend.js";
+import { validateCoreIdentity } from "./core_identity.js";
+import { remoteOAuthStateStore, remoteHumanHandoffs } from "./app_session_store.js";
 import { AgentError, mutationTools } from "./agent/contracts.js";
 import { VERSION } from "./version.js";
 import { recordMcpProtocolError, requestDiagnostics } from "./request_diagnostics.js";
@@ -48,12 +49,19 @@ async function main(): Promise<void> {
     !["127.0.0.1", "localhost"].includes(base.hostname)
   )
     throw new Error("Public issuer must use HTTPS");
+  const appSessionUrl = process.env.RIDE_AGENT_APP_SESSION_URL;
+  const appSessionOptions = appSessionUrl ? {
+    url: appSessionUrl,
+    token: required("RIDE_AGENT_APP_SESSION_TOKEN"),
+  } : undefined;
   if (
-    !process.env.REDIS_URL &&
+    !process.env.REDIS_URL && !appSessionOptions &&
     !["127.0.0.1", "localhost"].includes(base.hostname)
   )
-    throw new Error("Hosted OAuth requires Redis");
-  const store = process.env.REDIS_URL
+    throw new Error("Hosted OAuth requires durable App or Redis session storage");
+  const store = appSessionOptions
+    ? remoteOAuthStateStore(appSessionOptions)
+    : process.env.REDIS_URL
     ? await createRedisOAuthStateStore({ url: process.env.REDIS_URL })
     : new InMemoryOAuthStateStore();
   const config = {
@@ -112,7 +120,9 @@ async function main(): Promise<void> {
       cookieKey: required("RIDE_AGENT_HUMAN_COOKIE_KEY"),
       auth: config,
       exchange,
-      handoffs: process.env.REDIS_URL
+      handoffs: appSessionOptions
+        ? remoteHumanHandoffs(appSessionOptions)
+        : process.env.REDIS_URL
         ? await redisHumanHandoffs(process.env.REDIS_URL)
         : undefined,
     });
