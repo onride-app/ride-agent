@@ -312,7 +312,7 @@ export async function invokeAgent(
   if (!token)
     throw new AgentError("AUTH_REQUIRED", "Log in to Ride first.", false, 401);
   let response: Response | undefined;
-  let body: unknown;
+  let body: Result;
   try {
     response = await fetchAgentResponse(
       fetcher,
@@ -329,7 +329,11 @@ export async function invokeAgent(
       },
       name,
     );
-    body = await response.json();
+    // A proxy may return syntactically valid JSON without the Agent envelope.
+    // Validate inside the same uncertainty boundary as a lost/truncated body.
+    body = output.parse(await response.json());
+    if (!response.ok && !body.error)
+      throw new Error("Upstream HTTP failure without an Agent error");
   } catch (error) {
     // Only fixed diagnostic codes; never log credentials, args, URLs or raw errors.
     console.error(
@@ -396,20 +400,7 @@ export async function invokeAgent(
       503,
     );
   }
-  if (!body || typeof body !== "object")
-    throw new AgentError(
-      "BACKEND_UNAVAILABLE",
-      "Ride 返回了无效结果，请先查询已保存状态。",
-      false,
-      503,
-    );
-  if (!response.ok && !(body as Result).error)
-    throw new AgentError(
-      "BACKEND_UNAVAILABLE",
-      "Rider request failed.",
-      response.status >= 500,
-      response.status,
-    );
+  // Keep the existing private-identity guard distinct from transport failure.
   return publicResult(body);
 }
 function description(name: ToolName): string {
