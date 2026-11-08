@@ -11,6 +11,14 @@ import {
   legacyEligibilitySql,
 } from "./cold-history.js";
 import { monitorPhase } from "./monitor-diagnostics.js";
+import type { PerformancePoint } from "./analytics.js";
+import {
+  migratePerformanceSchema,
+  migrateInlinePerformance,
+  hydratePerformance,
+  readPerformanceWindow,
+  savePerformance,
+} from "./performance-history.js";
 
 export interface Proposal {
   id: string;
@@ -115,12 +123,23 @@ export const emptyState = (): State => ({
   updates: [],
   checkpoints: [],
 });
+export interface MonitorHistoryReader {
+  performanceWindow(
+    portfolioId: string,
+    start: number,
+    end: number,
+  ): Promise<PerformancePoint[]>;
+}
+export type MonitorCallback<T> = (
+  state: State,
+  history?: MonitorHistoryReader,
+) => Promise<T>;
 export interface Repository {
   read(user: string): Promise<State>;
   transact<T>(user: string, fn: (state: State) => Promise<T>): Promise<T>;
   transactMonitor?<T>(
     user: string,
-    fn: (state: State) => Promise<T>,
+    fn: MonitorCallback<T>,
     acknowledgementIds?: string[],
   ): Promise<T>;
   readNotifications?(user: string, ids: string[]): Promise<Update[]>;
@@ -194,7 +213,10 @@ export class PgRepository implements Repository {
   }
   migrate(): Promise<void> {
     return (this.schemaReady ??= (async () => {
+      if (this.closing) throw new Error("Repository is closing");
       await migrateHistorySchema(this.pool);
+      if (this.closing) throw new Error("Repository is closing");
+      await migratePerformanceSchema(this.pool);
     })());
   }
   async read(user: string): Promise<State> {
@@ -210,14 +232,14 @@ export class PgRepository implements Repository {
   }
   transactMonitor<T>(
     user: string,
-    fn: (state: State) => Promise<T>,
+    fn: MonitorCallback<T>,
     acknowledgementIds: string[] = [],
   ): Promise<T> {
     return this.transaction(user, fn, true, acknowledgementIds);
   }
   private async transaction<T>(
     user: string,
-    fn: (state: State) => Promise<T>,
+    fn: MonitorCallback<T>,
     monitor: boolean,
     acknowledgementIds: string[],
   ): Promise<T> {
@@ -251,6 +273,7 @@ export class PgRepository implements Repository {
         [user],
       );
       await migrateInlineHistory(c, user);
+      await migrateInlinePerformance(c, user);
       const r = await monitorPhase("db_state_read", () =>
         c.query(
           "SELECT state FROM ride_agent_state WHERE user_id=$1 FOR UPDATE",
@@ -266,11 +289,44 @@ export class PgRepository implements Repository {
         monitor,
         acknowledgementIds,
       );
+      const performance = await hydratePerformance(c, user, s, monitor);
       this.transactions.set(c, "callback");
-      const out = await monitorPhase("db_callback", () => fn(s));
+      let callbackActive = true;
+      let out: T;
+      try {
+        out = await monitorPhase("db_callback", () =>
+          fn(
+            s,
+            monitor
+              ? {
+                  performanceWindow: (portfolioId, start, end) => {
+                    if (!callbackActive)
+                      throw new Error("Monitor history transaction is closed");
+                    return readPerformanceWindow(
+                      c,
+                      user,
+                      s,
+                      performance,
+                      portfolioId,
+                      start,
+                      end,
+                    );
+                  },
+                }
+              : undefined,
+          ),
+        );
+      } finally {
+        callbackActive = false;
+      }
       if (connectionError) throw connectionError;
       await monitorPhase("db_commit", async () => {
-        const hot = await saveHistory(c, user, s, history);
+        const hot = await savePerformance(
+          c,
+          user,
+          await saveHistory(c, user, s, history),
+          performance,
+        );
         if (JSON.stringify(hot) !== history.originalHot) {
           await c.query(
             "UPDATE ride_agent_state SET state=$2, updated_at=now() WHERE user_id=$1",

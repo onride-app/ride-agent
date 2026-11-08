@@ -31,7 +31,7 @@ import {
   MANUAL_LEDGER_OWNER,
 } from "./ledger.js";
 import { event, AgentService } from "./service.js";
-import type { State } from "./repository.js";
+import type { State, MonitorCallback } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
 import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
@@ -74,7 +74,7 @@ export class AgentRunner {
     const { repository, adapter } = this.service;
     const transact = <T>(
       phase: "audit_control" | "observe_plan" | "durable_notify",
-      work: (state: State) => Promise<T>,
+      work: MonitorCallback<T>,
     ) =>
       monitorPhase(phase, () =>
         repository.transactMonitor
@@ -1279,113 +1279,126 @@ export class AgentRunner {
     let preparedNotifications: PreparedNotifications | undefined;
     let deferredVenueRetryAt: number | undefined;
     try {
-      deferredVenueRetryAt = await transact("durable_notify", async (state) => {
-        for (const p of state.portfolios)
-          for (const e of p.executions.filter(
-            (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
-          )) {
-            if (
-              e.status === "queued" &&
-              (e.revision !== p.revision || p.state === "attention")
-            ) {
-              e.status = "superseded";
-              continue;
-            }
-            if (e.status === "queued" && e.expires_at <= now()) {
-              e.status = "failed";
-              e.error = "Target expired before submission";
-              continue;
-            }
-            try {
-              if (e.status === "uncertain") {
-                const observed = await adapter.execution(user, p, e);
-                if (observed.status !== "failed") {
-                  e.status = observed.status;
-                  e.task_id = observed.task_id ?? e.task_id;
-                  e.observed_quantity = observed.observed_quantity;
-                  continue;
-                }
-                if (e.revision !== p.revision || p.state === "attention") {
-                  e.status = "superseded";
-                  continue;
-                }
-                if (e.expires_at <= now()) {
-                  e.status = "failed";
-                  e.error = "Target expired before submission";
-                  continue;
-                }
-              }
-              // The bridge revalidates source revision, ownership, authority, price
-              // deviation, live margin and Core policy immediately before signing.
-              const submit = await adapter.submit(user, p, e);
-              e.task_id = submit.task_id;
-              e.status = "submitted";
-              event(
-                state,
-                "execution_submitted",
-                p.id,
-                "Order submitted; fill and settlement are pending.",
-                { execution_id: e.id },
-              );
-            } catch (error) {
+      deferredVenueRetryAt = await transact(
+        "durable_notify",
+        async (state, history) => {
+          for (const p of state.portfolios)
+            for (const e of p.executions.filter(
+              (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
+            )) {
               if (
-                error instanceof AgentError &&
-                error.code === "EXECUTION_REJECTED"
+                e.status === "queued" &&
+                (e.revision !== p.revision || p.state === "attention")
               ) {
-                e.status = "failed";
-                e.error = error.message;
-              } else {
-                e.status = "uncertain";
-                e.error =
-                  "Submission result unknown; same execution identifier must be reconciled.";
+                e.status = "superseded";
+                continue;
               }
-              eventOnce(
-                state,
-                e.status === "failed"
-                  ? "EXECUTION_REJECTED"
-                  : "EXECUTION_UNCERTAIN",
-                p.id,
-                e.error,
-                { execution_id: e.id },
-              );
+              if (e.status === "queued" && e.expires_at <= now()) {
+                e.status = "failed";
+                e.error = "Target expired before submission";
+                continue;
+              }
+              try {
+                if (e.status === "uncertain") {
+                  const observed = await adapter.execution(user, p, e);
+                  if (observed.status !== "failed") {
+                    e.status = observed.status;
+                    e.task_id = observed.task_id ?? e.task_id;
+                    e.observed_quantity = observed.observed_quantity;
+                    continue;
+                  }
+                  if (e.revision !== p.revision || p.state === "attention") {
+                    e.status = "superseded";
+                    continue;
+                  }
+                  if (e.expires_at <= now()) {
+                    e.status = "failed";
+                    e.error = "Target expired before submission";
+                    continue;
+                  }
+                }
+                // The bridge revalidates source revision, ownership, authority, price
+                // deviation, live margin and Core policy immediately before signing.
+                const submit = await adapter.submit(user, p, e);
+                e.task_id = submit.task_id;
+                e.status = "submitted";
+                event(
+                  state,
+                  "execution_submitted",
+                  p.id,
+                  "Order submitted; fill and settlement are pending.",
+                  { execution_id: e.id },
+                );
+              } catch (error) {
+                if (
+                  error instanceof AgentError &&
+                  error.code === "EXECUTION_REJECTED"
+                ) {
+                  e.status = "failed";
+                  e.error = error.message;
+                } else {
+                  e.status = "uncertain";
+                  e.error =
+                    "Submission result unknown; same execution identifier must be reconciled.";
+                }
+                eventOnce(
+                  state,
+                  e.status === "failed"
+                    ? "EXECUTION_REJECTED"
+                    : "EXECUTION_UNCERTAIN",
+                  p.id,
+                  e.error,
+                  { execution_id: e.id },
+                );
+              }
+            }
+          const prefs = state.notification_preferences;
+          if (prefs?.daily_digest) {
+            const local = localDay(now(), prefs.timezone),
+              enabled = localDay(prefs.enabled_at, prefs.timezone);
+            if (
+              local.time >= prefs.local_time &&
+              prefs.last_digest_day !== local.day &&
+              (enabled.day < local.day || enabled.time < prefs.local_time)
+            ) {
+              const p = state.portfolios.at(-1);
+              if (p) {
+                // Historical points are cold. Only a due digest needs its exact
+                // observed-at window and baseline; ordinary turns keep heads.
+                const end = p.snapshot?.observed_at ?? now();
+                const points = history
+                  ? await history.performanceWindow(p.id, end - 86400_000, end)
+                  : state.performance;
+                const performance = performanceView(
+                  { ...state, performance: points },
+                  p,
+                  "daily",
+                );
+                event(
+                  state,
+                  "daily_digest",
+                  p.id,
+                  `Ride daily report · ${local.day} · net profit ${performance.net_profit_usdc ?? "unavailable"} USDC · ${performance.coverage} coverage.`,
+                  {
+                    performance,
+                    timezone: prefs.timezone,
+                    digest_day: local.day,
+                  },
+                );
+              }
+              prefs.last_digest_day = local.day;
             }
           }
-        const prefs = state.notification_preferences;
-        if (prefs?.daily_digest) {
-          const local = localDay(now(), prefs.timezone),
-            enabled = localDay(prefs.enabled_at, prefs.timezone);
-          if (
-            local.time >= prefs.local_time &&
-            prefs.last_digest_day !== local.day &&
-            (enabled.day < local.day || enabled.time < prefs.local_time)
-          ) {
-            const p = state.portfolios.at(-1);
-            if (p) {
-              const performance = performanceView(state, p, "daily");
-              event(
-                state,
-                "daily_digest",
-                p.id,
-                `Ride daily report · ${local.day} · net profit ${performance.net_profit_usdc ?? "unavailable"} USDC · ${performance.coverage} coverage.`,
-                {
-                  performance,
-                  timezone: prefs.timezone,
-                  digest_day: local.day,
-                },
-              );
-            }
-            prefs.last_digest_day = local.day;
-          }
-        }
-        preparedNotifications = this.notifications.prepare(user, state);
-        if (audited.size === 0)
-          return Math.min(
-            Infinity,
-            ...state.portfolios
-              .filter((p) => p.state !== "closed")
-              .map((p) => venueReadRetryAt(p) ?? Infinity),
-          );
-      });
+          preparedNotifications = this.notifications.prepare(user, state);
+          if (audited.size === 0)
+            return Math.min(
+              Infinity,
+              ...state.portfolios
+                .filter((p) => p.state !== "closed")
+                .map((p) => venueReadRetryAt(p) ?? Infinity),
+            );
+        },
+      );
     } catch (error) {
       if (preparedNotifications)
         this.notifications.rollback(preparedNotifications);

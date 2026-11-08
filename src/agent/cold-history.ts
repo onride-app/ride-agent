@@ -1,6 +1,7 @@
 import type pg from "pg";
 import type { State, Update } from "./repository.js";
 import type { Decision } from "./analytics.js";
+import { withFullPerformanceStateSql } from "./performance-history.js";
 
 // Only deduplication history is capped. Exact notification ACK IDs and durable
 // due delivery claims are selected independently and can never be displaced.
@@ -471,7 +472,8 @@ export async function saveHistory(
 
 // One ordinary MVCC snapshot, without row locks or account creation. Readers
 // cannot combine a new hot state with old history while a monitor commits.
-export const fullStateSql = `SELECT CASE WHEN EXISTS (
+export const fullStateSql =
+  withFullPerformanceStateSql(`SELECT CASE WHEN EXISTS (
   SELECT 1 FROM ride_agent_history_migrations m WHERE m.user_id=s.user_id)
   THEN jsonb_set(jsonb_set(s.state,'{updates}',COALESCE((SELECT jsonb_agg(u.payload ORDER BY u.ordinal)
     FROM ride_agent_updates u WHERE u.user_id=s.user_id AND u.active),'[]'::jsonb)),
@@ -480,4 +482,4 @@ export const fullStateSql = `SELECT CASE WHEN EXISTS (
         WHERE d.user_id=s.user_id AND d.portfolio_id=p->>'id' AND d.active),'[]'::jsonb)) ELSE p END ORDER BY n)
       FROM jsonb_array_elements(s.state->'portfolios') WITH ORDINALITY x(p,n)
       LEFT JOIN ride_agent_history_heads h ON h.user_id=s.user_id AND h.portfolio_id=p->>'id'),'[]'::jsonb))
-  ELSE s.state END AS state FROM ride_agent_state s WHERE s.user_id=$1`;
+  ELSE s.state END AS state FROM ride_agent_state s WHERE s.user_id=$1`);
