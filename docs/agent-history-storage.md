@@ -1,7 +1,7 @@
 # Agent hot state and durable history
 
 The App-owned Node runtime keeps the existing Agent domain, account locks and
-execution lifecycle. This storage change removes historical updates and decision
+execution lifecycle. This storage change removes historical updates, decisions and performance
 arrays from the JSON read by each monitor turn. It does not change observation
 freshness, venue quotas, transaction authorization or unknown-execution recovery.
 
@@ -9,9 +9,10 @@ freshness, venue quotas, transaction authorization or unknown-execution recovery
 
 `ride_agent_state.state` holds the current portfolio, owned ledger, executions,
 funding evidence, proposals and other current fields. Its `updates` array is an
-empty structural placeholder; portfolio `decisions` are stored separately.
+empty structural placeholder; portfolio `decisions` and owner `performance` are
+stored separately.
 
-Six additional tables are part of the same database and backup boundary:
+Nine additional tables are part of the same database and backup boundary:
 
 | Table | Purpose |
 | --- | --- |
@@ -21,6 +22,9 @@ Six additional tables are part of the same database and backup boundary:
 | `ride_agent_decisions` | Stable per-portfolio ordinal, current decision payload and immutable original payload |
 | `ride_agent_history_heads` | Monotonic ordinal/version and absent-versus-empty decisions metadata |
 | `ride_agent_decision_evidence` | Latest decision ordinal and any historical non-null target by copy/market, including a zero target |
+| `ride_agent_performance` | Owner-global ordinal, portfolio/time indexes, active payload and immutable original performance point |
+| `ride_agent_performance_heads` | Atomic per-owner performance migration marker, next global ordinal and absent-versus-empty metadata |
+| `ride_agent_performance_schema` | Independent schema-ready marker for databases already using updates/decisions storage |
 
 `Repository.read` and `transact` still return complete active history. A read uses
 one PostgreSQL MVCC statement, so a committed hot state cannot be paired with
@@ -62,6 +66,9 @@ Each monitor transaction reads:
 - Pending daily digests, including those requiring cancellation after a preference/day change.
 - The latest decision per copy/market, admission-evidence guards, and a durable
   history version included in phase fingerprints.
+- Only the last **append-order** performance point per current portfolio, to
+  preserve the existing event/hourly recording predicate. Ordinal order, rather
+  than maximum timestamp, determines that point.
 
 The 256 bound affects duplicate suppression only. A forgotten older duplicate
 may produce an extra event; it cannot remove due delivery, an exact ACK, a
@@ -75,6 +82,40 @@ Notification claims, stable IDs, per-device receipts, expiry, retry backoff and
 token-matched acknowledgements retain their previous meanings. Prepared delivery
 revalidates its exact claimed IDs through a small ordinary read, instead of
 loading complete user history. No user row lock crosses push I/O.
+
+## Performance history and on-demand analytics
+
+Performance points are not discarded, bucketed or coalesced. Their original
+owner-wide array order survives interleaved portfolios, identical payloads,
+same-millisecond points and histories whose timestamps are not monotonic.
+`(user_id, ordinal)` is the durable identity; timestamps are indexed values.
+The time index uses double precision to preserve the existing finite JavaScript
+number timestamp ABI, including fractional milliseconds; ordinals use bigint.
+An independent per-owner marker migrates performance even when that owner was
+already migrated by the earlier updates/decisions release. Copy, strip, new
+appends, notification claims and current state commit under the same owner row
+lock. Failure rolls back both migration and business changes.
+
+Ordinary `read` and `transact` hydrate every active point in the original global
+order, including points for portfolios no longer in the current list. The full
+read remains one MVCC SQL statement. An absent performance field stays absent;
+an explicit empty array stays empty. Full callbacks can still append, splice,
+reorder, replace or remove the array. Replacement logically retires old current
+rows and assigns new ordinals, while retaining their original payloads. A
+monitor callback may only append to its guarded projected prefix and cannot
+overwrite unloaded points.
+
+The optional monitor callback history reader runs only while that transaction
+is active and is bound to its owner. The runner requests a performance window
+only after determining that a daily digest is due, using the actual saved
+snapshot end and preceding 24 hours. The indexed read returns every point in
+that exact inclusive window plus the immediately preceding baseline, ordered
+by the original ordinal. It also includes any points appended in the callback
+but not saved yet. The temporary window is passed to the existing
+`performanceView`; it does not replace the monitor projection or enter hot JSON.
+Baseline ties, null profits, missing-hour gaps, freshness and coverage retain
+their previous meanings. Full daily/weekly/inception user analytics keep their
+complete history. A last-point-only report would be incorrect and is not used.
 
 ## Repeated observations
 
@@ -106,12 +147,14 @@ requested window; the episode count describes its whole interval.
 Unchanged projected records are not rewritten. The hot JSON is updated only
 when its serialized contents change; eligibility is updated only when its
 boolean changes. Histories still grow for distinct business events. Existing
-checkpoints, performance, configurations, receipts and financial evidence remain
+checkpoints, configurations, receipts and financial evidence remain
 in the current schema; this change does not claim to bound every future field.
 
 ## Rollback and validation
 
 The old `8b906c4` binary cannot safely interpret a stripped hot state by itself.
+Likewise, a binary predating performance cold storage cannot read performance
+after that field has migrated, even if it understands cold updates/decisions.
 Rollback must use a history-aware compatible binary and the complete database,
 or explicitly materialize the legacy full-state representation into an isolated
 restored database before starting the old binary. Never start an old monitor
@@ -127,3 +170,9 @@ eligibility for deferred/claimed/digest/attention states. These fixtures do not
 call production handlers or establish real-trade acceptance. Darwin skips the
 existing kernel TCP_USER_TIMEOUT proofs because PostgreSQL reports effective
 zero; that limitation must remain explicit.
+
+`performance-history.test.ts` additionally verifies real PostgreSQL migration of
+62,001 original points with a bounded monitor projection, global/same-ms order,
+complete-read equality, exact report windows and unsaved point overlays,
+no-op/point-only hot-write avoidance, full mutation compatibility, prefix guards,
+transaction rollback, concurrent owner locks/MVCC, and due-only runner queries.
