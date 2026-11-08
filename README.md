@@ -1,5 +1,6 @@
 # Rider
 
+
 **Rider** is the public MCP and CLI display name for Ride Agent. The package stays `@onride/agent`, the CLI and MCP configuration key stay `ride`, and the hosted URL stays `https://mcp.onride.me/mcp`.
 
 **AI Copy-Trading Agent**
@@ -146,6 +147,10 @@ Daily reports are opt-in Ride App pushes with a local time and IANA timezone. Th
 
 ## Architecture and self-hosting
 
+Hosted architecture uses a lightweight `mcp.onride.me` HTTP gateway and a versioned Agent business module owned by the private App API. The public App API relays the original user credential; the private API supervises backend, bridge and session-store listeners on loopback. Agent PostgreSQL is the separate `ride_agent_app` database on the App cluster, and OAuth/handoffs use App Redis through a fixed RPC. The gateway has no direct Agent PG/Redis credentials. See [current rollout status](docs/status.md), [hosted deployment](docs/deployment.md) and [App runtime](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/deploy/agent-runtime/README.md); code availability does not establish a production cutover.
+
+The following three-process diagram and commands describe standalone/self-hosted compatibility. Do not run a standalone monitor alongside the App-owned monitor.
+
 ```mermaid
 flowchart LR
   A[Agent / CLI / Skill] --> B[OAuth MCP gateway]
@@ -158,7 +163,7 @@ flowchart LR
   H --> E
 ```
 
-The public gateway runs `npm start`; the durable control service runs `npm run start:backend`; the private execution bridge runs `npm run start:bridge`. Each is a separate process. `PORT` defaults are 3333/3344/3355 and `HOST` defaults to loopback. Protect the bridge and Core with distinct service credentials and private ingress. The bridge requires the additive Ride Core V3 API/migrations/worker changes; this repository does not contain the private Ride Core or native App.
+For standalone self-hosting, the public gateway runs `npm start`, the control service runs `npm run start:backend`, and the execution bridge runs `npm run start:bridge` as separate processes. `PORT` defaults are 3333/3344/3355 and `HOST` defaults to loopback. Protect the bridge and Core with distinct service credentials and private ingress. The bridge requires the additive Ride Core V3 API/migrations/worker changes; this repository does not contain the private Ride Core or native App.
 
 See [deployment and configuration](docs/deployment.md) and [.env.example](.env.example). Keep secrets outside Git. Start with execution flags disabled. `RIDE_PUBLIC_SUBMISSION_MODE=true` exposes eleven read-only Agent/workflow tools and the App account read for directory submissions.
 
@@ -195,7 +200,6 @@ Widget/account repairs in 0.4.3 default asset preferences to unrestricted Crypto
 Native recommendations default to `conversation_display.markdown`: one combined allocation/performance table, concrete copy-sizing and exit-trigger summaries, and a details action. `get_portfolio` with `plan_id` and `detail: detailed` explains the same immutable preview without regenerating it. Compatible recommendation/comparison fields remain available.
 
 For alternatives, `browse_traders` accepts `plan_id` and `exclude_selected: true`; browsing or refreshing candidate data never changes plans or preferences. An explicit one-for-one edit uses `recalculate_plan.replacements`, preserving count, slot amounts and risk/copy settings. Other count or amount edits retain the existing explicit allocation API. Returned `plan_change` identifies each compared plan; capital concentration and qualitative overlap flags are not measured risk reduction.
-
 
 ### HTTP proxy rate limits
 
