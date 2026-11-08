@@ -341,7 +341,9 @@ export async function startAppAgentRuntime(
   return { closed, close };
 }
 
-export async function runAppAgentRuntime(): Promise<void> {
+export async function runAppAgentRuntime(
+  dependencies: AppRuntimeDependencies = production,
+): Promise<void> {
   const config = appRuntimeConfig(process.env);
   if (!config) {
     process.stdout.write("APP_AGENT_RUNTIME_DISABLED\n");
@@ -350,7 +352,7 @@ export async function runAppAgentRuntime(): Promise<void> {
   const owner = Number(process.env.RIDE_AGENT_APP_OWNER_PID);
   if (
     !Number.isSafeInteger(owner) ||
-    owner <= 1 ||
+    owner < 1 ||
     owner !== process.ppid ||
     process.stdin.isTTY
   )
@@ -386,7 +388,7 @@ export async function runAppAgentRuntime(): Promise<void> {
   try {
     const runtime = await startAppAgentRuntime(
       config,
-      production,
+      dependencies,
       controller.signal,
       markStopping,
     );
