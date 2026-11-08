@@ -9,7 +9,13 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { Express } from "express";
 import { z } from "zod";
-import { AgentError, failure, publicResult, output } from "./contracts.js";
+import {
+  AgentError,
+  failure,
+  publicResult,
+  output,
+  type Result,
+} from "./contracts.js";
 import {
   RIDE_PRIVY_AUTH_PROVIDERS,
   type PrivyAuthorizationInput,
@@ -17,6 +23,79 @@ import {
 } from "../oauth.js";
 import { MemoryHumanHandoffs, type HumanHandoffs } from "./human_handoffs.js";
 import { claudeCardDomain } from "./card_hosts.js";
+
+const humanReads = new Set([
+  "funding",
+  "funding_status",
+  "proposal",
+  "portfolio",
+  "updates",
+  "update",
+]);
+
+/** Gateway boundary only. A failed reply never establishes a failed operation. */
+async function invokeHumanBackend(
+  backend: string,
+  token: string,
+  operation: string,
+  args: unknown,
+  timeoutMs = operation.startsWith("funding") ? 120000 : 25000,
+): Promise<{ response: Response; value: Result }> {
+  let response: Response | undefined;
+  let value: Result;
+  try {
+    response = await fetch(new URL(`/agent/human/${operation}`, backend), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(args),
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+    });
+    value = output.parse(await response.json());
+    if (
+      (response.status >= 500 ||
+        response.status === 401 ||
+        response.status === 403) &&
+      !value.error
+    )
+      throw new Error("Upstream failure without an Agent error");
+  } catch {
+    if (response?.status === 401)
+      throw new AgentError(
+        "AUTH_REQUIRED",
+        "Ride 登录已失效，请重新连接。",
+        false,
+        401,
+      );
+    if (response?.status === 403)
+      throw new AgentError(
+        "ACCESS_DENIED",
+        "Ride 拒绝了此请求，请检查账户权限。",
+        false,
+        403,
+      );
+    const read = humanReads.has(operation);
+    throw new AgentError(
+      read ? "BACKEND_UNAVAILABLE" : "REQUEST_RESULT_UNKNOWN",
+      operation.startsWith("funding")
+        ? "资金请求结果未确认。请先查询资金状态（funding_status），不要重复提交或签名；此错误不代表登录失效。"
+        : read
+          ? "Ride 服务暂时无法返回完整结果，请稍后查询已保存状态。"
+          : "请求结果未确认。请先查询现有提案或账户状态，不要重复提交；此错误不代表登录失效。",
+      read,
+      503,
+    );
+  }
+  // Funding signing evidence stays on the authenticated human surface. The
+  // original public identity guard remains authoritative for other operations.
+  return {
+    response,
+    value: operation.startsWith("funding") ? value : publicResult(value),
+  };
+}
 
 export function mountHumanConfirmation(
   app: Express,
@@ -398,20 +477,20 @@ export function mountHumanConfirmation(
       const exchanged = await options.exchange(input);
       // Authentication alone must not mint a session for someone else's deposit.
       // This read never refreshes a quote, signs, activates or submits funding.
-      const response = await fetch(
-        new URL("/agent/human/funding", options.backend),
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${exchanged.rideAuthToken}`,
-          },
-          body: JSON.stringify({ deposit_id }),
-          signal: AbortSignal.timeout(15000),
-          redirect: "error",
-        },
+      const { response, value } = await invokeHumanBackend(
+        options.backend,
+        exchanged.rideAuthToken,
+        "funding",
+        { deposit_id },
+        15000,
       );
-      const value = output.parse(await response.json());
+      if (response.status === 401 || response.status === 403) {
+        res
+          .status(response.status)
+          .set("Cache-Control", "no-store")
+          .json(value);
+        return;
+      }
       if (
         !response.ok ||
         value.error ||
@@ -523,27 +602,12 @@ export function mountHumanConfirmation(
         }
         token = session.token;
       }
-      const response = await fetch(
-        new URL(`/agent/human/${req.params.operation}`, options.backend),
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify(req.body),
-          signal: AbortSignal.timeout(
-            req.params.operation.startsWith("funding") ? 120000 : 25000,
-          ),
-          redirect: "error",
-        },
+      const { response, value } = await invokeHumanBackend(
+        options.backend,
+        token,
+        req.params.operation,
+        req.body,
       );
-      const body = await response.json();
-      // Verified signing challenges belong only to this authenticated human
-      // page; MCP routes continue to reject raw trading identities.
-      const value = req.params.operation.startsWith("funding")
-        ? output.parse(body)
-        : publicResult(body);
       res.status(response.status).set("Cache-Control", "no-store").json(value);
     } catch (e) {
       res
