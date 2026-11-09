@@ -1,7 +1,7 @@
 # Rider 系统架构
 
 
-核对范围：Node 业务模块源码 `dd6dacd0159b8dd83c320b163d74864befc96fa0`，App 托管/流式 relay 源码 `4ffc2965575d9c23a2812f0f8425f990c16a7d62`。这里描述代码实现；生产切换核对时点、运行身份和观察边界见 [status](status.md)，不从合并或构建成功推定已切换。
+核对范围：Node 业务模块源码 `18826aa6945239205a29bf6df6bccc7c4534b828`，App 托管/流式 relay 源码 `4ffc2965575d9c23a2812f0f8425f990c16a7d62`。这里描述代码实现；生产切换核对时点、运行身份和观察边界见 [status](status.md)，不从合并或构建成功推定已切换。
 
 ## 托管部署的组件与边界
 
@@ -28,7 +28,7 @@ flowchart LR
 | Node backend / bridge / session RPC | App 冻结模块 → `src/app_runtime.ts`，仅 `127.0.0.1:3344/3355/3366` | 原 Agent 状态机、monitor、owned ledger、稳定 outbox、Core S2S、App Redis session RPC |
 | Core / worker | `predictly_server` 的既有服务 | 最终 ownership/epoch、签名、下单和对账；本次托管不替换财务授权 |
 
-App 的构建、固定源码包及模块 manifest、门控和 owner 升级方式见 [App runtime](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/deploy/agent-runtime/README.md)；完整迁移与 reverse rollback 见 [迁移 runbook](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/scripts/ride-agent-migration/README.md)。同集群的 `ride_agent_app` 是独立数据库，由专用角色持有 Agent 对象；Core 仍使用自己的数据库。
+App 的构建、固定源码包及模块 manifest、门控和 owner 升级方式见 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md)；完整迁移与 reverse rollback 见 [迁移 runbook](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/scripts/ride-agent-migration/README.md)。同集群的 `ride_agent_app` 是独立数据库，由专用角色持有 Agent 对象；Core 仍使用自己的数据库。
 
 `RIDE_AGENT_CORE_URL` 保留原完整配置，不改成 loopback Core；其 origin/path 参与 `CoreBridge.perpsCostOwner` 的指纹，迁址会改变预算/读取身份。只有业务 backend→bridge 在进程内使用 `127.0.0.1:3355`。Rust 业务 relay 的 130 秒 deadline 包容原 human funding 120 秒调用；原用户请求结果未确认时先查状态，不自动重提或重签。
 
@@ -47,11 +47,17 @@ App 的构建、固定源码包及模块 manifest、门控和 owner 升级方式
 
 ## 状态存储与并发
 
-`repository.ts` 的 `ride_agent_state` 保存当前状态和完整财务/未知执行证据；历史 updates/decisions 惰性迁出到同库冷表，原 payload、稳定 ID/ordinal 与完整读取兼容保留。原生 eligibility/latest 投影避免每轮解压全量历史；仅重复抑制使用 recent256 上限，due/claim/ACK/digest 与当前财务状态独立。详见 [冷热历史存储与回退边界](agent-history-storage.md)。所有业务及冷表迁移仍在原用户行锁事务内完成；cursor 的原用户绑定与签名 key 保留。
+`repository.ts` 的 `ride_agent_state` 保存当前状态和完整财务/未知执行证据；历史 updates/decisions/performance 惰性迁出到同库冷表，原 payload、稳定 ID/ordinal 与完整读取兼容保留。原生 eligibility/latest 投影避免每轮解压全量历史；仅重复抑制使用 recent256 上限，due/claim/ACK/digest 与当前财务状态独立。详见 [冷热历史存储与回退边界](agent-history-storage.md)。所有业务及冷表迁移仍在原用户行锁事务内完成；cursor 的原用户绑定与签名 key 保留。
 
 bridge 以 `ride_agent_core_outbox` 保存 execution ID、fingerprint、payload、response；`prediction.ts` 创建 prediction 辅助表并负责 opaque receipt/token/outcome metadata。Core 自己的 ownership 和交易表位于另一仓，Agent 数据库不是完整交易真相。
 
 每个 Agent DB 只有一个受管 monitor，以专用 PG session advisory lock 持有到 backend→bridge→session RPC 完整 drain 后释放。旧 standalone binary 不遵守此锁，因此 cutover 必须先停旧 monitor。Node 以 Rust stdin pipe EOF 检测 owner 退出，READY/STOPPING 标记控制准入，45 秒 Node drain、47 秒 Rust 边界由平台 60 秒 draining 窗口包容；owner 自动部署触发器禁用，升级按 stop/drain/锁释放/start 执行。20 秒 SQL、25 秒 driver deadline、失败连接销毁及原 execution ID 对账继续保留；生命周期 fixture 不证明任意硬杀下的端到端真实金融完成。
+
+### Performance cold-store 升级（已核验）
+
+业务模块 `18826aa6945239205a29bf6df6bccc7c4534b828` / archive `36b7dd7309957d27d097147cf5a89d5022cbd48e266e7eaaf0f86c5aed8d789a` 已部署到 `cae47a83-d72d-4b3c-898e-9f58e1113e69`，82 个 compiled module 全部实际核验。新增 `ride_agent_performance`、`ride_agent_performance_heads`、`ride_agent_performance_schema`，同用户行锁内惰性迁移；保留所有原始点和 ordinal，完整读取与 report baseline/连续性维持，monitor 使用最新 head和按需窗口。当前 3 个 eligible owner 无 inline performance；其他懒迁移 owner 的 44 点保留，不宣称全部 12 个 owner 已冷迁移。体积/CPU/RSS 的有界实测及限制见 [status](status.md)。
+
+`dd6dacd` / `0e13ef3` 虽支持此前 updates/decisions 冷表，却不能读取已剥离 performance 的热状态。回退必须先停并 drain owner，保留升级后当前完整数据库的最新 reverse snapshot，以 performance-aware binary 恢复；不能丢弃新写入或换 execution ID 重试。
 
 ## 证据、跟单和账本
 

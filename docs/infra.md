@@ -11,15 +11,15 @@
 |---|---|---|
 | 轻量 MCP gateway | ride-mcp project，service `38891061-9d74-47e6-821e-d4429cb15b6d`；`mcp.onride.me` | 仅 HTTP 访问 App Agent/session RPC；不配置 Agent PG/Redis 直连凭据，issuer/redirects/human cookie key 保留 |
 | App public relay | App project `c172400f-357a-429a-b6c6-43cabe396515`，production `32e1546f-a50d-4fbd-be2c-211680fc58ce`，service `89a5768e-f8d0-49dd-b63f-87f0ab4036d7` | 保持 public GraphQL；透传 Agent Tool/Human 与独立 Session RPC |
-| App private owner | 同项目/环境，service `ae126414-21a9-4795-9a38-5fcd144fd4ea` | 监督固定 Node `dd6dacd0159b8dd83c320b163d74864befc96fa0` 模块，loopback `3344/3355/3366`；一个 monitor/PG session lease |
+| App private owner | 同项目/环境，service `ae126414-21a9-4795-9a38-5fcd144fd4ea` | 监督固定 Node `18826aa6945239205a29bf6df6bccc7c4534b828` 模块，loopback `3344/3355/3366`；一个 monitor/PG session lease |
 | Agent PostgreSQL | App PG service `5faaa2c7-6706-4080-8f69-e4998b0cabe1` | 独立 DB `ride_agent_app`、专用 `ride_agent_runtime` role；全表/函数/序列及冷历史备份，Core DB 不变 |
 | OAuth / handoff Redis | App Redis service `d807b568-c244-48d6-9df8-d69b5109795e` | 原 namespace/opaque records/CAS/TTL；网关通过固定 HTTP RPC，不接收 Redis 凭据 |
 | 旧 backend/bridge | `02b43ebe…` / `b51736db…` | 已停止，无 active/pending deployment；禁止与新 owner 同时启动 |
 | 旧 Agent PG / 两个 Redis | `5d650bf2…`、`52f7bcff…` / `ee96261d…` | 计算已停止，卷与已验证备份保留；旧 PG 停前 read-only 且无业务连接，回退需兼容 binary |
 
-Node 模块、App API 与云部署身份分别记录。源码 pin 不随 docs-only commit 重冻。owner Git/自动部署触发器保持禁用；平台 draining 为 60 秒，升级执行 controlled stop/drain/start。参考 [App runtime](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/deploy/agent-runtime/README.md)、[完整迁移与兼容回退](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/scripts/ride-agent-migration/README.md)。
+Node 模块、App API 与云部署身份分别记录。源码 pin 不随 docs-only commit 重冻。owner Git/自动部署触发器保持禁用；平台 draining 为 60 秒，升级执行 controlled stop/drain/start。参考 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md)、[完整迁移与兼容回退](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/scripts/ride-agent-migration/README.md)。
 
-保留原 `RIDE_AGENT_CORE_URL` 完整值，其 origin/path 是读取预算 owner 指纹的一部分；不要把 Core URL 改为 loopback。进程内 loopback 仅用于 backend→bridge（`127.0.0.1:3355`）。轻量 gateway caller-only 修复的发布 SHA 另外记录，App Node 模块当前 pin `dd6dacd0159b8dd83c320b163d74864befc96fa0`。
+保留原 `RIDE_AGENT_CORE_URL` 完整值，其 origin/path 是读取预算 owner 指纹的一部分；不要把 Core URL 改为 loopback。进程内 loopback 仅用于 backend→bridge（`127.0.0.1:3355`）。轻量 gateway caller-only 修复的发布 SHA 另外记录，App Node 模块当前 pin `18826aa6945239205a29bf6df6bccc7c4534b828`。
 
 ## 服务、账号和需要的权限
 
@@ -45,7 +45,7 @@ Node 模块、App API 与云部署身份分别记录。源码 pin 不随 docs-on
 
 ## 配置与密钥归属
 
-历史静态键名见 [env-inventory](env-inventory.md)；新增托管 runtime/session 配置以 [App runtime](https://github.com/onride-app/predictly_server/blob/665468cc49aaa3cc4b7b50a6831d984e9f91221b/deploy/agent-runtime/README.md) 为准。`.env.example` 是开发起点，不能替代逐服务生产引用核对。
+历史静态键名见 [env-inventory](env-inventory.md)；新增托管 runtime/session 配置以 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md) 为准。`.env.example` 是开发起点，不能替代逐服务生产引用核对。
 
 | 配置组 | 配置方 | 秘密/轮换影响 |
 |---|---|---|
@@ -62,6 +62,12 @@ Node 模块、App API 与云部署身份分别记录。源码 pin 不随 docs-on
 | `RIDE_CONFIG_DIR`或默认私有用户目录 | CLI用户 | OAuth token/session由CLI保存，目录0700/文件0600；无需写入client config |
 | Core flags、Core S2S、`STRATEGY_CONTROL_PLANE_SERVICE_TOKEN` | Core API/gRPC/worker运维 | 本仓只消费既有契约，不在客户端保管签名密钥 |
 | GitHub/npm trusted publisher | release maintainer | workflow用OIDC，无需新增长期 npm token；当前publisher绑定/审批规则 TBD – confirm |
+
+### Performance cold-store 升级（已核验）
+
+业务模块 `18826aa6945239205a29bf6df6bccc7c4534b828` / archive `36b7dd7309957d27d097147cf5a89d5022cbd48e266e7eaaf0f86c5aed8d789a` 已部署到 `cae47a83-d72d-4b3c-898e-9f58e1113e69`，82 个 compiled module 全部实际核验。新增 `ride_agent_performance`、`ride_agent_performance_heads`、`ride_agent_performance_schema`，同用户行锁内惰性迁移；保留所有原始点和 ordinal，完整读取与 report baseline/连续性维持，monitor 使用最新 head和按需窗口。当前 3 个 eligible owner 无 inline performance；其他懒迁移 owner 的 44 点保留，不宣称全部 12 个 owner 已冷迁移。体积/CPU/RSS 的有界实测及限制见 [status](status.md)。
+
+`dd6dacd` / `0e13ef3` 虽支持此前 updates/decisions 冷表，却不能读取已剥离 performance 的热状态。回退必须先停并 drain owner，保留升级后当前完整数据库的最新 reverse snapshot，以 performance-aware binary 恢复；不能丢弃新写入或换 execution ID 重试。
 
 ## 环境与交接步骤
 
