@@ -1233,8 +1233,13 @@ export class AgentService {
                       sleeve.copy_id in (e.unfilled_allocations ?? {})),
                 )
                 .map(
-                  ({ allocations, unfilled_allocations, fingerprint, ...e }) =>
-                    e,
+                  ({
+                    allocations,
+                    unfilled_allocations,
+                    fingerprint,
+                    first_submission_failure: _diagnostic,
+                    ...e
+                  }) => e,
                 ),
               events: s.updates
                 .filter(
@@ -2604,7 +2609,14 @@ export function portfolioView(p: Portfolio, locale?: Locale): Result {
             null,
         })),
         positions,
-        executions: p.executions.map(({ allocations, fingerprint, ...e }) => e),
+        executions: p.executions.map(
+          ({
+            allocations,
+            fingerprint,
+            first_submission_failure: _diagnostic,
+            ...e
+          }) => e,
+        ),
         as_of: snap?.observed_at ?? null,
         loss_trigger_amount_usdc: cash(
           D(p.preferences.budget_usdc)

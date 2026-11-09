@@ -11,6 +11,7 @@ import type { VenueAdapter } from "./adapter.js";
 import { PgRepository, Cursor } from "./repository.js";
 import { AgentService, fromPlan } from "./service.js";
 import { AgentRunner } from "./runner.js";
+import { recordFirstSubmissionFailure } from "./submission-failure-diagnostics.js";
 
 const database = process.env.RIDE_AGENT_TEST_DATABASE_URL;
 if (
@@ -754,6 +755,20 @@ it(
       p.ledger_started_at = f.e.created_at - 1000;
       p.state = "active";
       p.reconciliation = "complete";
+      recordFirstSubmissionFailure(
+        f.e,
+        new AgentError(
+          "EXECUTOR_UNAVAILABLE",
+          "private original response lost",
+          true,
+        ),
+        100,
+        () => f.e.created_at + 1000,
+        () => 200,
+      );
+      const firstSubmissionFailure = structuredClone(
+        f.e.first_submission_failure,
+      );
       p.executions.push(structuredClone(f.e));
       p.sleeves[0].reviewed_at = now();
       const originalPrefs = structuredClone(p.preferences),
@@ -794,6 +809,10 @@ it(
       assert.equal(retired.executions[0].created_at, f.e.created_at);
       assert.equal(retired.executions[0].expires_at, f.e.expires_at);
       assert.equal(retired.executions[0].task_id, null);
+      assert.deepEqual(
+        retired.executions[0].first_submission_failure,
+        firstSubmissionFailure,
+      );
       assert.equal(retired.state, "attention");
       assert.deepEqual(retired.preferences, originalPrefs);
       assert.deepEqual(
@@ -818,6 +837,10 @@ it(
         structuredClone(state.portfolios[0]),
       );
       assert.equal(restarted.executions[0].status, "failed");
+      assert.deepEqual(
+        restarted.executions[0].first_submission_failure,
+        firstSubmissionFailure,
+      );
       assert.deepEqual(
         restarted.executions[0].retirement,
         retired.executions[0].retirement,
