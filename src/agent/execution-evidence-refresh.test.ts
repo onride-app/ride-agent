@@ -178,7 +178,8 @@ function bridgeFixture() {
       submissions.push(structuredClone(payload));
       return { task_id: "task_original" };
     }
-    if (op === "perps_execution") return { status: 2, legs: [] };
+    if (op === "perps_execution")
+      return { task_id: payload.task_id, status: 2, legs: [] };
     return { policy_revision: 1 };
   };
   return { bridge, stub, snap, p, e, outbox, submissions };
@@ -357,7 +358,8 @@ it("reconciles an existing outbox by a read-only original-task proof after expir
       assert.equal(request.expires_at, payload.expires_at);
       return originalAcceptedProof(payload, task);
     }
-    if (op === "perps_execution") return { status: 2, legs: [] };
+    if (op === "perps_execution")
+      return { task_id: request.task_id, status: 2, legs: [] };
     assert.fail(
       "Reconciliation must not resubmit or rewrite the original admission",
     );
@@ -400,7 +402,8 @@ it("recovers a Core-accepted response loss by read-only proof of the same execut
       assert.equal(accepted.has(payload.execution_id), true);
       return originalAcceptedProof(f.outbox.get(f.e.id).payload, task);
     }
-    if (op === "perps_execution") return { status: 2, legs: [] };
+    if (op === "perps_execution")
+      return { task_id: payload.task_id, status: 2, legs: [] };
     return { policy_revision: 1 };
   };
   try {
@@ -523,7 +526,7 @@ for (const issue of ["backwards time", "changed revision at the same time"])
     assert.equal(f.adapter.submitCount, 0);
   });
 
-it("does not submit an expired uncertain target after reconciliation reports it was not accepted", async () => {
+it("does not retire or submit an expired uncertain Perps target from a bare failed response without a permanent original-ID receipt", async () => {
   const p = portfolio();
   p.executions = [execution("uncertain", true)];
   const f = await runnerFixture(p);
@@ -535,7 +538,7 @@ it("does not submit an expired uncertain target after reconciliation reports it 
   await f.runner.tick("alice");
   const saved = await f.read();
   assert.equal(f.adapter.submitCount, 0);
-  assert.equal(saved.executions[0].status, "failed");
+  assert.equal(saved.executions[0].status, "uncertain");
 });
 
 it("keeps expired uncertain work unresolved when acceptance cannot be determined", async () => {

@@ -51,6 +51,8 @@ App 的构建、固定源码包及模块 manifest、门控和 owner 升级方式
 
 bridge 以 `ride_agent_core_outbox` 保存 execution ID、fingerprint、payload、response；`prediction.ts` 创建 prediction 辅助表并负责 opaque receipt/token/outcome metadata。Core 自己的 ownership 和交易表位于另一仓，Agent 数据库不是完整交易真相。
 
+本地 Perps outbox 缺失时，通过 Core 的同身份、同 wallet generation/epoch 正证据恢复已有 task；空仓或 not-found 不能清除 uncertain。独立的明确写协议可在 Core 同锁完整历史证据检查后建立永久原 ID 拒绝 fence，Node 将 typed receipt 保存到原 execution，不补造冻结 payload。read-only 不调用退休写操作，退休代码不修改风控或重新激活组合。具体边界和隔离回归见[原执行恢复](execution-recovery.md)；这项代码能力不等于旧未知执行已在生产解除。
+
 每个 Agent DB 只有一个受管 monitor，以专用 PG session advisory lock 持有到 backend→bridge→session RPC 完整 drain 后释放。旧 standalone binary 不遵守此锁，因此 cutover 必须先停旧 monitor。Node 以 Rust stdin pipe EOF 检测 owner 退出，READY/STOPPING 标记控制准入，45 秒 Node drain、47 秒 Rust 边界由平台 60 秒 draining 窗口包容；owner 自动部署触发器禁用，升级按 stop/drain/锁释放/start 执行。20 秒 SQL、25 秒 driver deadline、失败连接销毁及原 execution ID 对账继续保留；生命周期 fixture 不证明任意硬杀下的端到端真实金融完成。
 
 ### Performance cold-store 升级（已核验）

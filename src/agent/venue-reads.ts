@@ -43,7 +43,28 @@ type AccountReadScope = {
   durableAttempted?: boolean;
   monotonicUntil: number;
   planAttempt?: object;
+  frameLease?: AccountReadFrameLease;
+  releasedFrames?: Set<string>;
+  queueUntil: number;
+  activateEvidenceDeadline?(): void;
 };
+export type AccountReadFrameLease = {
+  frame_id: string;
+  expires_at: number;
+};
+/** Authenticated fleet admission; it must use the existing shared ledger. */
+export interface AccountReadFrameCoordinator {
+  readonly capacity: number;
+  begin(
+    owner: string,
+    weight: number,
+    deadlineMs: number,
+    signal: AbortSignal,
+    mode: "learned" | "cold_trial",
+  ): Promise<AccountReadFrameLease>;
+  end(frameId: string): Promise<void>;
+  close?(): Promise<void>;
+}
 type Counters = {
   calls: number;
   cache_hit: number;
@@ -122,6 +143,7 @@ export interface VenueReadOptions {
   observationPlans?: ObservationPlanStore;
   requireObservationPlanBinding?: boolean;
   monotonicClock?: () => number;
+  frameCoordinator?: AccountReadFrameCoordinator;
 }
 
 // Completed account evidence is never reused. Metadata TTL and same-lane
@@ -138,6 +160,14 @@ export class VenueReads {
   private readonly observationPlans?: ObservationPlanStore;
   private readonly requireObservationPlanBinding: boolean;
   private readonly monotonicClock: () => number;
+  private readonly frameCoordinator?: AccountReadFrameCoordinator;
+  private frames = {
+    admitted: 0,
+    denied: 0,
+    capacity_trials: 0,
+    released: 0,
+    release_failed: 0,
+  };
   private counts = counters();
   private costPlans = costPlanCounters();
   private accountObservations = new Set<Promise<unknown>>();
@@ -166,6 +196,18 @@ export class VenueReads {
     this.requireObservationPlanBinding =
       options.requireObservationPlanBinding ?? false;
     this.monotonicClock = options.monotonicClock ?? (() => performance.now());
+    this.frameCoordinator = options.frameCoordinator;
+    if (
+      this.frameCoordinator &&
+      (!Number.isSafeInteger(this.frameCoordinator.capacity) ||
+        this.frameCoordinator.capacity < 120 ||
+        this.frameCoordinator.capacity > 1200)
+    )
+      throw new RangeError("Fleet observation capacity must be bounded");
+    if (this.frameCoordinator && this.transport !== "core_shared_info")
+      throw new RangeError(
+        "Fleet observation admission requires authenticated Core reads",
+      );
     if (
       !Number.isSafeInteger(this.deadlineMs) ||
       this.deadlineMs < 1 ||
@@ -197,6 +239,7 @@ export class VenueReads {
       budget: this.budget.snapshot(),
       counts: { ...this.counts },
       cost_plans: { ...this.costPlans },
+      frames: { ...this.frames },
       methods: [...this.byMethod].map(([purpose_method, values]) => ({
         purpose_method,
         ...values,
@@ -252,11 +295,26 @@ export class VenueReads {
       admission: new AbortController(),
       owner,
       monotonicUntil: this.monotonicClock() + 20000,
+      queueUntil: this.clock() + 100000,
     };
-    const timer = this.timers.setTimeout(
+    let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
       20000,
     );
+    scope.activateEvidenceDeadline = () => {
+      if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
+      this.timers.clearTimeout(timer);
+      scope.until = Math.min(
+        this.clock() + 20000,
+        scope.frameLease!.expires_at,
+      );
+      const remaining = Math.max(0, scope.until - this.clock());
+      scope.monotonicUntil = this.monotonicClock() + remaining;
+      timer = this.timers.setTimeout(
+        () => scope.admission.abort(this.accountDeadline()),
+        remaining,
+      );
+    };
     const observing = this.accountScope.run(scope, async () => {
       let abort!: () => void;
       const cancelled = new Promise<never>((_, reject) => {
@@ -319,6 +377,7 @@ export class VenueReads {
       } finally {
         if (!finalizing) cleanup();
         scope.reservation?.close(complete);
+        this.releaseFrame(scope);
       }
     });
     this.accountObservations.add(observing);
@@ -330,8 +389,92 @@ export class VenueReads {
   }
   async drainAccounts(): Promise<void> {
     this.draining = true;
+    await this.frameCoordinator?.close?.();
     await Promise.allSettled([...this.accountObservations]);
-    await Promise.allSettled([...this.accountFinalizers]);
+    // A cancelled admission may resolve late and add its release finalizer.
+    // Drain that release too, rather than snapshotting the set only once.
+    while (this.accountFinalizers.size)
+      await Promise.allSettled([...this.accountFinalizers]);
+  }
+  private releaseFrame(scope: AccountReadScope): void {
+    if (!scope.frameLease || !this.frameCoordinator) return;
+    const frameId = scope.frameLease.frame_id;
+    scope.releasedFrames ??= new Set();
+    if (scope.releasedFrames.has(frameId)) return;
+    scope.releasedFrames.add(frameId);
+    scope.frameLease = undefined;
+    // end releases only the unused Core booking. Sent or uncertain requests
+    // remain charged in Core's shared rolling ledger, independent of this call.
+    const releasing = Promise.resolve()
+      .then(() => this.frameCoordinator!.end(frameId))
+      .then(
+        () => {
+          this.frames.released++;
+        },
+        () => {
+          this.frames.release_failed++;
+        },
+      );
+    this.accountFinalizers.add(releasing);
+    void releasing.finally(() => this.accountFinalizers.delete(releasing));
+  }
+  private async reserveFrame(
+    scope: AccountReadScope,
+    reservation: AccountReadReservation,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!this.frameCoordinator) return;
+    const coordinator = this.frameCoordinator;
+    // The cold local plan is a full-process-window placeholder (1000), not a
+    // proven provider cost. An explicit capacity trial books at most Core's
+    // hard capacity without rewriting that hint or promising completeness.
+    // If actual scope exceeds the booking, Core must reject the continuation;
+    // no partial account evidence or reduced history can become a success.
+    const weight = Math.min(reservation.weight, coordinator.capacity);
+    if (weight < reservation.weight) this.frames.capacity_trials++;
+    const pending = coordinator
+      .begin(
+        scope.owner!,
+        weight,
+        scope.queueUntil,
+        signal,
+        weight < reservation.weight ? "cold_trial" : "learned",
+      )
+      .then((lease) => {
+        if (
+          !lease ||
+          typeof lease.frame_id !== "string" ||
+          !/^[A-Za-z0-9_-]{16,128}$/.test(lease.frame_id)
+        )
+          throw costPlanUnavailable();
+        scope.frameLease = lease;
+        if (
+          !Number.isSafeInteger(lease.expires_at) ||
+          lease.expires_at > this.clock() + 20000 ||
+          this.clock() > scope.queueUntil
+        ) {
+          this.releaseFrame(scope);
+          throw costPlanUnavailable();
+        }
+        if (signal.aborted || lease.expires_at <= this.clock()) {
+          this.releaseFrame(scope);
+          throw signal.aborted ? signal.reason : this.accountDeadline();
+        }
+        scope.activateEvidenceDeadline!();
+        this.frames.admitted++;
+      });
+    this.accountFinalizers.add(pending);
+    void pending.then(
+      () => this.accountFinalizers.delete(pending),
+      () => this.accountFinalizers.delete(pending),
+    );
+    try {
+      await this.abortable(pending, signal);
+      this.accountReadTimeout();
+    } catch (error) {
+      this.frames.denied++;
+      throw error;
+    }
   }
   private invalidateCostPlan(scope: AccountReadScope): void {
     if (
@@ -455,6 +598,18 @@ export class VenueReads {
       if (deferred && this.clock() > until) throw deferred;
       try {
         const reservation = this.budget.beginObservation(scope.owner!);
+        // Fleet admission happens before any account venue read and before
+        // dirtying a durable cost-plan lease. A denied fleet booking must not
+        // consume a cheap prefix repeatedly or pretend that a full frame ran.
+        scope.reservation = reservation;
+        try {
+          await this.reserveFrame(scope, reservation, signal);
+        } catch (error) {
+          reservation.close(false);
+          scope.reservation = undefined;
+          this.releaseFrame(scope);
+          throw error;
+        }
         if (this.observationPlans && durableHint) {
           scope.durableAttempted = true;
           // Record the reservation before awaiting the claim so cancellation
@@ -487,7 +642,8 @@ export class VenueReads {
       } catch (error) {
         const retry =
           error instanceof AgentError &&
-          error.code === "VENUE_READ_BUDGET_EXHAUSTED"
+          error.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+          error.details?.reason_code !== "READ_FRAME_PENDING"
             ? error.details?.retry_after_ms
             : undefined;
         if (
@@ -734,7 +890,13 @@ export class VenueReads {
       // Bound HTTP/JSON work to 12 seconds after admission instead of consuming
       // its wire window in the queue; the whole-operation boundary stays 20s.
       const wire = new AbortController();
-      const wireMs = this.accountReadTimeout(this.deadlineMs);
+      const wireMs = Math.min(
+        this.accountReadTimeout(this.deadlineMs),
+        scope?.frameLease
+          ? Math.max(0, scope.frameLease.expires_at - this.clock())
+          : this.deadlineMs,
+      );
+      if (wireMs <= 0) throw this.accountDeadline();
       const wireDeadline = this.clock() + wireMs;
       wireTimer = this.timers.setTimeout(
         () =>
@@ -778,7 +940,15 @@ export class VenueReads {
               signal: wireSignal,
               redirect: "error",
             },
-            { deadline_ms: wireDeadline },
+            {
+              deadline_ms: wireDeadline,
+              ...(scope?.frameLease
+                ? {
+                    frame_id: scope.frameLease.frame_id,
+                    frame_owner: scope.owner!,
+                  }
+                : {}),
+            },
           ),
           wireSignal,
         );

@@ -43,6 +43,14 @@ export function coreInfoFetcher(
     )
       throw new CoordinatedReadError("VENUE_READ_DEADLINE", false);
     if (init.signal?.aborted) throw init.signal.reason;
+    if (
+      (context.frame_id !== undefined || context.frame_owner !== undefined) &&
+      (typeof context.frame_id !== "string" ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(context.frame_id) ||
+        typeof context.frame_owner !== "string" ||
+        !/^[0-9a-f]{64}$/.test(context.frame_owner))
+    )
+      throw new CoordinatedReadError("VENUE_READ_UNSUPPORTED", false);
     const response = await request(endpoint, {
       method: "POST",
       headers: {
@@ -52,6 +60,12 @@ export function coreInfoFetcher(
       body: JSON.stringify({
         request: JSON.parse(String(init.body)),
         deadline_ms: context.deadline_ms,
+        ...(context.frame_id
+          ? {
+              frame_id: context.frame_id,
+              frame_owner: context.frame_owner,
+            }
+          : {}),
       }),
       signal: init.signal,
       redirect: "error",

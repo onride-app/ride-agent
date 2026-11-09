@@ -38,6 +38,8 @@ type Waiter = {
 };
 export interface AccountReadReservation {
   readonly id: number;
+  /** Operational frame estimate, never a provider quota increase or evidence. */
+  readonly weight: number;
   close(complete?: boolean): void;
   costPlan(): ObservationCostPlan | null;
 }
@@ -383,6 +385,7 @@ export class VenueReadBudget {
     let learnedCostPlan: ObservationCostPlan | null = null;
     const ticket: AccountReadReservation = {
       id: ++this.observationSequence,
+      weight: entry.demand,
       costPlan: () =>
         learnedCostPlan
           ? {
@@ -452,6 +455,20 @@ export class VenueReadBudget {
   private finishObservation() {
     const frame = this.observation;
     if (!frame?.closed || frame.pending) return;
+    // Fleet admission may reject before the first dispatch. That is no cost
+    // sample and no evidence of scope growth: preserve a valid learned hint
+    // rather than replacing it with the cold full-window placeholder.
+    if (
+      !frame.complete &&
+      frame.committed === 0 &&
+      !frame.grew &&
+      !frame.hadUncertain &&
+      !frame.sampleInvalid
+    ) {
+      this.observation = undefined;
+      this.pump();
+      return;
+    }
     // Include a metadata miss margin. An expanding scope/history raises the
     // high-water mark before admission and fails closed if it cannot fit.
     const previous =
