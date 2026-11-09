@@ -13,6 +13,7 @@ import {
 } from "./venue-read-transport.js";
 import {
   sharedVenueReadBudget,
+  ObservationPacingDeferred,
   readTimers,
   type BudgetTimers,
   type ReadLane,
@@ -51,6 +52,11 @@ type AccountReadScope = {
 export type AccountReadFrameLease = {
   frame_id: string;
   expires_at: number;
+};
+/** Trusted caller lifetime, separate from the fleet's pending booking lifetime. */
+export type AccountObservationLimits = {
+  signal?: AbortSignal;
+  deadlineMs?: number;
 };
 /** Authenticated fleet admission; it must use the existing shared ledger. */
 export interface AccountReadFrameCoordinator {
@@ -171,6 +177,7 @@ export class VenueReads {
   private counts = counters();
   private costPlans = costPlanCounters();
   private accountObservations = new Set<Promise<unknown>>();
+  private activeAccountScopes = new Set<AccountReadScope>();
   private accountFinalizers = new Set<Promise<void>>();
   private draining = false;
   private byMethod = new Map<string, Counters>();
@@ -286,30 +293,55 @@ export class VenueReads {
       throw this.unavailable();
     }
   }
-  async observeAccount<T>(work: () => Promise<T>, owner?: string): Promise<T> {
+  async observeAccount<T>(
+    work: () => Promise<T>,
+    owner?: string,
+    limits: AccountObservationLimits = {},
+  ): Promise<T> {
     if (this.accountScope.getStore()) return work();
     if (this.draining) throw costPlanUnavailable();
+    if (
+      limits.deadlineMs !== undefined &&
+      !Number.isSafeInteger(limits.deadlineMs)
+    )
+      throw this.accountDeadline();
+    const remaining = Math.min(
+      20000,
+      (limits.deadlineMs ?? Infinity) - this.clock(),
+    );
+    if (remaining <= 0) throw this.accountDeadline();
     const scope: AccountReadScope = {
       id: ++this.accountSequence,
-      until: this.clock() + 20000,
+      until: this.clock() + remaining,
       admission: new AbortController(),
       owner,
-      monotonicUntil: this.monotonicClock() + 20000,
+      monotonicUntil: this.monotonicClock() + remaining,
       queueUntil: this.clock() + 100000,
     };
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
-      20000,
+      remaining,
     );
+    const callerCancelled = () => scope.admission.abort(limits.signal!.reason);
+    limits.signal?.addEventListener("abort", callerCancelled, { once: true });
+    if (limits.signal?.aborted) callerCancelled();
+    this.activeAccountScopes.add(scope);
     scope.activateEvidenceDeadline = () => {
       if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
       this.timers.clearTimeout(timer);
-      scope.until = Math.min(
-        this.clock() + 20000,
-        scope.frameLease!.expires_at,
+      scope.until = Math.min(scope.until, scope.frameLease!.expires_at);
+      const remaining = Math.max(
+        0,
+        Math.min(
+          scope.until - this.clock(),
+          scope.monotonicUntil - this.monotonicClock(),
+        ),
       );
-      const remaining = Math.max(0, scope.until - this.clock());
-      scope.monotonicUntil = this.monotonicClock() + remaining;
+      scope.monotonicUntil = Math.min(
+        scope.monotonicUntil,
+        this.monotonicClock() + remaining,
+      );
+      if (remaining <= 0) throw this.accountDeadline();
       timer = this.timers.setTimeout(
         () => scope.admission.abort(this.accountDeadline()),
         remaining,
@@ -326,8 +358,10 @@ export class VenueReads {
       const cleanup = () => {
         this.timers.clearTimeout(timer);
         scope.admission.signal.removeEventListener("abort", abort);
+        limits.signal?.removeEventListener("abort", callerCancelled);
       };
       try {
+        if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
         const value = await Promise.race([work(), cancelled]);
         this.accountReadTimeout();
         // All successful work has returned before cost publication. A failed,
@@ -385,10 +419,17 @@ export class VenueReads {
       return await observing;
     } finally {
       this.accountObservations.delete(observing);
+      this.activeAccountScopes.delete(scope);
     }
   }
   async drainAccounts(): Promise<void> {
     this.draining = true;
+    for (const scope of this.activeAccountScopes)
+      // Cancel only fleet admissions still waiting for their local ticket.
+      // Already admitted reads retain the original graceful completion and
+      // durable cost-plan publication before the database pool is closed.
+      if (this.frameCoordinator && !scope.reservation)
+        scope.admission.abort(costPlanUnavailable());
     await this.frameCoordinator?.close?.();
     await Promise.allSettled([...this.accountObservations]);
     // A cancelled admission may resolve late and add its release finalizer.
@@ -525,7 +566,12 @@ export class VenueReads {
     const scope = this.accountScope.getStore();
     if (!scope) return maximum;
     if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
-    const left = Math.ceil(scope.until - this.clock());
+    const left = Math.ceil(
+      Math.min(
+        scope.until - this.clock(),
+        scope.monotonicUntil - this.monotonicClock(),
+      ),
+    );
     if (left <= 0) throw this.accountDeadline();
     return Math.min(maximum, left);
   }
@@ -533,11 +579,11 @@ export class VenueReads {
     scope: AccountReadScope,
   ): Promise<AccountReadReservation> {
     // A near-ready FIFO slot should not be lost to a complete monitor cycle's
-    // reconciliation and commit work. Wait only before the first venue read,
-    // for at most one second in total, inside the original account deadline.
-    // Without fleet coordination, every near-ready retry passes the same local
-    // whole-observation gate. A Core grant instead makes one local attempt;
-    // a denial releases its unused fleet booking before returning to the runner.
+    // reconciliation and commit work. Uncoordinated reads retain their original
+    // one-second wait. Fleet grants may wait only for known local pacing.
+    // The original scope,
+    // caller and Core lease deadlines keep running; quota and FIFO denials
+    // release unused fleet credit immediately.
     const until = Math.min(scope.until, this.clock() + 1000);
     const signal = this.callerSignal
       ? AbortSignal.any([scope.admission.signal, this.callerSignal])
@@ -629,7 +675,8 @@ export class VenueReads {
     for (;;) {
       if (signal.aborted) throw signal.reason;
       this.accountReadTimeout();
-      if (deferred && this.clock() > until) throw deferred;
+      if (!this.frameCoordinator && deferred && this.clock() > until)
+        throw deferred;
       try {
         const reservation = this.budget.beginObservation(
           scope.owner!,
@@ -684,10 +731,10 @@ export class VenueReads {
         }
         return reservation;
       } catch (error) {
-        if (this.frameCoordinator) {
-          // Local quota, FIFO, cooldown and pacing remain authoritative even
-          // after a Core grant. Return that grant's unused credit immediately;
-          // do not poll a second fleet booking in this user transaction.
+        const fleetPacing =
+          this.frameCoordinator && error instanceof ObservationPacingDeferred;
+        const waitUntil = fleetPacing ? scope.until : until;
+        if (this.frameCoordinator && !fleetPacing) {
           this.releaseFrame(scope);
           throw error;
         }
@@ -701,9 +748,17 @@ export class VenueReads {
           typeof retry !== "number" ||
           !Number.isSafeInteger(retry) ||
           retry < 1 ||
-          retry > until - this.clock()
-        )
+          (fleetPacing
+            ? retry >=
+              Math.min(
+                waitUntil - this.clock(),
+                scope.monotonicUntil - this.monotonicClock(),
+              )
+            : retry > waitUntil - this.clock())
+        ) {
+          if (this.frameCoordinator) this.releaseFrame(scope);
           throw error;
+        }
         deferred = error;
         await new Promise<void>((resolve, reject) => {
           const cancel = () => {
