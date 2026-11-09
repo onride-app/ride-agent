@@ -2452,6 +2452,7 @@ export class CoreBridge {
       (await this.retireOriginalExecution(user, p, e, proofDeadline)) ??
       uncertain;
     if (e.retirement !== undefined) {
+      if (e.task_id !== null && e.task_id !== undefined) return uncertain;
       const request = perpsRecoveryRequest(user, this.perpsBinding(p), e);
       const receipt =
         request && persistedPerpsRetirement(request, e.retirement, now());
@@ -2527,8 +2528,7 @@ export class CoreBridge {
           now(),
         );
         if (proof.kind === "unknown") return retireOrUncertain();
-        if (proof.kind === "not_accepted_expired")
-          return retireOrUncertain();
+        if (proof.kind === "not_accepted_expired") return retireOrUncertain();
         task = proof.task_id;
         await this.pool.query(
           "UPDATE ride_agent_core_outbox SET response=$2 WHERE execution_id=$1",
