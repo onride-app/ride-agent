@@ -609,6 +609,22 @@ it(
         [],
         "A committed permanent receipt needs no new external write after restart",
       );
+      const conflict = {
+        ...durable,
+        task_id: f.task,
+        status: "submitted" as const,
+      };
+      assert.deepEqual(await f.bridge().execution(f.user, f.p, conflict), {
+        status: "uncertain",
+        observed_quantity: null,
+        settled: false,
+      });
+      assert.equal(
+        conflict.task_id,
+        f.task,
+        "Conflicting stored retirement and accepted task must never clear the task fence",
+      );
+      assert.deepEqual(f.calls, []);
       await assert.rejects(
         f.bridge().submit(f.user, f.p, { ...durable, status: "queued" }),
         { code: "EXECUTION_REJECTED" },

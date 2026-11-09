@@ -65,8 +65,9 @@ unknown 转终态；新写协议不支持或证明不足时保持 unknown。没�
 特别是旧记录缺少原始锚点时，部署新代码后仍会保持 uncertain。
 
 永久退休协议还须先应用 Core 的
-`20261110000001_agent_original_execution_retirement.sql`（含旧 writer barrier 和插入
-guard），再部署 Core RPC/API，最后更新 Node。回退必须保留已产生的 tombstone 和
+`deploy/sql/agent_original_execution_retirement.sql`（含旧 writer barrier、插入 guard
+和独立 schema receipt，不加入全局 SQLx migrations），再部署 Core RPC/API，最后
+更新 Node。operator 必须核实实役 runtime/writer roles 的表权限。回退必须保留已产生的 tombstone 和
 数据库 guard，不能用旧快照覆盖永久拒绝证据。
 
 本地回归：
