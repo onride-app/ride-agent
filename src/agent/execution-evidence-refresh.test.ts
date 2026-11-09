@@ -185,6 +185,78 @@ function bridgeFixture() {
   return { bridge, stub, snap, p, e, outbox, submissions };
 }
 
+it("bounds fresh pre-outbox account evidence by execution expiry and the trusted caller deadline", async () => {
+  const f = bridgeFixture(),
+    stop = new AbortController();
+  const until = Math.min(f.e.expires_at, now() + 1000);
+  f.stub.perpsAccount = async (
+    _user: string,
+    _p: unknown,
+    bind: boolean,
+    limits: any,
+  ) => {
+    assert.equal(bind, false);
+    assert.equal(limits.signal, stop.signal);
+    assert.equal(limits.deadlineMs, until);
+    return f.snap;
+  };
+  try {
+    await f.bridge.submit("alice", f.p, f.e, {
+      signal: stop.signal,
+      deadlineMs: until,
+    });
+  } finally {
+    await f.bridge.close();
+  }
+});
+
+it("rechecks disconnect and the original trusted deadline after shared source waits before the first outbox INSERT", async (t) => {
+  let clock = now();
+  t.mock.method(Date, "now", () => clock);
+  for (const kind of ["disconnect", "deadline"] as const) {
+    const f = bridgeFixture(),
+      stop = new AbortController(),
+      deadlineMs = clock + 1000;
+    f.stub.source = async () => {
+      if (kind === "disconnect") stop.abort(new Error("fixture disconnected"));
+      else clock += 1001;
+      return source();
+    };
+    try {
+      await assert.rejects(
+        f.bridge.submit("alice", f.p, f.e, { signal: stop.signal, deadlineMs }),
+      );
+      assert.equal(f.outbox.size, 0);
+      assert.equal(f.submissions.length, 0);
+    } finally {
+      await f.bridge.close();
+    }
+  }
+});
+
+it("an expired read caller does not cancel an already frozen original acceptance", async () => {
+  const f = bridgeFixture(),
+    stop = new AbortController();
+  try {
+    const first = await f.bridge.submit("alice", f.p, f.e);
+    const frozen = structuredClone(f.outbox.get(f.e.id));
+    stop.abort(new Error("fixture disconnected"));
+    f.stub.perpsAccount = () =>
+      assert.fail("frozen work must not prepare fresh evidence");
+    assert.deepEqual(
+      await f.bridge.submit("alice", f.p, f.e, {
+        signal: stop.signal,
+        deadlineMs: 1,
+      }),
+      first,
+    );
+    assert.deepEqual(f.outbox.get(f.e.id), frozen);
+    assert.equal(f.submissions.length, 1);
+  } finally {
+    await f.bridge.close();
+  }
+});
+
 it("recovers pre-outbox read throttling with fresh unchanged-source proof while preserving the old target and price anchor", async () => {
   const f = bridgeFixture();
   const before = structuredClone(f.p.sleeves[0].intents[key]);

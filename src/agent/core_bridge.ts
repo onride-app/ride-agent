@@ -15,7 +15,7 @@ import {
 import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
-import { VenueReads } from "./venue-reads.js";
+import { VenueReads, type AccountObservationLimits } from "./venue-reads.js";
 import { drainBridge } from "./bridge-shutdown.js";
 import {
   AccountObservationPlans,
@@ -24,6 +24,7 @@ import {
 import { coreInfoFetcher } from "./core-info-reads.js";
 import { coreFrameCoordinator } from "./core-frame-coordinator.js";
 import { notificationCancellation } from "./notification-cancellation.js";
+import { submitObservationCancellation } from "./submit-observation-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
 import {
   VenueOrderSnapshots,
@@ -1137,6 +1138,7 @@ export class CoreBridge {
     user: string,
     p: Portfolio | null,
     bind = false,
+    observation?: AccountObservationLimits,
   ): Promise<AccountSnapshot> {
     return this.venueReads.observeAccount(
       () => this.readPerpsAccount(user, p, bind),
@@ -1154,6 +1156,7 @@ export class CoreBridge {
           ),
         ].sort(),
       ]),
+      observation,
     );
   }
   private perpsCostOwner(
@@ -2158,6 +2161,7 @@ export class CoreBridge {
     user: string,
     p: Portfolio,
     e: Execution,
+    observation?: AccountObservationLimits,
   ): Promise<{ task_id: string }> {
     if (e.retirement !== undefined)
       throw new AgentError(
@@ -2201,7 +2205,10 @@ export class CoreBridge {
         );
       payload = saved.rows[0].payload;
     } else {
-      const snap = await this.perpsAccount(user, p);
+      const snap = await this.perpsAccount(user, p, false, {
+        signal: observation?.signal,
+        deadlineMs: Math.min(e.expires_at, observation?.deadlineMs ?? Infinity),
+      });
       if (
         snap.manual_markets?.some(
           (handoff) => e.key === `perps:${handoff.coin}`,
@@ -2355,6 +2362,19 @@ export class CoreBridge {
         throw new AgentError(
           "EXECUTION_REJECTED",
           "Target expired during evidence checks; fresh planning is required.",
+        );
+      // Only a fresh, not-yet-outboxed submission can stop here. Existing
+      // frozen actions keep their original acceptance/reconciliation path.
+      if (observation?.signal?.aborted) throw observation.signal.reason;
+      if (
+        observation?.deadlineMs !== undefined &&
+        observation.deadlineMs <= now()
+      )
+        throw new AgentError(
+          "VENUE_READ_DEADLINE",
+          "Fresh submission evidence deadline expired.",
+          true,
+          503,
         );
       await this.pool.query(
         "INSERT INTO ride_agent_core_outbox(execution_id,user_id,portfolio_id,fingerprint,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
@@ -2741,6 +2761,7 @@ export class CoreBridge {
     op: string,
     input: any,
     notificationCaller?: AbortSignal,
+    submitObservation?: AccountObservationLimits,
   ): Promise<unknown> {
     switch (op) {
       case "read_plan_evidence":
@@ -2917,7 +2938,12 @@ export class CoreBridge {
       case "account":
         return this.account(input.user_id, input.portfolio);
       case "submit":
-        return this.submit(input.user_id, input.portfolio, input.execution);
+        return this.submit(
+          input.user_id,
+          input.portfolio,
+          input.execution,
+          submitObservation,
+        );
       case "execution":
         return this.execution(input.user_id, input.portfolio, input.execution);
       case "fence":
@@ -3051,12 +3077,17 @@ export async function startManagedCoreBridge(
       req.params.operation === "notify"
         ? notificationCancellation(req, res)
         : undefined;
+    const submitObservation =
+      req.params.operation === "submit"
+        ? submitObservationCancellation(req, res)
+        : undefined;
     try {
       res.json(
         await bridge.operation(
           req.params.operation,
           req.body,
           cancellation?.signal,
+          submitObservation,
         ),
       );
     } catch (e) {
@@ -3065,6 +3096,7 @@ export async function startManagedCoreBridge(
         .json({ error: failure(e).error });
     } finally {
       cancellation?.close();
+      submitObservation?.close();
     }
   });
   let listener: Server;

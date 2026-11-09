@@ -17,6 +17,19 @@ export const readTimers: BudgetTimers = {
     clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+/** Internal scheduling distinction; the public error contract stays unchanged. */
+export class ObservationPacingDeferred extends AgentError {
+  constructor(retry: number) {
+    super(
+      "VENUE_READ_BUDGET_EXHAUSTED",
+      "Complete account observation is queued before venue reads begin.",
+      true,
+      503,
+      { retry_after_ms: retry },
+    );
+  }
+}
+
 type Charge = {
   at: number;
   lane: ReadLane;
@@ -418,9 +431,18 @@ export class VenueReadBudget {
     }
     if (now < this.nextObservationAt) {
       this.observations.deferred++;
-      throw this.observationDeferred(
-        Math.min(60000, Math.max(1, Math.ceil(this.nextObservationAt - now))),
+      const retry = Math.min(
+        60000,
+        Math.max(1, Math.ceil(this.nextObservationAt - now)),
       );
+      // Pacing is waitable only when every other local gate is ready now.
+      if (
+        this.exclusive ||
+        now < this.blockedUntil ||
+        this.used() + reservedWeight > this.limit
+      )
+        throw this.observationDeferred(retry);
+      throw new ObservationPacingDeferred(retry);
     }
     if (this.exclusive) {
       this.observations.deferred++;
