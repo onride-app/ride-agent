@@ -22,6 +22,7 @@ import {
   ACCOUNT_OBSERVATION_COST_CONTRACT,
 } from "./account-observation-plans.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
+import { coreFrameCoordinator } from "./core-frame-coordinator.js";
 import { notificationCancellation } from "./notification-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
 import {
@@ -37,6 +38,15 @@ import {
   perpsAcceptanceRequest,
   perpsExecutionAcceptance,
 } from "./execution-acceptance.js";
+import {
+  perpsExecutionRecovery,
+  perpsRecoveryRequest,
+} from "./execution-core-recovery.js";
+import {
+  perpsExecutionRetirement,
+  persistedPerpsRetirement,
+  type PerpsRetirementReceipt,
+} from "./execution-retirement.js";
 import { sourceEvidenceReady } from "./source-observations.js";
 import {
   inObservedPerpsScope,
@@ -182,6 +192,10 @@ export class CoreBridge {
           this.infoReadRoute === "core" ? "core_shared_info" : "official",
         observationPlans: this.observationPlans,
         requireObservationPlanBinding: true,
+        frameCoordinator:
+          this.infoReadRoute === "core" && this.network === "mainnet"
+            ? coreFrameCoordinator(this.coreUrl, this.coreToken)
+            : undefined,
       },
     );
     this.sourceIdentities = new PerpsSourceIdentities(
@@ -2145,6 +2159,11 @@ export class CoreBridge {
     p: Portfolio,
     e: Execution,
   ): Promise<{ task_id: string }> {
+    if (e.retirement !== undefined)
+      throw new AgentError(
+        "EXECUTION_REJECTED",
+        "This original execution ID is permanently retired and cannot be submitted.",
+      );
     const prediction = e.key.startsWith("prediction:");
     const existing = await this.pool.query(
       "SELECT fingerprint,payload,response FROM ride_agent_core_outbox WHERE execution_id=$1 AND user_id=$2 AND portfolio_id=$3",
@@ -2362,6 +2381,56 @@ export class CoreBridge {
     );
     return response;
   }
+  private async retireOriginalExecution(
+    user: string,
+    p: Portfolio,
+    e: Execution,
+    deadline: number,
+  ): Promise<{
+    status: "failed";
+    observed_quantity: null;
+    settled: false;
+    retirement: PerpsRetirementReceipt;
+  } | null> {
+    // Retirement is an explicit Core write. An unset read-only gate does not
+    // grant this capability; read-only status queries must never call it.
+    if (
+      process.env.RIDE_AGENT_READ_ONLY !== "false" ||
+      this.network !== "mainnet" ||
+      e.status !== "uncertain" ||
+      e.task_id ||
+      e.expires_at > now() ||
+      deadline <= now()
+    )
+      return null;
+    const request = perpsRecoveryRequest(user, this.perpsBinding(p), e);
+    if (!request) return null;
+    const startedAt = now();
+    let response: unknown;
+    try {
+      response = await this.core(
+        "perps_execution_retirement",
+        request,
+        AbortSignal.timeout(Math.max(1, Math.min(6000, deadline - startedAt))),
+      );
+    } catch {
+      return null;
+    }
+    const receipt = perpsExecutionRetirement(
+      request,
+      response,
+      startedAt,
+      now(),
+    );
+    return receipt
+      ? {
+          status: "failed",
+          observed_quantity: null,
+          settled: false,
+          retirement: receipt,
+        }
+      : null;
+  }
   async execution(
     user: string,
     p: Portfolio,
@@ -2371,23 +2440,62 @@ export class CoreBridge {
     status: Execution["status"];
     observed_quantity: string | null;
     settled: boolean;
+    retirement?: PerpsRetirementReceipt;
   }> {
     const uncertain = {
       status: "uncertain" as const,
       observed_quantity: null,
       settled: false,
     };
+    const proofDeadline = now() + 12_000;
+    const retireOrUncertain = async () =>
+      (await this.retireOriginalExecution(user, p, e, proofDeadline)) ??
+      uncertain;
+    if (e.retirement !== undefined) {
+      const request = perpsRecoveryRequest(user, this.perpsBinding(p), e);
+      const receipt =
+        request && persistedPerpsRetirement(request, e.retirement, now());
+      return receipt
+        ? {
+            status: "failed",
+            observed_quantity: null,
+            settled: false,
+            retirement: receipt,
+          }
+        : uncertain;
+    }
     let task = e.task_id;
+    let recoveredTask = false;
     if (!task) {
       const saved = await this.pool.query(
         "SELECT response,payload FROM ride_agent_core_outbox WHERE execution_id=$1 AND user_id=$2 AND portfolio_id=$3",
         [e.id, user, p.id],
       );
-      if (!saved.rowCount)
-        return e.key.startsWith("perps:")
-          ? uncertain
-          : { status: "failed", observed_quantity: null, settled: false };
-      if (e.key.startsWith("prediction:") && saved.rows[0].response)
+      if (!saved.rowCount) {
+        if (!e.key.startsWith("perps:"))
+          return { status: "failed", observed_quantity: null, settled: false };
+        const request = perpsRecoveryRequest(user, this.perpsBinding(p), e);
+        if (!request || this.network !== "mainnet") return uncertain;
+        const startedAt = now();
+        let response: unknown;
+        try {
+          response = await this.core("perps_execution_recovery", request);
+        } catch {
+          return retireOrUncertain();
+        }
+        const proof = perpsExecutionRecovery(
+          request,
+          response,
+          startedAt,
+          now(),
+        );
+        if (proof.kind !== "accepted") return retireOrUncertain();
+        // Core has the immutable original intent. Recover only its existing
+        // task; do not invent or INSERT a missing frozen local submit payload.
+        // The caller persists this task in its existing owner transaction.
+        task = proof.task_id;
+        recoveredTask = true;
+      } else if (e.key.startsWith("prediction:") && saved.rows[0].response)
         task = saved.rows[0].response.task_id;
       else if (
         e.key.startsWith("perps:") &&
@@ -2402,7 +2510,7 @@ export class CoreBridge {
           e,
           saved.rows[0].payload,
         );
-        if (!request || this.network !== "mainnet") return uncertain;
+        if (!request || this.network !== "mainnet") return retireOrUncertain();
         const startedAt = now();
         let response: unknown;
         try {
@@ -2410,7 +2518,7 @@ export class CoreBridge {
         } catch {
           // Older Core, a lost read response, or incomplete acceptance evidence
           // cannot authorize replay or release an unknown original target.
-          return uncertain;
+          return retireOrUncertain();
         }
         const proof = perpsExecutionAcceptance(
           request,
@@ -2418,9 +2526,9 @@ export class CoreBridge {
           startedAt,
           now(),
         );
-        if (proof.kind === "unknown") return uncertain;
+        if (proof.kind === "unknown") return retireOrUncertain();
         if (proof.kind === "not_accepted_expired")
-          return { status: "failed", observed_quantity: null, settled: false };
+          return retireOrUncertain();
         task = proof.task_id;
         await this.pool.query(
           "UPDATE ride_agent_core_outbox SET response=$2 WHERE execution_id=$1",
@@ -2445,6 +2553,16 @@ export class CoreBridge {
       account_id: this.perpsBinding(p),
       task_id: task,
     });
+    if (
+      !response ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      response.task_id !== task ||
+      !Number.isInteger(response.status) ||
+      response.status < 1 ||
+      response.status > 7
+    )
+      return uncertain;
     let snapshot: any = {};
     try {
       snapshot =
@@ -2452,22 +2570,38 @@ export class CoreBridge {
           ? JSON.parse(response.snapshot)
           : (response.snapshot ?? {});
     } catch {}
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot))
+      return uncertain;
+    const terminalTask = [3, 4, 5, 6].includes(response.status);
+    const settlementEvidence =
+      typeof snapshot.fill_settlement_pending === "boolean" &&
+      typeof snapshot.settlement_observation_required === "boolean";
+    if ((recoveredTask || terminalTask) && !settlementEvidence)
+      return uncertain;
     const snap = await this.account(user, p),
       position = snap.positions[e.key] ?? "0";
     const done =
       response.status === 3 &&
-      !snapshot.fill_settlement_pending &&
-      !snapshot.settlement_observation_required;
+      snapshot.fill_settlement_pending === false &&
+      snapshot.settlement_observation_required === false;
     const failed = [4, 5].includes(response.status);
+    const settlementPending =
+      terminalTask &&
+      (snapshot.fill_settlement_pending ||
+        snapshot.settlement_observation_required);
     return {
       task_id: task!,
-      status: done
-        ? "completed"
-        : failed
-          ? "failed"
-          : response.legs?.some((l: any) => D(l.quantity ?? 0).gt(0))
-            ? "partially_filled"
-            : "submitted",
+      status: settlementPending
+        ? "settling"
+        : done
+          ? "completed"
+          : failed
+            ? "failed"
+            : response.status === 6
+              ? "superseded"
+              : response.legs?.some((l: any) => D(l.quantity ?? 0).gt(0))
+                ? "partially_filled"
+                : "submitted",
       observed_quantity: position,
       settled: done,
     };

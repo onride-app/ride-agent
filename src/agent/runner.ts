@@ -33,6 +33,13 @@ import {
 import { event, AgentService } from "./service.js";
 import type { State, MonitorCallback } from "./repository.js";
 import { checkPerpsOrder } from "./order_rules.js";
+import { perpsRecoveryRequest } from "./execution-core-recovery.js";
+import {
+  perpsExecutionRetirement,
+  persistedPerpsRetirement,
+  type PerpsRetirementReceipt,
+} from "./execution-retirement.js";
+
 import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
 import { orderedSourceFills } from "./source-fill-evidence.js";
@@ -49,6 +56,18 @@ import {
   localDay,
   performanceView,
 } from "./analytics.js";
+
+function commitOriginalRetirement(
+  e: Execution,
+  receipt: PerpsRetirementReceipt,
+): void {
+  e.retirement = receipt;
+  e.status = "failed";
+  e.task_id = null;
+  e.observed_quantity = null;
+  e.error =
+    "Original expired execution was not accepted; its ID is permanently rejected.";
+}
 
 export class AgentRunner {
   private sourceTimes = new Map<string, number>();
@@ -1286,6 +1305,23 @@ export class AgentRunner {
             for (const e of p.executions.filter(
               (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
             )) {
+              if (e.retirement !== undefined) {
+                const request = perpsRecoveryRequest(
+                  user,
+                  p.venue_accounts?.perps ?? p.account_id,
+                  e,
+                );
+                const receipt =
+                  request &&
+                  persistedPerpsRetirement(request, e.retirement, now());
+                if (receipt) commitOriginalRetirement(e, receipt);
+                else {
+                  e.status = "uncertain";
+                  e.error =
+                    "Stored original-ID retirement evidence is incomplete; submission remains blocked.";
+                }
+                continue;
+              }
               if (
                 e.status === "queued" &&
                 (e.revision !== p.revision || p.state === "attention")
@@ -1300,8 +1336,48 @@ export class AgentRunner {
               }
               try {
                 if (e.status === "uncertain") {
+                  const reconciliationStartedAt = now();
                   const observed = await adapter.execution(user, p, e);
-                  if (observed.status !== "failed") {
+                  if (observed.retirement !== undefined) {
+                    const request = perpsRecoveryRequest(
+                      user,
+                      p.venue_accounts?.perps ?? p.account_id,
+                      e,
+                    );
+                    const receipt =
+                      request &&
+                      perpsExecutionRetirement(
+                        request,
+                        observed.retirement,
+                        reconciliationStartedAt,
+                        now(),
+                      );
+                    if (
+                      !receipt ||
+                      observed.status !== "failed" ||
+                      observed.task_id ||
+                      observed.observed_quantity !== null ||
+                      observed.settled
+                    )
+                      throw new AgentError(
+                        "EXECUTION_UNCERTAIN",
+                        "Original-ID retirement evidence remains unconfirmed.",
+                        true,
+                      );
+                    commitOriginalRetirement(e, receipt);
+                    continue;
+                  }
+                  if (
+                    e.key.startsWith("perps:") &&
+                    observed.status !== "uncertain" &&
+                    !observed.task_id
+                  )
+                    throw new AgentError(
+                      "EXECUTION_UNCERTAIN",
+                      "A terminal original Perps execution requires its original task or a permanent retirement receipt.",
+                      true,
+                    );
+                  if (observed.status !== "failed" || observed.task_id) {
                     e.status = observed.status;
                     e.task_id = observed.task_id ?? e.task_id;
                     e.observed_quantity = observed.observed_quantity;

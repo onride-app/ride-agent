@@ -131,7 +131,12 @@ function readOnlyCore(f: ReturnType<typeof fixture>, value: any) {
     f.inputs.push(input);
     if (operation === "perps_execution_acceptance") return value;
     if (operation === "perps_execution")
-      return { status: 2, snapshot: {}, legs: [{ quantity: "0.4" }] };
+      return {
+        task_id: input.task_id,
+        status: 2,
+        snapshot: {},
+        legs: [{ quantity: "0.4" }],
+      };
     assert.fail("Acceptance reconciliation cannot submit or mutate Core");
   };
   f.stub.account = async () => ({ positions: { "perps:BTC": "0.4" } });
@@ -170,7 +175,7 @@ it("a legacy frozen target without an expiry cannot be proven never accepted or 
   }
 });
 
-it("only a serialized, identity-matched expired absence proof can retire the original unknown target, without fills, journal rewrites, or resubmission", async () => {
+it("a legacy serialized expiry-only absence proof cannot retire an unknown target without a new permanent original-ID fence", async () => {
   const f = fixture();
   const original = JSON.stringify(f.payload);
   readOnlyCore(f, proof(f));
@@ -179,7 +184,7 @@ it("only a serialized, identity-matched expired absence proof can retire the ori
   try {
     const result = await f.bridge.execution(f.user, f.p, f.e);
     assert.deepEqual(result, {
-      status: "failed",
+      status: "uncertain",
       observed_quantity: null,
       settled: false,
     });
@@ -382,7 +387,7 @@ it("an unexpired target or a nonstandard original TTL cannot use an absence resp
   }
 });
 
-it("a missing local Perps outbox does not prove absence in Core; Prediction's existing missing-outbox behavior stays unchanged", async () => {
+it("a missing local Perps outbox asks for positive Core recovery and never proves absence; Prediction's missing-outbox behavior stays unchanged", async () => {
   const f = fixture();
   f.setPresent(false);
   try {
@@ -391,7 +396,8 @@ it("a missing local Perps outbox does not prove absence in Core; Prediction's ex
       observed_quantity: null,
       settled: false,
     });
-    assert.deepEqual(f.operations, []);
+    assert.deepEqual(f.operations, ["perps_execution_recovery"]);
+    f.operations.length = 0;
     f.e.key = "prediction:fixture";
     assert.deepEqual(await f.bridge.execution(f.user, f.p, f.e), {
       status: "failed",

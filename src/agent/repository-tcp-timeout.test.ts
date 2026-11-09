@@ -16,11 +16,12 @@ async function settings(repo: PgRepository) {
       tcp: string;
       path: string;
       app: string;
-      transaction: string;
+      transaction: string | null;
+      server_version_num: number;
       version: string;
       pid: number;
     }>(
-      "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name='tcp_user_timeout') AS tcp, current_setting('search_path') AS path, current_setting('application_name') AS app, current_setting('transaction_timeout',true) AS transaction, version() AS version, pg_backend_pid() AS pid",
+      "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name='tcp_user_timeout') AS tcp, current_setting('search_path') AS path, current_setting('application_name') AS app, current_setting('transaction_timeout',true) AS transaction, current_setting('server_version_num')::int AS server_version_num, version() AS version, pg_backend_pid() AS pid",
     )
   ).rows[0];
 }
@@ -63,7 +64,7 @@ for (const value of [0, 60000, 500])
         assert.equal(row.app, "url-keep");
         assert.equal(
           row.transaction,
-          "0",
+          row.server_version_num >= 170000 ? "0" : null,
           "no transaction wall timer is introduced",
         );
         assert.equal(

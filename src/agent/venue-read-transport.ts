@@ -3,7 +3,7 @@ import { AgentError } from "./contracts.js";
 export type VenueReadFetcher = (
   url: string,
   init: RequestInit,
-  context?: { deadline_ms: number },
+  context?: { deadline_ms: number; frame_id?: string; frame_owner?: string },
 ) => Promise<Response>;
 
 // Only the authenticated Core adapter creates these receipts. Ordinary HTTP

@@ -78,6 +78,7 @@ export interface VenueAdapter {
     status: Execution["status"];
     observed_quantity: string | null;
     settled: boolean;
+    retirement?: import("./execution-retirement.js").PerpsRetirementReceipt;
   }>;
   fence(user: string, portfolio: Portfolio): Promise<void>;
   cancelIncreasing(user: string, portfolio: Portfolio): Promise<void>;
@@ -424,6 +425,7 @@ export class BridgeAdapter implements VenueAdapter {
       status: Execution["status"];
       observed_quantity: string | null;
       settled: boolean;
+      retirement?: import("./execution-retirement.js").PerpsRetirementReceipt;
     }>("execution", { user_id: user, portfolio, execution });
   }
   async fence(user: string, portfolio: Portfolio) {
