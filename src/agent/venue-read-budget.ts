@@ -1,6 +1,7 @@
 import { AgentError } from "./contracts.js";
 import {
   ACCOUNT_OBSERVATION_PLAN_TTL_MS,
+  costPlanUnavailable,
   validObservationCostPlan,
   type ObservationCostPlan,
 } from "./account-observation-plans.js";
@@ -40,6 +41,9 @@ export interface AccountReadReservation {
   readonly id: number;
   /** Operational frame estimate, never a provider quota increase or evidence. */
   readonly weight: number;
+  /** Original operational hint; a capacity trial never rewrites this value. */
+  readonly fullDemand: number;
+  readonly capacityTrial: boolean;
   close(complete?: boolean): void;
   costPlan(): ObservationCostPlan | null;
 }
@@ -60,6 +64,8 @@ type Observation = {
   publishCostPlan(plan: ObservationCostPlan): void;
   previousPlan?: { demand: number; peaks: number[] };
   planAttempt?: object;
+  capacityTrialLimit?: number;
+  trialExceeded?: boolean;
 };
 type Owner = {
   served: number;
@@ -332,7 +338,40 @@ export class VenueReadBudget {
     if (queued) queued.demand = plan.demand;
     return true;
   }
-  beginObservation(owner: string): AccountReadReservation {
+  /** Read the next full demand without reserving, joining or renewing a FIFO. */
+  peekObservationDemand(owner: string): number {
+    const now = this.clock();
+    const queued = this.observationQueue.get(owner);
+    if (queued && queued.seen > now - 120000) return queued.demand;
+    const plan = this.observationPlans.get(owner);
+    return plan && plan.seen >= now - ACCOUNT_OBSERVATION_PLAN_TTL_MS
+      ? plan.demand
+      : this.limit;
+  }
+  peekObservationFramePlan(owner: string, trialCapacity: number) {
+    const fullDemand = this.peekObservationDemand(owner);
+    const raw = this.observationPlans.get(owner);
+    const plan =
+      raw && raw.seen >= this.clock() - ACCOUNT_OBSERVATION_PLAN_TTL_MS
+        ? validObservationCostPlan(raw, this.limit)
+        : null;
+    // Old partial -> complete learning can retain the full-window high-water
+    // placeholder for its first two low samples. Preserve that hint and let
+    // the same bounded trial gather its remaining COMPLETE scope samples.
+    const conservativeFullHint =
+      plan &&
+      plan.demand === this.limit &&
+      plan.peaks.length < 3 &&
+      plan.peaks.every((peak) => peak + 20 <= trialCapacity);
+    return {
+      fullDemand,
+      cold: fullDemand === this.limit && (!plan || !!conservativeFullHint),
+    };
+  }
+  beginObservation(
+    owner: string,
+    capacityTrial?: { fullDemand: number; reservedWeight: number },
+  ): AccountReadReservation {
     this.prune();
     const now = this.clock();
     for (const [key, entry] of this.observationPlans)
@@ -354,6 +393,18 @@ export class VenueReadBudget {
       this.observationQueue.set(owner, entry);
     }
     entry.seen = now;
+    if (
+      capacityTrial &&
+      (!Number.isSafeInteger(capacityTrial.reservedWeight) ||
+        capacityTrial.reservedWeight < Math.min(120, this.limit) ||
+        capacityTrial.reservedWeight > this.limit ||
+        capacityTrial.fullDemand !== entry.demand ||
+        capacityTrial.fullDemand !== this.limit ||
+        !this.peekObservationFramePlan(owner, capacityTrial.reservedWeight)
+          .cold)
+    )
+      throw costPlanUnavailable();
+    const reservedWeight = capacityTrial?.reservedWeight ?? entry.demand;
     const first = this.observationQueue.keys().next().value;
     if (this.observation || first !== owner) {
       this.observations.deferred++;
@@ -375,9 +426,9 @@ export class VenueReadBudget {
       this.observations.deferred++;
       throw this.observationDeferred(1000);
     }
-    if (now < this.blockedUntil || this.used() + entry.demand > this.limit) {
+    if (now < this.blockedUntil || this.used() + reservedWeight > this.limit) {
       this.observations.deferred++;
-      const error = this.denied(true, entry.demand);
+      const error = this.denied(true, reservedWeight);
       this.pump();
       throw error;
     }
@@ -385,7 +436,9 @@ export class VenueReadBudget {
     let learnedCostPlan: ObservationCostPlan | null = null;
     const ticket: AccountReadReservation = {
       id: ++this.observationSequence,
-      weight: entry.demand,
+      weight: reservedWeight,
+      fullDemand: entry.demand,
+      capacityTrial: capacityTrial !== undefined,
       costPlan: () =>
         learnedCostPlan
           ? {
@@ -403,13 +456,25 @@ export class VenueReadBudget {
           )
         )
           this.observation.sampleInvalid = true;
+        if (
+          capacityTrial &&
+          complete &&
+          (this.observation.pending > 0 ||
+            this.observation.hadUncertain ||
+            this.observation.sampleInvalid ||
+            this.observation.trialExceeded)
+        ) {
+          this.observation.complete = false;
+          this.finishObservation();
+          throw this.trialExhausted();
+        }
         this.finishObservation();
       },
     };
     this.observation = {
       ticket,
       owner,
-      remaining: entry.demand,
+      remaining: reservedWeight,
       committed: 0,
       peak: 0,
       pending: 0,
@@ -423,13 +488,20 @@ export class VenueReadBudget {
       publishCostPlan: (plan) => {
         learnedCostPlan = plan;
       },
-      previousPlan: this.observationPlans.has(owner)
-        ? {
-            demand: this.observationPlans.get(owner)!.demand,
-            peaks: [...this.observationPlans.get(owner)!.peaks],
-          }
-        : undefined,
+      previousPlan:
+        this.observationPlans.has(owner) &&
+        (!capacityTrial ||
+          validObservationCostPlan(
+            this.observationPlans.get(owner),
+            this.limit,
+          ))
+          ? {
+              demand: this.observationPlans.get(owner)!.demand,
+              peaks: [...this.observationPlans.get(owner)!.peaks],
+            }
+          : undefined,
       planAttempt: this.observationPlanAttempts.get(owner)?.token,
+      ...(capacityTrial ? { capacityTrialLimit: reservedWeight } : {}),
     };
     this.observations.started++;
     if (this.recentObservationWeights.length) {
@@ -653,6 +725,15 @@ export class VenueReadBudget {
       },
     );
   }
+  private trialExhausted() {
+    return new AgentError(
+      "VENUE_READ_BUDGET_EXHAUSTED",
+      "Complete account scope exceeds its explicit capacity trial; fresh complete evidence is still required.",
+      true,
+      503,
+      { retry_after_ms: 60000, reason_code: "READ_FRAME_CAPACITY" },
+    );
+  }
   acquire(
     lane: ReadLane,
     cost: number,
@@ -683,6 +764,13 @@ export class VenueReadBudget {
     if (observation) {
       const frame = this.observation!;
       frame.peak = Math.max(frame.peak, frame.committed + cost);
+      if (
+        frame.capacityTrialLimit !== undefined &&
+        (frame.trialExceeded || (cost > frame.remaining && frame.pending === 0))
+      ) {
+        frame.trialExceeded = true;
+        return reject(this.trialExhausted());
+      }
       if (
         !this.exclusive &&
         cost > frame.remaining &&
@@ -823,6 +911,28 @@ export class VenueReadBudget {
               this.observation !== undefined,
           ) ?? candidates.find(Boolean);
         if (!next) break;
+        const trialFrame =
+          next.observation && this.observation?.ticket === next.observation
+            ? this.observation
+            : undefined;
+        if (
+          trialFrame?.capacityTrialLimit !== undefined &&
+          (trialFrame.trialExceeded || next.cost > trialFrame.remaining)
+        ) {
+          // A response already in flight may return conservative excess. Wait
+          // for its actual settlement, but never dispatch against the unused
+          // local1000 headroom outside this explicit trial's780 reservation.
+          if (!trialFrame.trialExceeded && trialFrame.pending > 0) break;
+          this.queues[next.lane].splice(
+            this.queues[next.lane].indexOf(next),
+            1,
+          );
+          next.signal.removeEventListener("abort", next.cancel);
+          trialFrame.trialExceeded = true;
+          trialFrame.sampleInvalid = true;
+          next.reject(this.trialExhausted());
+          continue;
+        }
         if (
           next.unknownSurcharge &&
           (this.active.account > 0 || this.active.source > 0)
@@ -847,11 +957,17 @@ export class VenueReadBudget {
         }
         this.queues[next.lane].splice(this.queues[next.lane].indexOf(next), 1);
         next.signal.removeEventListener("abort", next.cancel);
+        const frame = next.observation ? this.observation! : undefined;
         const charge: Charge = {
           at: this.clock(),
           lane: next.lane,
           weight: next.unknownSurcharge
-            ? this.limit - used - protection
+            ? Math.min(
+                this.limit - used - protection,
+                frame?.capacityTrialLimit !== undefined
+                  ? frame.remaining
+                  : Infinity,
+              )
             : next.cost,
           sent: false,
           settled: false,
@@ -866,7 +982,6 @@ export class VenueReadBudget {
         // head will fit then; every paid/held charge keeps its real expiry.
         if (borrow) this.sourcePacingLoans++;
         this.charges.push(charge);
-        const frame = next.observation ? this.observation! : undefined;
         const held = frame ? Math.min(frame.remaining, charge.weight) : 0;
         const measured = next.unknownSurcharge ? next.cost : charge.weight;
         if (frame) {
@@ -927,11 +1042,21 @@ export class VenueReadBudget {
               frame.committed += weight - measured;
               frame.remaining += Math.max(0, held - weight);
               frame.peak = Math.max(frame.peak, frame.committed);
+              if (
+                frame.capacityTrialLimit !== undefined &&
+                frame.committed > frame.capacityTrialLimit
+              ) {
+                frame.trialExceeded = true;
+                frame.sampleInvalid = true;
+              }
             }
             this.owners[next.lane].get(next.owner)!.served -= refund;
             this.owners[next.lane].get(next.owner)!.pending -= reservation;
             if (turn) turn.served -= refund;
             this.pump();
+            // The full actual fee is already recorded above, including debt.
+            // It cannot become a successful or partial account observation.
+            if (frame?.trialExceeded) throw this.trialExhausted();
           },
           uncertain,
           release: () => {
