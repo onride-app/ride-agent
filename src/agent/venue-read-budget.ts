@@ -1,4 +1,5 @@
 import { AgentError } from "./contracts.js";
+import { UNSENT_READ_BUDGET_REASON } from "./venue-read-transport.js";
 import {
   ACCOUNT_OBSERVATION_PLAN_TTL_MS,
   costPlanUnavailable,
@@ -744,6 +745,7 @@ export class VenueReadBudget {
       503,
       {
         retry_after_ms: Math.min(60000, Math.max(1, Math.ceil(next - at))),
+        ...(budget ? { reason_code: UNSENT_READ_BUDGET_REASON } : {}),
       },
     );
   }

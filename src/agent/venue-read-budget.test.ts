@@ -6,6 +6,11 @@ import { readCost, responseCost } from "./venue-read-cost.js";
 import { failure } from "./contracts.js";
 import { CoreBridge } from "./core_bridge.js";
 import { SourceFeed } from "./source-feed.js";
+import { AgentError } from "./contracts.js";
+import {
+  isUnsentReadBudgetDenial,
+  UNSENT_READ_BUDGET_REASON,
+} from "./venue-read-transport.js";
 
 async function flush() {
   for (let i = 0; i < 50; i++) await Promise.resolve();
@@ -63,6 +68,56 @@ class FakeTime {
     return value;
   }
 }
+
+it("marks only a pre-dispatch local budget rejection and preserves account reason identities", async () => {
+  const time = new FakeTime(),
+    budget = new VenueReadBudget({ clock: time.clock, timers: time.timers });
+  const paid = await budget.acquire(
+    "account",
+    1000,
+    "",
+    new AbortController().signal,
+  );
+  paid.sent();
+  paid.settle(1000);
+  paid.release();
+  let sent = 0;
+  const reads = new VenueReads(
+    async () => {
+      sent++;
+      return Response.json({});
+    },
+    time.clock,
+    2,
+    { budget, timers: time.timers, report: () => {} },
+  );
+  const work = reads.read(
+    "https://api.hyperliquid.xyz/info",
+    { type: "allMids" },
+    0,
+    "source",
+  );
+  await assert.rejects(time.resolve(work), (error) => {
+    assert.ok(isUnsentReadBudgetDenial(error));
+    assert.equal(error.details?.reason_code, UNSENT_READ_BUDGET_REASON);
+    return true;
+  });
+  assert.equal(sent, 0);
+  assert.equal(budget.snapshot().used, 1000);
+  for (const reason_code of [
+    "READ_FRAME_PENDING",
+    "READ_FRAME_CAPACITY",
+    "READ_FRAME_PACING",
+  ])
+    assert.equal(
+      isUnsentReadBudgetDenial(
+        new AgentError("VENUE_READ_BUDGET_EXHAUSTED", "fixture", true, 503, {
+          reason_code,
+        }),
+      ),
+      false,
+    );
+});
 function setup(limit = 1000, fetcher?: typeof fetch) {
   const time = new FakeTime(),
     budget = new VenueReadBudget({

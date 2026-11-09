@@ -1,5 +1,16 @@
 import { AgentError } from "./contracts.js";
 
+// Proof about this read's admission only, never financial non-acceptance.
+export const UNSENT_READ_BUDGET_REASON = "READ_LOCAL_BUDGET_UNSENT";
+export function isUnsentReadBudgetDenial(error: unknown): error is AgentError {
+  return (
+    error instanceof AgentError &&
+    error.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+    error.retryable === true &&
+    error.details?.reason_code === UNSENT_READ_BUDGET_REASON
+  );
+}
+
 export type VenueReadFetcher = (
   url: string,
   init: RequestInit,
@@ -19,7 +30,21 @@ export class CoordinatedReadError extends AgentError {
       "Coordinated venue read is unavailable; fresh evidence is required.",
       code !== "VENUE_READ_UNSUPPORTED",
       503,
-      retryAfterMs === undefined ? undefined : { retry_after_ms: retryAfterMs },
+      retryAfterMs === undefined &&
+        !(
+          code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+          upstreamRequestSent === false
+        )
+        ? undefined
+        : {
+            ...(retryAfterMs === undefined
+              ? {}
+              : { retry_after_ms: retryAfterMs }),
+            ...(code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+            upstreamRequestSent === false
+              ? { reason_code: UNSENT_READ_BUDGET_REASON }
+              : {}),
+          },
     );
   }
 }
