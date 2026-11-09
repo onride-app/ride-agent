@@ -43,6 +43,10 @@ import {
 import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
 import { isUnsentReadBudgetDenial } from "./venue-read-transport.js";
+import {
+  recordFirstSubmissionFailure,
+  submissionDiagnosticStart,
+} from "./submission-failure-diagnostics.js";
 import { orderedSourceFills } from "./source-fill-evidence.js";
 import {
   runMonitorTrace,
@@ -1418,7 +1422,19 @@ export class AgentRunner {
                 }
                 // The bridge revalidates source revision, ownership, authority, price
                 // deviation, live margin and Core policy immediately before signing.
-                const submit = await adapter.submit(user, p, e);
+                const submissionStarted = submissionDiagnosticStart();
+                let submit: Awaited<ReturnType<typeof adapter.submit>>;
+                try {
+                  submit = await adapter.submit(user, p, e);
+                } catch (error) {
+                  recordFirstSubmissionFailure(
+                    e,
+                    error,
+                    submissionStarted,
+                    now,
+                  );
+                  throw error;
+                }
                 e.task_id = submit.task_id;
                 e.status = "submitted";
                 event(

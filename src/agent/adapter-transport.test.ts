@@ -9,6 +9,7 @@ import { AgentError, failure } from "./contracts.js";
 import { recommend } from "./domain.js";
 import { candidate, snapshot } from "./fixtures.js";
 import { fromPlan } from "./service.js";
+import { recordFirstSubmissionFailure } from "./submission-failure-diagnostics.js";
 import {
   CoordinatedReadError,
   isUnsentReadBudgetDenial,
@@ -166,6 +167,56 @@ function portfolio() {
   ];
   return p;
 }
+
+it("omits only the private submission diagnostic from frozen bridge requests without mutating persisted state", async () => {
+  const p = portfolio(),
+    original = structuredClone(p),
+    bodies: any[] = [],
+    wireBytes: string[] = [];
+  const app = express();
+  app.use(
+    express.json({
+      verify: (_req, _res, buffer) => {
+        wireBytes.push(buffer.toString());
+      },
+    }),
+  );
+  app.post("/internal/agent/:operation", (req, res) => {
+    bodies.push(req.body);
+    res.json(
+      req.params.operation === "submit"
+        ? { task_id: "task_fixture" }
+        : { status: "uncertain", observed_quantity: null, settled: false },
+    );
+  });
+  await loopback(app, async (adapter) => {
+    await adapter.submit("fixture-user", p, p.executions[0]);
+    recordFirstSubmissionFailure(
+      p.executions[0],
+      new AgentError("EXECUTOR_UNAVAILABLE", "private fixture error", true),
+      0,
+      () => 1000,
+      () => 10,
+    );
+    const persisted = structuredClone(p);
+    await adapter.submit("fixture-user", p, p.executions[0]);
+    await adapter.execution("fixture-user", p, p.executions[0]);
+    assert.deepEqual(bodies[0], bodies[1]);
+    assert.equal(
+      wireBytes[0],
+      wireBytes[1],
+      "diagnostic metadata changes no byte of the frozen submit wire body",
+    );
+    assert.equal(
+      JSON.stringify(bodies).includes("first_submission_failure"),
+      false,
+    );
+    assert.deepEqual(p, persisted);
+    const { first_submission_failure: _packet, ...frozen } = p.executions[0];
+    assert.deepEqual(frozen, original.executions[0]);
+    assert.deepEqual(bodies[2].execution, original.executions[0]);
+  });
+});
 
 it("omits only audit decisions on all portfolio wire calls so a >1 MiB history passes a real 1 MiB parser without mutating controls or history", async () => {
   const p = portfolio();

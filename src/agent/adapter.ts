@@ -120,7 +120,21 @@ function bridgeInput(input: unknown): unknown {
       ([key]) => key !== "decisions" && key !== "__decision_history_version",
     ),
   );
-  return { ...input, portfolio };
+  const withoutDiagnostic = (value: unknown) => {
+    if (!record(value) || !Object.hasOwn(value, "first_submission_failure"))
+      return value;
+    const { first_submission_failure: _diagnostic, ...execution } = value;
+    return execution;
+  };
+  if (Array.isArray(portfolio.executions))
+    portfolio.executions = portfolio.executions.map(withoutDiagnostic);
+  return {
+    ...input,
+    portfolio,
+    ...(record(input.execution)
+      ? { execution: withoutDiagnostic(input.execution) }
+      : {}),
+  };
 }
 
 function invalidBridgeResponse(response: Response): AgentError {

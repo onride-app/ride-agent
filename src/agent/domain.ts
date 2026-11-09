@@ -296,6 +296,7 @@ export interface Execution {
   reserve_usdc: string;
   error: string | null;
   retirement?: import("./execution-retirement.js").PerpsRetirementReceipt;
+  first_submission_failure?: import("./submission-failure-diagnostics.js").FirstSubmissionFailure;
 }
 export interface MonitorError {
   at: number;
