@@ -9,6 +9,11 @@ import { AgentError, failure } from "./contracts.js";
 import { recommend } from "./domain.js";
 import { candidate, snapshot } from "./fixtures.js";
 import { fromPlan } from "./service.js";
+import {
+  CoordinatedReadError,
+  isUnsentReadBudgetDenial,
+  UNSENT_READ_BUDGET_REASON,
+} from "./venue-read-transport.js";
 
 class TransportClock {
   at = 0;
@@ -66,6 +71,36 @@ async function loopback<T>(
     );
   }
 }
+
+it("preserves only verified unsent budget provenance across the real bridge error transport", async () => {
+  for (const [code, sent] of [
+    ["VENUE_READ_BUDGET_EXHAUSTED", false],
+    ["VENUE_READ_BUDGET_EXHAUSTED", true],
+    ["VENUE_RATE_LIMITED", false],
+    ["VENUE_RATE_LIMITED", true],
+    ["VENUE_RESPONSE_INVALID", false],
+  ] as const) {
+    const app = express();
+    app.post("/internal/agent/source", (_req, res) =>
+      res.status(503).json(failure(new CoordinatedReadError(code, sent, 2000))),
+    );
+    await loopback(app, async (adapter) => {
+      await assert.rejects(adapter.source(candidate(1)), (error) => {
+        assert.ok(error instanceof AgentError);
+        assert.equal(error.code, code);
+        assert.equal(error.details?.retry_after_ms, 2000);
+        const eligible =
+          code === "VENUE_READ_BUDGET_EXHAUSTED" && sent === false;
+        assert.equal(isUnsentReadBudgetDenial(error), eligible);
+        assert.equal(
+          error.details?.reason_code,
+          eligible ? UNSENT_READ_BUDGET_REASON : undefined,
+        );
+        return true;
+      });
+    });
+  }
+});
 
 function portfolio() {
   const p = fromPlan(

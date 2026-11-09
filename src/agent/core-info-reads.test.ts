@@ -11,6 +11,7 @@ import { AgentError } from "./contracts.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 import { VenueReads } from "./venue-reads.js";
 import { SourceFeed } from "./source-feed.js";
+import { UNSENT_READ_BUDGET_REASON } from "./venue-read-transport.js";
 
 const initialTime = 1_700_000_000_000;
 const mainnet = "https://api.hyperliquid.xyz/info";
@@ -205,7 +206,15 @@ for (const [remote, code] of mappedCodes)
         0,
         "source",
       ),
-      { code, details: { retry_after_ms: 1200 } },
+      {
+        code,
+        details: {
+          retry_after_ms: 1200,
+          ...(remote === "local_budget"
+            ? { reason_code: UNSENT_READ_BUDGET_REASON }
+            : {}),
+        },
+      },
     );
     const diag = f.reads.diagnostics();
     assert.equal(f.calls.length, 1);

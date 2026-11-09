@@ -7,6 +7,12 @@ import { fingerprint, now, recommend, type Execution } from "./domain.js";
 import { AgentService, fromPlan } from "./service.js";
 import { AgentRunner } from "./runner.js";
 import { Cursor, MemoryRepository } from "./repository.js";
+import { SourceFeed } from "./source-feed.js";
+import type { VenueAdapter } from "./adapter.js";
+import {
+  CoordinatedReadError,
+  UNSENT_READ_BUDGET_REASON,
+} from "./venue-read-transport.js";
 
 const preferences = {
   budget_usdc: "20",
@@ -518,6 +524,260 @@ async function runnerFixture(p = portfolio(), adapter = new FakeAdapter()) {
       repo.transact("alice", async (s) => structuredClone(s.portfolios[0])),
   };
 }
+
+for (const outcome of [
+  "fresh",
+  "retry fails",
+  "stale source",
+  "stale position",
+  "incomplete",
+  "account expired",
+] as const)
+  it(`reconsiders only an unsent pre-audit source budget denial once after a six-second account wait: ${outcome}`, async (t) => {
+    let clock = 1793200000000;
+    t.mock.method(Date, "now", () => clock);
+    const f = await runnerFixture(),
+      before = structuredClone((await f.read()).sleeves[0].intents);
+    let reads = 0;
+    f.adapter.source = async () => {
+      if (++reads === 1)
+        throw new CoordinatedReadError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          false,
+          2000,
+        );
+      assert.equal(
+        reads,
+        2,
+        "the new result must not trigger another aged-prefetch retry",
+      );
+      clock += outcome === "account expired" ? 31000 : 500;
+      if (outcome === "retry fails")
+        throw new CoordinatedReadError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          false,
+          2000,
+        );
+      const value = source();
+      if (outcome === "stale source") value.observed_at -= 6000;
+      if (outcome === "stale position") value.positions[0].observed_at -= 6000;
+      if (outcome === "incomplete") value.complete = false;
+      return value;
+    };
+    f.adapter.account = async () => {
+      await Promise.resolve();
+      clock += 6000;
+      return snapshot();
+    };
+    await f.runner.tick("alice");
+    const saved = await f.read();
+    assert.equal(reads, 2);
+    assert.equal(f.adapter.submitCount, outcome === "fresh" ? 1 : 0);
+    if (outcome === "fresh") {
+      assert.equal(saved.state, "active");
+      assert.equal(saved.last_error, undefined);
+      assert.equal(saved.sleeves[0].last_source_at, clock);
+    } else {
+      assert.deepEqual(saved.sleeves[0].intents, before);
+      assert.equal(saved.state, "attention");
+      assert.equal(
+        saved.last_error?.code,
+        outcome === "retry fails"
+          ? "VENUE_READ_BUDGET_EXHAUSTED"
+          : outcome === "account expired"
+            ? "ACCOUNT_STALE"
+            : "SOURCE_STALE",
+      );
+    }
+  });
+
+for (const issue of [
+  "real429",
+  "cooldown",
+  "sent budget",
+  "unverified budget",
+  "not retryable",
+  "invalid response",
+  "deadline",
+] as const)
+  it(`does not reconsider a prefetch without verified unsent retryable budget provenance: ${issue}`, async (t) => {
+    let clock = 1793200000000;
+    t.mock.method(Date, "now", () => clock);
+    const f = await runnerFixture();
+    let reads = 0;
+    f.adapter.source = async () => {
+      reads++;
+      if (issue === "sent budget")
+        throw new CoordinatedReadError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          true,
+          2000,
+        );
+      const code = ["real429", "cooldown"].includes(issue)
+        ? "VENUE_RATE_LIMITED"
+        : issue === "invalid response"
+          ? "VENUE_RESPONSE_INVALID"
+          : issue === "deadline"
+            ? "VENUE_READ_DEADLINE"
+            : "VENUE_READ_BUDGET_EXHAUSTED";
+      throw new AgentError(
+        code,
+        "fixture source error",
+        issue !== "not retryable",
+        503,
+        {
+          retry_after_ms: 2000,
+          ...(issue === "unverified budget"
+            ? {}
+            : { reason_code: UNSENT_READ_BUDGET_REASON }),
+        },
+      );
+    };
+    f.adapter.account = async () => {
+      await Promise.resolve();
+      clock += 6000;
+      return snapshot();
+    };
+    await f.runner.tick("alice");
+    assert.equal(reads, 1);
+    assert.equal(f.adapter.submitCount, 0);
+    assert.equal((await f.read()).state, "attention");
+  });
+
+it("does not retry a qualified source prefetch when this round's account audit fails", async (t) => {
+  let clock = 1793200000000;
+  t.mock.method(Date, "now", () => clock);
+  const f = await runnerFixture();
+  let reads = 0;
+  f.adapter.source = async () => {
+    reads++;
+    throw new CoordinatedReadError("VENUE_READ_BUDGET_EXHAUSTED", false, 2000);
+  };
+  f.adapter.account = async () => {
+    await Promise.resolve();
+    clock += 6000;
+    throw new AgentError("ACCOUNT_STALE", "fixture audit failed", true);
+  };
+  await f.runner.tick("alice");
+  assert.equal(reads, 1);
+  assert.equal(f.adapter.submitCount, 0);
+});
+
+it("does not turn a lazy post-audit source failure into an extra consumption retry", async (t) => {
+  let clock = 1793200000000;
+  t.mock.method(Date, "now", () => clock);
+  const p = portfolio();
+  p.source_read_error = {
+    at: clock,
+    code: "VENUE_READ_BUDGET_EXHAUSTED",
+    message: "fixture source backoff",
+    retryable: true,
+    read_scope: "source",
+    details: { retry_after_ms: 5000, reason_code: UNSENT_READ_BUDGET_REASON },
+  };
+  const f = await runnerFixture(p);
+  let reads = 0;
+  f.adapter.source = async () => {
+    reads++;
+    throw new CoordinatedReadError("VENUE_READ_BUDGET_EXHAUSTED", false, 2000);
+  };
+  f.adapter.account = async () => {
+    await Promise.resolve();
+    clock += 6000;
+    return snapshot();
+  };
+  await f.runner.tick("alice");
+  assert.equal(reads, 1);
+  assert.equal(f.adapter.submitCount, 0);
+});
+
+for (const retryMs of [2000, 60000])
+  it(`uses normal SourceFeed cache/backoff after a successful audit without forcing a fetch (${retryMs}ms failure hint)`, async (t) => {
+    let clock = 1793200000000;
+    t.mock.method(Date, "now", () => clock);
+    const f = await runnerFixture();
+    let fetches = 0,
+      calls = 0;
+    let prefetchFailed!: () => void;
+    const firstFailure = new Promise<void>((resolve) => {
+      prefetchFailed = resolve;
+    });
+    const feed = new SourceFeed(
+      async () => {
+        if (++fetches === 1)
+          throw new CoordinatedReadError(
+            "VENUE_READ_BUDGET_EXHAUSTED",
+            false,
+            retryMs,
+          );
+        clock += 500;
+        return source();
+      },
+      {
+        clock: () => clock,
+        timers: { setInterval: () => 1, clearInterval: () => {} },
+      },
+    );
+    const venue: VenueAdapter = f.adapter;
+    venue.source = async (trader) => {
+      calls++;
+      try {
+        return await feed.read(trader.id);
+      } catch (error) {
+        if (calls === 1) prefetchFailed();
+        throw error;
+      }
+    };
+    f.adapter.account = async () => {
+      await firstFailure;
+      clock += 6000;
+      return snapshot();
+    };
+    try {
+      await f.runner.tick("alice");
+      assert.equal(calls, 2);
+      assert.equal(fetches, retryMs === 2000 ? 2 : 1);
+      assert.equal(f.adapter.submitCount, retryMs === 2000 ? 1 : 0);
+    } finally {
+      feed.close();
+    }
+  });
+
+it("retains the audit fingerprint guard before reconsidering an unsent prefetch", async (t) => {
+  let clock = 1793200000000;
+  t.mock.method(Date, "now", () => clock);
+  const f = await runnerFixture(),
+    transact = f.repo.transact.bind(f.repo);
+  let reads = 0,
+    first = true;
+  f.adapter.source = async () => {
+    reads++;
+    throw new CoordinatedReadError("VENUE_READ_BUDGET_EXHAUSTED", false, 2000);
+  };
+  f.adapter.account = async () => {
+    await Promise.resolve();
+    clock += 6000;
+    return snapshot();
+  };
+  f.repo.transact = async (user, work) => {
+    const result = await transact(user, work);
+    if (first) {
+      first = false;
+      await transact(user, async (state) => {
+        state.portfolios[0].sleeves[0].source_revision =
+          "external_revision_without_bump";
+      });
+    }
+    return result;
+  };
+  await f.runner.tick("alice");
+  assert.equal(reads, 1);
+  assert.equal(f.adapter.submitCount, 0);
+  assert.equal(
+    (await f.read()).sleeves[0].source_revision,
+    "external_revision_without_bump",
+  );
+});
 
 it("reuses an already verified fixed snapshot without requesting a zero-width fill history window or replaying entries", async () => {
   const p = portfolio(),

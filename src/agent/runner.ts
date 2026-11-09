@@ -42,6 +42,7 @@ import {
 
 import { describeRiskBlocker } from "./risk-status.js";
 import { observeSources, sourceEvidenceReady } from "./source-observations.js";
+import { isUnsentReadBudgetDenial } from "./venue-read-transport.js";
 import { orderedSourceFills } from "./source-fill-evidence.js";
 import {
   runMonitorTrace,
@@ -454,6 +455,11 @@ export class AgentRunner {
         if (expected === undefined || fingerprint(p) !== expected.token)
           continue;
         let sources = prefetches.get(p.id);
+        const originalPrefetch = sources !== undefined;
+        const prefetchBudgetRetries = new Map<
+          string,
+          ReturnType<typeof adapter.source>
+        >();
         const getSources = () => (sources ??= startSources(p));
         const publicFailures = new Set<unknown>();
         let replayedSourceError: MonitorError | undefined;
@@ -558,14 +564,31 @@ export class AgentRunner {
               }
             }
             if (p.reconciliation !== "complete" && s.initialized) continue;
+            let refreshedBudgetPrefetch = false;
             let observation = await publicRead(async () => {
               const value = await getSources().get(s.trader.id);
-              if (!value.ok) throw value.error;
+              if (!value.ok) {
+                if (!originalPrefetch || !isUnsentReadBudgetDenial(value.error))
+                  throw value.error;
+                // An unsent prefetch can outlive the account wait. Re-enter
+                // the normal source reader once; its cache, in-flight joins
+                // and backoff remain authoritative. Never force a refresh.
+                refreshedBudgetPrefetch = true;
+                let retry = prefetchBudgetRetries.get(s.trader.id);
+                if (!retry) {
+                  retry = adapter.source(s.trader);
+                  prefetchBudgetRetries.set(s.trader.id, retry);
+                }
+                return { ok: true as const, value: await retry };
+              }
               return value;
             });
             // Collection overlaps the complete account read. Its first result
             // may have expired while that read was queued or in flight.
-            if (!fresh(observation.value.observed_at, 5000)) {
+            if (
+              !refreshedBudgetPrefetch &&
+              !fresh(observation.value.observed_at, 5000)
+            ) {
               const value = await publicRead(() => adapter.source(s.trader));
               observation = { ok: true, value };
             }
