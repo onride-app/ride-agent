@@ -1,39 +1,43 @@
 # Rider 系统架构
 
-核对日期 2026-10-29，源码以远程 `a4402eb` 为准（本地工作树 `f20f87e`，差异已核对）。这里描述代码实现；当前线上角色绑定/版本见 [status](status.md)。
 
-## 组件与边界
+核对范围：Node 业务模块源码 `18826aa6945239205a29bf6df6bccc7c4534b828`，App 托管/流式 relay 源码 `4ffc2965575d9c23a2812f0f8425f990c16a7d62`。这里描述代码实现；生产切换核对时点、运行身份和观察边界见 [status](status.md)，不从合并或构建成功推定已切换。
+
+## 托管部署的组件与边界
 
 ```mermaid
 flowchart LR
-  Client[AI client / CLI / Skill] --> Gateway[OAuth MCP gateway]
+  Client[AI client / CLI / Skill] --> Gateway[mcp.onride.me lightweight gateway]
   Browser[Ride human review] --> Gateway
-  Gateway --> Identity[Ride Core GraphQL identity]
-  Gateway --> Backend[Agent backend + monitor]
-  Gateway --> Redis[Redis OAuth and handoff state]
-  Backend --> Pg[Agent PostgreSQL]
-  Backend --> Bridge[Private execution bridge]
-  Bridge --> Pg
-  Bridge --> Core[Ride Core internal Agent API]
-  Core --> Worker[Existing workers / wallet signing]
-  Worker --> Venue[Hyperliquid / Polymarket]
-  Bridge --> Reads[Public venue evidence / RPC]
-  Bridge --> FCM[Firebase push]
+  Gateway --> Public[App public API relay]
+  Gateway --> Identity[Public Core GraphQL identity]
+  Public --> Private[App private Rust API owner]
+  Private --> Module[Versioned Node business module]
+  Module --> Pg[ride_agent_app on App PG cluster]
+  Module --> Redis[App Redis OAuth and handoff namespace]
+  Module --> Core[Existing private Core API and workers]
+  Core --> Venue[Hyperliquid / Polymarket]
+  Module --> Reads[Venue evidence / RPC / FCM]
 ```
 
-| 进程 | 入口和默认端口 | 信任职责 |
+| 组件 | 入口和监听 | 信任职责 |
 |---|---|---|
-| Gateway | `src/server.ts`, 3333 | OAuth issuer/resource、MCP、CLI API、浏览器/原生 human 路由；不签名 |
-| Backend | `src/backend.ts` → `agent/backend.ts`, 3344 | Core identity 校验、每用户状态、业务状态机、监控/通知调度 |
-| Bridge | `src/bridge.ts` → `agent/core_bridge.ts`, 3355 | S2S token、源/账户证据、Core 操作翻译、stable outbox 与 prediction 元数据 |
-| 私有 Core/worker | 本仓不包含 | 最终用户/账户 ownership、控制平面、钱包密钥与交易执行 |
+| MCP gateway | `src/server.ts`，公网 `mcp.onride.me` | OAuth issuer/resource、MCP、CLI 与 human 页面；通过 HTTP 调 App，不持有 Agent PG/Redis 连接配置 |
+| App public relay | `predictly_server/crates/api/src/agent_app_runtime`，public API | 原样透传原用户 Bearer；不注入 Core 权限、不自动重试 POST；Tool/Human 响应随背压流式传输 |
+| App private owner | 同 Rust API crate，private service `ae126414-21a9-4795-9a38-5fcd144fd4ea` | 显式 private/runtime/backend gates、监督一个版本化 Node 子进程、ready/STOPPING/EOF 生命周期 |
+| Node backend / bridge / session RPC | App 冻结模块 → `src/app_runtime.ts`，仅 `127.0.0.1:3344/3355/3366` | 原 Agent 状态机、monitor、owned ledger、稳定 outbox、Core S2S、App Redis session RPC |
+| Core / worker | `predictly_server` 的既有服务 | 最终 ownership/epoch、签名、下单和对账；本次托管不替换财务授权 |
 
-`src/start.ts` 用 `RIDE_SERVICE_ENTRYPOINT` 动态选择进程；Railway仓库配置直启 `dist/<entry>.js`；当前平台override为`npm start`，所以角色依赖平台process env。selector在角色的dotenv加载前读取，单改`.env`中的entrypoint不会切换启动角色。backend→bridge 使用 `RIDE_AGENT_EXECUTOR_TOKEN`，bridge→Core 使用独立 `RIDE_AGENT_CORE_SERVICE_TOKEN`，不能共用或给客户端。
+App 的构建、固定源码包及模块 manifest、门控和 owner 升级方式见 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md)；完整迁移与 reverse rollback 见 [迁移 runbook](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/scripts/ride-agent-migration/README.md)。同集群的 `ride_agent_app` 是独立数据库，由专用角色持有 Agent 对象；Core 仍使用自己的数据库。
+
+`RIDE_AGENT_CORE_URL` 保留原完整配置，不改成 loopback Core；其 origin/path 参与 `CoreBridge.perpsCostOwner` 的指纹，迁址会改变预算/读取身份。只有业务 backend→bridge 在进程内使用 `127.0.0.1:3355`。Rust 业务 relay 的 130 秒 deadline 包容原 human funding 120 秒调用；原用户请求结果未确认时先查状态，不自动重提或重签。
+
+独立 self-hosting 继续支持 `src/start.ts` 的 `RIDE_SERVICE_ENTRYPOINT=server|backend|bridge`，端口默认 `3333/3344/3355`。这是兼容部署入口；托管生产的 backend/bridge 由 App owner 导入。两种 monitor 不得同时运行。backend→bridge 的 `RIDE_AGENT_EXECUTOR_TOKEN` 与 bridge→Core 的 `RIDE_AGENT_CORE_SERVICE_TOKEN` 保持分离。
 
 ## 用户旅程和数据流
 
 1. 安装器为支持的 AI 客户端配置生产 MCP 和 Skill。Codex native HTTP OAuth 与 CLI 的本地 OAuth session 相互独立；Claude/Cursor 使用 CLI stdio adapter。CLI session 由 `src/cli/session.ts` 放在用户私有配置目录。
-2. OAuth PKCE 登录经 Privy 获取身份，再向 Core GraphQL 交换/校验 Ride JWT。Redis 持久化 OAuth client/code/access/refresh token 以及浏览器 human handoff；loopback 开发可用内存 store。
+2. OAuth PKCE 登录经 Privy 获取身份，再向原 public Core GraphQL 交换/校验 Ride JWT。托管 gateway 通过固定 App session-store RPC 保存 OAuth client/code/access/refresh 与 human handoff；权威存储是 App Redis，namespace、opaque bytes、CAS 与原 TTL 保留。loopback 开发仍可使用内存 store。private owner 不提供 GraphQL，backend 的 `RIDE_GRAPHQL_URL` 保持指向可用的原 public GraphQL。
 3. `get_ride_guide` 动态返回工作流；schemas/tool metadata 在 `contracts.ts`、`mcp.ts`。实际 read-only tool 集合依据代码，旧文档中的数量可能落后。
 4. 账户读同时区分 Agent 投资组合与已有 Ride App 跟单 (`account_reads.ts`)；Agent 空列表不说明 App 无持仓。候选发现、风险选择、精确行情窗口依次生成不可变 preview。
 5. preview 编辑创建新 plan；`start_copy`/update/stop/close 等写工具生成过期时间、owner/revision、hash 都冻结的 proposal。OAuth trade scope 不直接执行。
@@ -43,11 +47,17 @@ flowchart LR
 
 ## 状态存储与并发
 
-`repository.ts` 的 `ride_agent_state(user_id,state JSONB,updated_at)` 保存 preferences、selection、plans、portfolios、proposals、delegation、updates、checkpoints、performance、notification preferences 等。迁移由 backend 启动创建。业务迁移在 `SELECT ... FOR UPDATE` 用户行事务中完成；token 所属用户作为边界，cursor 用独立签名 key 绑定用户。
+`repository.ts` 的 `ride_agent_state` 保存当前状态和完整财务/未知执行证据；历史 updates/decisions/performance 惰性迁出到同库冷表，原 payload、稳定 ID/ordinal 与完整读取兼容保留。原生 eligibility/latest 投影避免每轮解压全量历史；仅重复抑制使用 recent256 上限，due/claim/ACK/digest 与当前财务状态独立。详见 [冷热历史存储与回退边界](agent-history-storage.md)。所有业务及冷表迁移仍在原用户行锁事务内完成；cursor 的原用户绑定与签名 key 保留。
 
 bridge 以 `ride_agent_core_outbox` 保存 execution ID、fingerprint、payload、response；`prediction.ts` 创建 prediction 辅助表并负责 opaque receipt/token/outcome metadata。Core 自己的 ownership 和交易表位于另一仓，Agent 数据库不是完整交易真相。
 
-一个 Agent DB 目前运维上只启一个 monitor。行锁可以序列化用户状态，但尚无跨进程 scheduler leases；同时 monitor 的外部证据观察可能重叠。20 秒 PostgreSQL statement deadline、25 秒 driver query deadline及失败连接销毁限制阻塞；SIGTERM 立即关闭 pre-callback readers。没有信号的硬杀仍依赖网络断联检测，见 [10/28 修复记录](repository-clientwrite-shutdown-2026-10-28.md)。
+每个 Agent DB 只有一个受管 monitor，以专用 PG session advisory lock 持有到 backend→bridge→session RPC 完整 drain 后释放。旧 standalone binary 不遵守此锁，因此 cutover 必须先停旧 monitor。Node 以 Rust stdin pipe EOF 检测 owner 退出，READY/STOPPING 标记控制准入，45 秒 Node drain、47 秒 Rust 边界由平台 60 秒 draining 窗口包容；owner 自动部署触发器禁用，升级按 stop/drain/锁释放/start 执行。20 秒 SQL、25 秒 driver deadline、失败连接销毁及原 execution ID 对账继续保留；生命周期 fixture 不证明任意硬杀下的端到端真实金融完成。
+
+### Performance cold-store 升级（已核验）
+
+业务模块 `18826aa6945239205a29bf6df6bccc7c4534b828` / archive `36b7dd7309957d27d097147cf5a89d5022cbd48e266e7eaaf0f86c5aed8d789a` 已部署到 `cae47a83-d72d-4b3c-898e-9f58e1113e69`，82 个 compiled module 全部实际核验。新增 `ride_agent_performance`、`ride_agent_performance_heads`、`ride_agent_performance_schema`，同用户行锁内惰性迁移；保留所有原始点和 ordinal，完整读取与 report baseline/连续性维持，monitor 使用最新 head和按需窗口。当前 3 个 eligible owner 无 inline performance；其他懒迁移 owner 的 44 点保留，不宣称全部 12 个 owner 已冷迁移。体积/CPU/RSS 的有界实测及限制见 [status](status.md)。
+
+`dd6dacd` / `0e13ef3` 虽支持此前 updates/decisions 冷表，却不能读取已剥离 performance 的热状态。回退必须先停并 drain owner，保留升级后当前完整数据库的最新 reverse snapshot，以 performance-aware binary 恢复；不能丢弃新写入或换 execution ID 重试。
 
 ## 证据、跟单和账本
 

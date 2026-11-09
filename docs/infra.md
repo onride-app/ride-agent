@@ -1,6 +1,25 @@
 # Rider 基础设施、账号与密钥目录
 
-核对日期 2026-10-29。此文件只列标识、用途和所有权线索，绝不保存 secret 值。依据为源码、部署配置和仓库历史文档；账号所有权未通过控制台重新审计；已进行下述Railway只读CLI身份与部署元数据核对。`TBD – confirm` 表示新接手人必须向拥有者核实。
+
+下列原账号/服务表是 2026-10-29 历史交接快照；托管角色增量见下节，实际状态按迁移凭据填写。此文件只列标识、用途和所有权线索，绝不保存 secret 值。依据为源码、部署配置和仓库历史文档；账号所有权未通过控制台重新审计；已进行下述Railway只读CLI身份与部署元数据核对。`TBD – confirm` 表示新接手人必须向拥有者核实。
+
+## 托管角色与存储（2026-11-09 切换记录）
+
+生产切换核对至：`2026-11-09 07:32 Asia/Shanghai（2026-11-08 23:32 UTC，核对时点）`。实际运行/停止凭据与有界观察：private owner 部署 `e17afed2-d5a9-48a2-94e0-66fd53bc2acc`、public relay `206149…`、gateway `697bb9f5-702b-449a-9c60-08182191be35` 均 SUCCESS。API 实际源码 `4ffc2965575d9c23a2812f0f8425f990c16a7d62`，binary SHA256 `8b1e64aed7be686749ce86446c2f4ac25ef0d202126c366daeeb76fbb90c0b63`；Node 模块 `dd6dacd0159b8dd83c320b163d74864befc96fa0`，archive SHA256 `17efdef46bbd01a19e4750bef56eefe0e54274240df7b11eae3a5bbdf0555544`，81 个 compiled module 哈希全部核验。gateway 实际源码 `26a6a94`，已切换 App URLs，无直连 PG/Redis、Core/executor token；外部 health/guide 200，OAuth issuer 保持原值。App health/ready/runtime-ready 均 200，已迁移 OAuth registration 读取 200/no-store。恢复后启用前 PG 全量 46,275 行/7 表 fingerprint 一致，OAuth 74 个记录恢复并验证；启用后 old backend/bridge active=0、gateway=1、public Node=0/private Node=1/唯一 PG monitor lease=1，旧 PG read-only 且无业务连接。旧 PG/两个 Redis 的停止指令均成功，连同旧 backend/bridge 合计 5 个旧计算服务退役；卷和已验证备份保留。脱敏记录：`owner-api-module-verified.json`、`gateway-live-http.json`、`postcutover-owner-boundary.json`、`old-ride-decommission-readonly.json`、`old-store-compute-stop.json`。这些证明运行/迁移边界，不代表宿主自然 refresh/CAS、原账号签名/真实成交或真机推送验收。
+
+| 角色 | 精确定位 | 切换后的职责 |
+|---|---|---|
+| 轻量 MCP gateway | ride-mcp project，service `38891061-9d74-47e6-821e-d4429cb15b6d`；`mcp.onride.me` | 仅 HTTP 访问 App Agent/session RPC；不配置 Agent PG/Redis 直连凭据，issuer/redirects/human cookie key 保留 |
+| App public relay | App project `c172400f-357a-429a-b6c6-43cabe396515`，production `32e1546f-a50d-4fbd-be2c-211680fc58ce`，service `89a5768e-f8d0-49dd-b63f-87f0ab4036d7` | 保持 public GraphQL；透传 Agent Tool/Human 与独立 Session RPC |
+| App private owner | 同项目/环境，service `ae126414-21a9-4795-9a38-5fcd144fd4ea` | 监督固定 Node `18826aa6945239205a29bf6df6bccc7c4534b828` 模块，loopback `3344/3355/3366`；一个 monitor/PG session lease |
+| Agent PostgreSQL | App PG service `5faaa2c7-6706-4080-8f69-e4998b0cabe1` | 独立 DB `ride_agent_app`、专用 `ride_agent_runtime` role；全表/函数/序列及冷历史备份，Core DB 不变 |
+| OAuth / handoff Redis | App Redis service `d807b568-c244-48d6-9df8-d69b5109795e` | 原 namespace/opaque records/CAS/TTL；网关通过固定 HTTP RPC，不接收 Redis 凭据 |
+| 旧 backend/bridge | `02b43ebe…` / `b51736db…` | 已停止，无 active/pending deployment；禁止与新 owner 同时启动 |
+| 旧 Agent PG / 两个 Redis | `5d650bf2…`、`52f7bcff…` / `ee96261d…` | 计算已停止，卷与已验证备份保留；旧 PG 停前 read-only 且无业务连接，回退需兼容 binary |
+
+Node 模块、App API 与云部署身份分别记录。源码 pin 不随 docs-only commit 重冻。owner Git/自动部署触发器保持禁用；平台 draining 为 60 秒，升级执行 controlled stop/drain/start。参考 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md)、[完整迁移与兼容回退](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/scripts/ride-agent-migration/README.md)。
+
+保留原 `RIDE_AGENT_CORE_URL` 完整值，其 origin/path 是读取预算 owner 指纹的一部分；不要把 Core URL 改为 loopback。进程内 loopback 仅用于 backend→bridge（`127.0.0.1:3355`）。轻量 gateway caller-only 修复的发布 SHA 另外记录，App Node 模块当前 pin `18826aa6945239205a29bf6df6bccc7c4534b828`。
 
 ## 服务、账号和需要的权限
 
@@ -26,12 +45,13 @@
 
 ## 配置与密钥归属
 
-完整逐键清单见 [env-inventory](env-inventory.md)，包含运行时、CLI、预览、测试/CI和Core协作变量的来源。`.env.example` 是起点，不能保证涵盖所有源码变量。
+历史静态键名见 [env-inventory](env-inventory.md)；新增托管 runtime/session 配置以 [App runtime](https://github.com/onride-app/predictly_server/blob/edf2eb19ea55106b517ac31cbe80a19db34d93b5/deploy/agent-runtime/README.md) 为准。`.env.example` 是开发起点，不能替代逐服务生产引用核对。
 
 | 配置组 | 配置方 | 秘密/轮换影响 |
 |---|---|---|
 | Gateway issuer/backend/Core URL、Privy app/client、trust-proxy | gateway运维 | URL不一定秘密，但连接串/API-key-bearing URL按秘密；issuer改变需重新OAuth |
-| `REDIS_URL`, `RIDE_AGENT_DATABASE_URL` | 数据库/Redis运维 | 含凭据；通过secret manager注入；备份不能放Git |
+| `REDIS_URL`, `RIDE_AGENT_DATABASE_URL` | App private owner 运维 | 指向 App Redis / 独立 Agent DB；托管 gateway 不持有；含凭据，备份不能放 Git |
+| `RIDE_AGENT_APP_SESSION_URL`, `RIDE_AGENT_APP_SESSION_TOKEN` | gateway 与 App session RPC | HTTPS App 入口与独立 S2S token；不等同 Core 用户 JWT/执行 token |
 | `RIDE_AGENT_HUMAN_COOKIE_KEY` | gateway | 独立>=32-byte秘密；变更会使浏览器human session失效 |
 | `RIDE_AGENT_CURSOR_KEY` | backend | 独立>=32字符签名key；轮换会影响旧cursor |
 | `RIDE_AGENT_EXECUTOR_TOKEN` | backend与bridge | 独立>=32字符S2S秘密，只分配对应服务 |
@@ -43,16 +63,22 @@
 | Core flags、Core S2S、`STRATEGY_CONTROL_PLANE_SERVICE_TOKEN` | Core API/gRPC/worker运维 | 本仓只消费既有契约，不在客户端保管签名密钥 |
 | GitHub/npm trusted publisher | release maintainer | workflow用OIDC，无需新增长期 npm token；当前publisher绑定/审批规则 TBD – confirm |
 
+### Performance cold-store 升级（已核验）
+
+业务模块 `18826aa6945239205a29bf6df6bccc7c4534b828` / archive `36b7dd7309957d27d097147cf5a89d5022cbd48e266e7eaaf0f86c5aed8d789a` 已部署到 `cae47a83-d72d-4b3c-898e-9f58e1113e69`，82 个 compiled module 全部实际核验。新增 `ride_agent_performance`、`ride_agent_performance_heads`、`ride_agent_performance_schema`，同用户行锁内惰性迁移；保留所有原始点和 ordinal，完整读取与 report baseline/连续性维持，monitor 使用最新 head和按需窗口。当前 3 个 eligible owner 无 inline performance；其他懒迁移 owner 的 44 点保留，不宣称全部 12 个 owner 已冷迁移。体积/CPU/RSS 的有界实测及限制见 [status](status.md)。
+
+`dd6dacd` / `0e13ef3` 虽支持此前 updates/decisions 冷表，却不能读取已剥离 performance 的热状态。回退必须先停并 drain owner，保留升级后当前完整数据库的最新 reverse snapshot，以 performance-aware binary 恢复；不能丢弃新写入或换 execution ID 重试。
+
 ## 环境与交接步骤
 
 - 本地：loopback HTTP +独立DB/Redis；fixture/functional test只使用一次性数据库。
 - CI：GitHub Actions PostgreSQL 17服务，Node 22检查；发布workflow Node 24/OIDC；测试凭据只是CI fixture，不作为任何线上凭据。
-- Hosted：gateway public HTTPS；backend/bridge/Core私网，service-to-service token分离；Railway precise private HTTP hostname用`RIDE_AGENT_PRIVATE_HTTP_HOST` allowlist。
+- Hosted：gateway public HTTPS → App public relay → private owner 的 loopback Node 模块；session RPC/用户 JWT/Core S2S token 分离。独立 self-hosting 的 private HTTP hostname allowlist 继续兼容。
 - 网络：bridge默认testnet；prediction无paper模式。`enabled`/read-only/mainnet/unified/RWA/prediction flags必须按各层分别核实。
 - 接手时逐项邀请独立账号，记录实际owner、资源ID和服务目标，将秘密通过密码管理器/平台secret共享。当前缺失owner不能用Git作者或本机已登录账号推断。
 - 备份/恢复频率、RPO/RTO、Redis持久化、监控告警、provider billing owner、on-call负责人：TBD – confirm。
 
-本次交接只读核对身份与部署元数据，没有转储或写出实际秘密值，也没有修改线上配置。
+原 2026-10-29 交接只读核对身份与部署元数据。新增生产迁移/停机事实只能引用本节实际凭据；文档不保存秘密值或私人数据库内容。
 
 ## 已核对的Railway资源定位（2026-10-29只读快照）
 
