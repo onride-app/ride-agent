@@ -28,6 +28,59 @@ async function assertHttpSuccess(
   assert.deepEqual(await outcome.response.json(), { ok: true });
 }
 
+const fixtureStages = new Set(["source", "account_admission", "history_wire"]);
+const fixtureCodes = new Set([
+  "VENUE_READ_BUDGET_EXHAUSTED",
+  "VENUE_READ_DEADLINE",
+  "VENUE_COST_PLAN_UNAVAILABLE",
+  "VENUE_RATE_LIMITED",
+  "VENUE_RESPONSE_INVALID",
+]);
+
+async function waitForFixtureEvent(
+  type: string,
+  messages: any[],
+  exited: () => boolean,
+  pending?: ReturnType<typeof captureHttpResponse>,
+) {
+  let completed: Awaited<ReturnType<typeof captureHttpResponse>> | undefined;
+  // captureHttpResponse never rejects. Observe completion without leaving a
+  // losing event-wait timer behind when HTTP fails before the held wire.
+  void pending?.then((outcome) => {
+    completed = outcome;
+  });
+  const until = Date.now() + 5000;
+  while (Date.now() < until) {
+    const found = messages.find((message) => message?.type === type);
+    if (found) return found;
+    const failed = messages.find((message) => message?.type === "read_error");
+    if (failed) {
+      const stage = fixtureStages.has(failed.stage) ? failed.stage : "OTHER";
+      const code = fixtureCodes.has(failed.code) ? failed.code : "OTHER";
+      assert.fail(`Fixture read failed before ${type}: ${stage}/${code}`);
+    }
+    if (completed) {
+      // Headers can arrive before a body that never completes. No body can
+      // substitute for the held wire, so fail without waiting beyond 5s.
+      // The positive path still verifies the original HTTP 200 and body.
+      if (!completed.ok) throw completed.error;
+      void completed.response.body?.cancel().catch(() => {});
+      assert.equal(completed.response.status, 200);
+      assert.fail(`Fixture HTTP completed before its required ${type} event`);
+    }
+    if (exited())
+      assert.fail("Fixture process exited before its bounded lifecycle event");
+    await delay(5);
+  }
+  const last = [...messages]
+    .reverse()
+    .find((message) => message?.type === "stage");
+  const stage = fixtureStages.has(last?.stage) ? last.stage : "OTHER";
+  assert.fail(
+    `Fixture process did not emit its bounded lifecycle event: ${type}/${stage}`,
+  );
+}
+
 const script = `
 import http from 'node:http';
 import { AccountObservationPlans } from './src/agent/account-observation-plans.ts';
@@ -39,6 +92,7 @@ const bridge = new CoreBridge('https://core.test','fixture',process.env.RIDE_AGE
 const store = new AccountObservationPlans(bridge.pool);
 await store.migrate();
 let releaseWire;
+let stage='source';
 process.on('message',message=>{
   if(message?.type==='release_wire'){
     const release=releaseWire;releaseWire=undefined;release?.();
@@ -47,18 +101,29 @@ process.on('message',message=>{
 const reads = new VenueReads(async (_url,init)=>{
   const payload=JSON.parse(String(init.body));
   if(payload.type==='userFillsByTime'){
+    stage='history_wire';
+    process.send({type:'stage',stage:'history_wire'});
     await new Promise(resolve=>{releaseWire=resolve;process.send({type:'wire'});});
   }
   return Response.json([]);
 },Date.now,2,{budget:new VenueReadBudget(),observationPlans:store});
 bridge.venueReads=reads;
 const server=http.createServer(async (_req,res)=>{
+  stage='source';
   try{
     if(process.env.COST_PLAN_FIXTURE_PHASE==='resume')
-      for(let i=0;i<6;i++) await reads.read('https://fixture.invalid/info',{type:'clearinghouseState',user:'fixture-source-'+i},0,'source');
+      for(let i=0;i<6;i++){
+        process.send({type:'stage',stage,source_index:i});
+        await reads.read('https://fixture.invalid/info',{type:'clearinghouseState',user:'fixture-source-'+i},0,'source');
+      }
+    stage='account_admission';process.send({type:'stage',stage});
     await reads.observeAccount(()=>reads.read('https://fixture.invalid/info',{type:'userFillsByTime'}),process.env.COST_PLAN_FIXTURE_OWNER);
     res.end(JSON.stringify({ok:true}));
-  }catch{res.statusCode=503;res.end(JSON.stringify({ok:false}));}
+  }catch(error){
+    const allowed=new Set(${JSON.stringify([...fixtureCodes])});
+    process.send({type:'read_error',stage,code:allowed.has(error?.code)?error.code:'OTHER'});
+    res.statusCode=503;res.end(JSON.stringify({ok:false}));
+  }
 });
 server.listen(0,'127.0.0.1',()=>process.send({type:'ready',port:server.address().port}));
 let stopping=false;
@@ -108,6 +173,111 @@ it("shutdown fixture captures transport rejection immediately and still requires
   }
 });
 
+it("shutdown fixture observes early HTTP and typed read failures instead of hiding them behind a wire timeout", async () => {
+  const messages: any[] = [];
+  let releaseWire: (() => void) | undefined;
+  let headersBodyEnded: (() => boolean) | undefined;
+  const server = createServer((request, response) => {
+    if (request.url === "/reset") return response.destroy();
+    if (request.url === "/headers-only") {
+      headersBodyEnded = () => response.writableEnded;
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.flushHeaders();
+      return;
+    }
+    const respond = () => {
+      response.statusCode = request.url === "/unavailable" ? 503 : 200;
+      response.end(JSON.stringify({ ok: response.statusCode === 200 }));
+    };
+    if (request.url === "/held") {
+      releaseWire = respond;
+      messages.push({ type: "wire" });
+    } else respond();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const origin = `http://127.0.0.1:${address.port}`;
+  try {
+    const reset = captureHttpResponse(fetch(`${origin}/reset`));
+    const outcome = await reset;
+    assert.equal(outcome.ok, false);
+    if (outcome.ok) assert.fail("The reset transport must reject");
+    await assert.rejects(
+      waitForFixtureEvent("wire", [], () => false, reset),
+      (error) => error === outcome.error,
+    );
+    await assert.rejects(
+      waitForFixtureEvent(
+        "wire",
+        [],
+        () => false,
+        captureHttpResponse(fetch(`${origin}/unavailable`)),
+      ),
+      { code: "ERR_ASSERTION", actual: 503, expected: 200 },
+    );
+    await assert.rejects(
+      waitForFixtureEvent(
+        "wire",
+        [],
+        () => false,
+        captureHttpResponse(fetch(`${origin}/ok`)),
+      ),
+      /HTTP completed before its required wire event/,
+    );
+    const headersOnly = new AbortController();
+    const boundary = setTimeout(() => headersOnly.abort(), 5000);
+    try {
+      await assert.rejects(
+        waitForFixtureEvent(
+          "wire",
+          [],
+          () => false,
+          captureHttpResponse(
+            fetch(`${origin}/headers-only`, { signal: headersOnly.signal }),
+          ),
+        ),
+        /HTTP completed before its required wire event/,
+      );
+      assert.ok(headersBodyEnded);
+      assert.equal(headersBodyEnded(), false);
+    } finally {
+      clearTimeout(boundary);
+      headersOnly.abort();
+    }
+    await assert.rejects(
+      waitForFixtureEvent(
+        "wire",
+        [
+          {
+            type: "read_error",
+            stage: "account_admission",
+            code: "VENUE_COST_PLAN_UNAVAILABLE",
+          },
+        ],
+        () => false,
+      ),
+      /account_admission\/VENUE_COST_PLAN_UNAVAILABLE/,
+    );
+    const response = captureHttpResponse(fetch(`${origin}/held`));
+    assert.equal(
+      (await waitForFixtureEvent("wire", messages, () => false, response)).type,
+      "wire",
+    );
+    assert.ok(releaseWire);
+    const release = releaseWire;
+    releaseWire = undefined;
+    release();
+    await assertHttpSuccess(response);
+  } finally {
+    releaseWire?.();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
 function fixture(
   owner: string,
   phase: "learn" | "resume",
@@ -140,19 +310,13 @@ function fixture(
   return {
     child,
     exit,
-    async wait(type: string) {
-      const until = Date.now() + 5000;
-      while (Date.now() < until) {
-        const found = messages.find((message) => message?.type === type);
-        if (found) return found;
-        if (child.exitCode !== null || child.signalCode !== null)
-          assert.fail(
-            "Fixture process exited before its bounded lifecycle event",
-          );
-        await delay(5);
-      }
-      assert.fail("Fixture process did not emit its bounded lifecycle event");
-    },
+    wait: (type: string, pending?: ReturnType<typeof captureHttpResponse>) =>
+      waitForFixtureEvent(
+        type,
+        messages,
+        () => child.exitCode !== null || child.signalCode !== null,
+        pending,
+      ),
   };
 }
 
@@ -248,7 +412,7 @@ it(
       const response = captureHttpResponse(
         fetch(`http://127.0.0.1:${ready.port}/read`),
       );
-      await first.wait("wire");
+      await first.wait("wire", response);
       const original = (
         await pool.query(
           "SELECT generation::text,dirty FROM ride_agent_account_cost_plans WHERE owner_key=$1",
@@ -276,7 +440,7 @@ it(
       const next = captureHttpResponse(
         fetch(`http://127.0.0.1:${resumed.port}/read`),
       );
-      await second.wait("wire");
+      await second.wait("wire", next);
       second.child.kill("SIGTERM");
       await second.wait("stop_started");
       second.child.send({ type: "release_wire" });
