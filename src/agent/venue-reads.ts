@@ -330,10 +330,10 @@ export class VenueReads {
       try {
         const value = await Promise.race([work(), cancelled]);
         this.accountReadTimeout();
-        complete = true;
         // All successful work has returned before cost publication. A failed,
         // still-pending, unknown or otherwise invalid scope yields no plan.
         scope.reservation?.close(true);
+        complete = true;
         const plan = scope.reservation?.costPlan();
         if (plan && scope.planLease && this.observationPlans) {
           const signal = this.callerSignal
@@ -420,26 +420,20 @@ export class VenueReads {
   }
   private async reserveFrame(
     scope: AccountReadScope,
-    reservation: AccountReadReservation,
+    reservation: { weight: number; mode: "learned" | "cold_trial" },
     signal: AbortSignal,
   ): Promise<void> {
     if (!this.frameCoordinator) return;
     const coordinator = this.frameCoordinator;
     // The cold local plan is a full-process-window placeholder (1000), not a
-    // proven provider cost. An explicit capacity trial books at most Core's
-    // hard capacity without rewriting that hint or promising completeness.
+    // proven provider cost. An explicit capacity trial books only its verified
+    // reservation without rewriting that hint or promising completeness.
     // If actual scope exceeds the booking, Core must reject the continuation;
     // no partial account evidence or reduced history can become a success.
-    const weight = Math.min(reservation.weight, coordinator.capacity);
-    if (weight < reservation.weight) this.frames.capacity_trials++;
+    const weight = reservation.weight;
+    if (reservation.mode === "cold_trial") this.frames.capacity_trials++;
     const pending = coordinator
-      .begin(
-        scope.owner!,
-        weight,
-        scope.queueUntil,
-        signal,
-        weight < reservation.weight ? "cold_trial" : "learned",
-      )
+      .begin(scope.owner!, weight, scope.queueUntil, signal, reservation.mode)
       .then((lease) => {
         if (
           !lease ||
@@ -541,8 +535,9 @@ export class VenueReads {
     // A near-ready FIFO slot should not be lost to a complete monitor cycle's
     // reconciliation and commit work. Wait only before the first venue read,
     // for at most one second in total, inside the original account deadline.
-    // No frame or provisional weight is held while waiting; every recheck must
-    // pass the same whole-observation admission gate again.
+    // Without fleet coordination, every near-ready retry passes the same local
+    // whole-observation gate. A Core grant instead makes one local attempt;
+    // a denial releases its unused fleet booking before returning to the runner.
     const until = Math.min(scope.until, this.clock() + 1000);
     const signal = this.callerSignal
       ? AbortSignal.any([scope.admission.signal, this.callerSignal])
@@ -591,24 +586,73 @@ export class VenueReads {
         throw costPlanUnavailable();
       }
     }
+    let fleetPlan:
+      { fullDemand: number; reservedWeight: number; cold: boolean } | undefined;
+    if (this.frameCoordinator) {
+      // A busy local source ledger must not prevent polling or expiring an
+      // already queued fleet reservation. This peek claims no local capacity
+      // and never changes the cold hint, plan lifetime or FIFO membership.
+      const historyReservation = readCost({ type: "userFillsByTime" }).reserve;
+      const trialCapacity = this.frameCoordinator.capacity - historyReservation;
+      const hint = this.budget.peekObservationFramePlan(
+        scope.owner!,
+        trialCapacity,
+      );
+      if (
+        (!hint.cold && hint.fullDemand > this.frameCoordinator.capacity) ||
+        (hint.cold && trialCapacity < Math.min(120, this.budget.limit))
+      ) {
+        throw new AgentError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          "Known account scope exceeds fleet capacity; fresh complete evidence is still required.",
+          true,
+          503,
+          { retry_after_ms: 60000, reason_code: "READ_FRAME_CAPACITY" },
+        );
+      }
+      fleetPlan = {
+        ...hint,
+        reservedWeight: hint.cold
+          ? Math.min(hint.fullDemand, trialCapacity)
+          : hint.fullDemand,
+      };
+      await this.reserveFrame(
+        scope,
+        {
+          weight: fleetPlan.reservedWeight,
+          mode: fleetPlan.cold ? "cold_trial" : "learned",
+        },
+        signal,
+      );
+    }
     let deferred: unknown;
     for (;;) {
       if (signal.aborted) throw signal.reason;
       this.accountReadTimeout();
       if (deferred && this.clock() > until) throw deferred;
       try {
-        const reservation = this.budget.beginObservation(scope.owner!);
-        // Fleet admission happens before any account venue read and before
-        // dirtying a durable cost-plan lease. A denied fleet booking must not
-        // consume a cheap prefix repeatedly or pretend that a full frame ran.
+        const reservation = this.budget.beginObservation(
+          scope.owner!,
+          fleetPlan?.cold
+            ? {
+                fullDemand: fleetPlan.fullDemand,
+                reservedWeight: fleetPlan.reservedWeight,
+              }
+            : undefined,
+        );
         scope.reservation = reservation;
-        try {
-          await this.reserveFrame(scope, reservation, signal);
-        } catch (error) {
+        // The hint may change while the private grant is in flight. Never
+        // spend a ticket whose actual full demand differs from that booking.
+        if (
+          fleetPlan &&
+          (reservation.fullDemand !== fleetPlan.fullDemand ||
+            reservation.weight !== fleetPlan.reservedWeight ||
+            reservation.capacityTrial !== fleetPlan.cold)
+        ) {
           reservation.close(false);
           scope.reservation = undefined;
           this.releaseFrame(scope);
-          throw error;
+          throw costPlanUnavailable();
         }
         if (this.observationPlans && durableHint) {
           scope.durableAttempted = true;
@@ -640,6 +684,13 @@ export class VenueReads {
         }
         return reservation;
       } catch (error) {
+        if (this.frameCoordinator) {
+          // Local quota, FIFO, cooldown and pacing remain authoritative even
+          // after a Core grant. Return that grant's unused credit immediately;
+          // do not poll a second fleet booking in this user transaction.
+          this.releaseFrame(scope);
+          throw error;
+        }
         const retry =
           error instanceof AgentError &&
           error.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
@@ -1037,7 +1088,17 @@ export class VenueReads {
         this.budget.quarantine();
         throw error;
       }
-      ticket.settle(actual);
+      let capacityFailure: AgentError | undefined;
+      try {
+        ticket.settle(actual);
+      } catch (error) {
+        if (
+          error instanceof AgentError &&
+          error.details?.reason_code === "READ_FRAME_CAPACITY"
+        )
+          capacityFailure = error;
+        else throw error;
+      }
       settled = true;
       this.count(cost.method, lane, "charged_weight", actual);
       if (cost.unknownSurcharge && actual > ticket.reservation) {
@@ -1049,6 +1110,7 @@ export class VenueReads {
           actual - ticket.reservation,
         );
       }
+      if (capacityFailure) throw capacityFailure;
       return data;
     } catch (error) {
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
