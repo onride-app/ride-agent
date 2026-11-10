@@ -290,7 +290,7 @@ it("caps queue plus wire at 20 seconds while a real unknown wire timeout still q
     }) as typeof fetch,
     time.clock,
     2,
-    { budget, timers: time.timers },
+    { budget, timers: time.timers, monotonicClock: time.clock },
   );
   const work = reads
     .observeAccount(() =>
@@ -320,7 +320,7 @@ it("retains the 12-second wire limit for an already-sent unknown response inside
     (async () => new Promise<Response>(() => {})) as typeof fetch,
     time.clock,
     2,
-    { budget, timers: time.timers },
+    { budget, timers: time.timers, monotonicClock: time.clock },
   );
   const work = reads
     .observeAccount(() =>
