@@ -178,7 +178,7 @@ it("a pacing grant cannot wait past the execution or original Core lease cutoff"
   }
 });
 
-it("does not wait on quota, exclusive unknown reads or cooldown even while pacing is also active", async () => {
+it("keeps hard quota and cooldown closed while rechecking an exclusive gate without refunding it", async () => {
   for (const gate of ["quota", "unknown", "cooldown"] as const) {
     const f = await auditedPacingFixture();
     let ticket;
@@ -197,15 +197,30 @@ it("does not wait on quota, exclusive unknown reads or cooldown even while pacin
       }
     } else f.budget.note429(30000);
     const at = f.t.clock();
-    await assert.rejects(
-      f.reads.observeAccount(
-        () => f.reads.read(url, { type: "allMids" }),
-        owner,
-      ),
+    const observation = f.reads.observeAccount(
+      () => f.reads.read(url, { type: "allMids" }),
+      owner,
     );
-    assert.equal(f.t.clock(), at);
-    assert.equal(f.calls.length, 4);
-    if (gate === "unknown") ticket!.release();
+    if (gate === "unknown") {
+      let done = false;
+      const result = observation.then((value) => {
+        done = true;
+        return value;
+      });
+      await f.t.advance(500);
+      assert.equal(done, false);
+      assert.equal(f.calls.length, 4);
+      assert.equal(f.budget.snapshot().used, 1000);
+      ticket!.release();
+      assert.equal(f.budget.snapshot().used, 80);
+      await f.t.advance(5500);
+      await result;
+      assert.equal(f.calls.length, 5);
+    } else {
+      await assert.rejects(observation);
+      assert.equal(f.t.clock(), at);
+      assert.equal(f.calls.length, 4);
+    }
     await f.reads.drainAccounts();
     assert.equal(f.ends.length, gate === "cooldown" ? 1 : 2);
   }
@@ -324,18 +339,28 @@ it("a waiting owner retains local FIFO and a later granted owner cannot use its 
     owner,
   );
   await flush();
-  await assert.rejects(
-    f.reads.observeAccount(
+  let laterDone = false;
+  const later = f.reads
+    .observeAccount(
       () => f.reads.read(url, { type: "allMids" }),
       "b".repeat(64),
-    ),
-  );
+    )
+    .then((value) => {
+      laterDone = true;
+      return value;
+    });
+  await flush();
+  assert.equal(laterDone, false);
   assert.equal(f.calls.length, 4);
   assert.equal(f.budget.snapshot().observations.started, 1);
   await f.t.advance(6000);
   await first;
-  await f.reads.drainAccounts();
+  assert.equal(laterDone, false);
   assert.equal(f.calls.length, 5);
+  await f.t.advance(10000);
+  await later;
+  await f.reads.drainAccounts();
+  assert.equal(f.calls.length, 6);
   assert.equal(f.ends.length, 3);
 });
 
@@ -546,7 +571,7 @@ it("polls a stable Core booking across busy local source rounds without taking a
   await reads.drainAccounts();
 });
 
-it("releases a Core grant immediately when the unchanged local quota is only milliseconds from ready", async () => {
+it("waits the real remaining quota expiry without credit forgiveness or a renewed Core grant", async () => {
   const t = time();
   let ended = 0,
     polls = 0,
@@ -572,17 +597,27 @@ it("releases a Core grant immediately when the unchanged local quota is only mil
   await paySource(budget, 300);
   await t.advance(59950);
   const at = t.clock();
-  await assert.rejects(
-    reads.observeAccount(() => reads.read(url, { type: "allMids" }), owner),
+  const observation = reads.observeAccount(
+    () => reads.read(url, { type: "allMids" }),
+    owner,
   );
   await flush();
   assert.equal(t.clock(), at);
   assert.equal(polls, 1);
-  assert.equal(ended, 1);
+  assert.equal(ended, 0);
   assert.equal(wireCalls, 0);
   assert.equal(budget.snapshot().used, 300);
   assert.equal(budget.snapshot().observations.started, 0);
+  await t.advance(49);
+  assert.equal(wireCalls, 0);
+  assert.equal(budget.snapshot().used, 300);
+  await t.advance(1);
+  await observation;
+  assert.equal(polls, 1);
+  assert.equal(wireCalls, 1);
+  assert.equal(budget.snapshot().used, 2);
   await reads.drainAccounts();
+  assert.equal(ended, 1);
 });
 
 it("fails closed and releases the grant when full local demand changes while Core admission is in flight", async () => {
@@ -655,28 +690,29 @@ it("keeps local owner FIFO authoritative when Core grants arrive behind another 
   });
   const active = budget.beginObservation("b".repeat(64)),
     later = "c".repeat(64);
-  await assert.rejects(
-    reads.observeAccount(() => reads.read(url, { type: "allMids" }), owner),
+  const firstRead = reads.observeAccount(
+    () => reads.read(url, { type: "allMids" }),
+    owner,
   );
-  await assert.rejects(
-    reads.observeAccount(() => reads.read(url, { type: "allMids" }), later),
+  const laterRead = reads.observeAccount(
+    () => reads.read(url, { type: "allMids" }),
+    later,
   );
   await flush();
   assert.equal(grants.length, 2);
-  assert.deepEqual(ended, grants);
+  assert.equal(ended.length, 0);
   assert.equal(wireCalls, 0);
   assert.equal(budget.snapshot().observation_active, true);
   assert.equal(budget.snapshot().observation_queued, 2);
   active.close(false);
-  assert.throws(
-    () => budget.beginObservation(later),
-    (e) => e instanceof AgentError && e.code === "VENUE_READ_BUDGET_EXHAUSTED",
-  );
-  const first = budget.beginObservation(owner);
-  first.close(false);
-  const second = budget.beginObservation(later);
-  second.close(false);
+  await t.advance(1500);
+  await firstRead;
+  await laterRead;
+  assert.equal(wireCalls, 2);
+  assert.equal(budget.snapshot().observation_active, false);
+  assert.equal(budget.snapshot().observation_queued, 0);
   await reads.drainAccounts();
+  assert.deepEqual(ended, grants);
 });
 
 it("drains a late grant despite busy source charges without reserving or refunding a local account ticket", async () => {

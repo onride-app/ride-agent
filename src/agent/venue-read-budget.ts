@@ -18,16 +18,37 @@ export const readTimers: BudgetTimers = {
     clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
-/** Internal scheduling distinction; the public error contract stays unchanged. */
-export class ObservationPacingDeferred extends AgentError {
-  constructor(retry: number) {
+type ObservationBeginReason =
+  | "READ_LOCAL_BUSY"
+  | "READ_LOCAL_FIFO"
+  | "READ_LOCAL_PACING"
+  | "READ_LOCAL_QUOTA"
+  | "READ_LOCAL_EXCLUSIVE"
+  | "READ_LOCAL_QUARANTINE";
+const beginDeferrals = new WeakSet<object>();
+/** Only BEGIN can create this brand. A read/remote error cannot authorize a wait. */
+export class ObservationAdmissionDeferred extends AgentError {
+  constructor(reason: ObservationBeginReason, retry: number) {
     super(
       "VENUE_READ_BUDGET_EXHAUSTED",
       "Complete account observation is queued before venue reads begin.",
       true,
       503,
-      { retry_after_ms: retry },
+      { retry_after_ms: retry, reason_code: reason },
     );
+    beginDeferrals.add(this);
+  }
+}
+export function isObservationAdmissionDeferred(
+  error: unknown,
+): error is ObservationAdmissionDeferred {
+  return (
+    error instanceof ObservationAdmissionDeferred && beginDeferrals.has(error)
+  );
+}
+export class ObservationPacingDeferred extends ObservationAdmissionDeferred {
+  constructor(retry: number) {
+    super("READ_LOCAL_PACING", retry);
   }
 }
 
@@ -129,7 +150,17 @@ export class VenueReadBudget {
   private observation?: Observation;
   private observationQueue = new Map<
     string,
-    { demand: number; seen: number }
+    {
+      demand: number;
+      seen: number;
+      legacy: boolean;
+      legacySeen: number;
+      interests: Set<object>;
+    }
+  >();
+  private observationInterests = new Map<
+    object,
+    { owner: string; waiting: boolean }
   >();
   private observationPlans = new Map<
     string,
@@ -241,8 +272,15 @@ export class VenueReadBudget {
         !this.observationQueue.has(owner)
       )
         this.observationPlanAttempts.delete(owner);
-    for (const [key, entry] of this.observationQueue)
-      if (entry.seen <= now - 120000) this.observationQueue.delete(key);
+    for (const [key, entry] of this.observationQueue) {
+      if (entry.legacy && entry.legacySeen <= now - 120000)
+        entry.legacy = false;
+      if (
+        !entry.legacy &&
+        (entry.interests.size === 0 || entry.seen <= now - 120000)
+      )
+        this.observationQueue.delete(key);
+    }
     this.charges = this.charges.filter(
       (c) => !c.sent || !c.settled || c.at > now - 60000,
     );
@@ -356,11 +394,10 @@ export class VenueReadBudget {
   peekObservationDemand(owner: string): number {
     const now = this.clock();
     const queued = this.observationQueue.get(owner);
-    if (queued && queued.seen > now - 120000) return queued.demand;
     const plan = this.observationPlans.get(owner);
-    return plan && plan.seen >= now - ACCOUNT_OBSERVATION_PLAN_TTL_MS
-      ? plan.demand
-      : this.limit;
+    if (!plan || plan.seen < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
+      return this.limit;
+    return queued && queued.seen > now - 120000 ? queued.demand : plan.demand;
   }
   peekObservationFramePlan(owner: string, trialCapacity: number) {
     const fullDemand = this.peekObservationDemand(owner);
@@ -382,16 +419,7 @@ export class VenueReadBudget {
       cold: fullDemand === this.limit && (!plan || !!conservativeFullHint),
     };
   }
-  beginObservation(
-    owner: string,
-    capacityTrial?: { fullDemand: number; reservedWeight: number },
-  ): AccountReadReservation {
-    this.prune();
-    const now = this.clock();
-    for (const [key, entry] of this.observationPlans)
-      if (entry.seen < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
-        this.observationPlans.delete(key);
-    if (this.cooldownRemaining() > 0) throw this.coolingDown();
+  private observationEntry(owner: string, legacy: boolean) {
     let entry = this.observationQueue.get(owner);
     if (!entry) {
       if (
@@ -400,13 +428,68 @@ export class VenueReadBudget {
           !this.observationPlans.has(owner))
       )
         throw this.denied(true);
+      const plan = this.observationPlans.get(owner);
       entry = {
-        demand: this.observationPlans.get(owner)?.demand ?? this.limit,
-        seen: now,
+        demand:
+          plan && plan.seen >= this.clock() - ACCOUNT_OBSERVATION_PLAN_TTL_MS
+            ? plan.demand
+            : this.limit,
+        seen: this.clock(),
+        legacy,
+        legacySeen: legacy ? this.clock() : 0,
+        interests: new Set<object>(),
       };
       this.observationQueue.set(owner, entry);
     }
-    entry.seen = now;
+    if (legacy) {
+      entry.legacy = true;
+      entry.legacySeen = this.clock();
+    }
+    entry.seen = this.clock();
+    return entry;
+  }
+  /** Called only AFTER a fleet grant. This reserves no fee or local ticket. */
+  beginObservationInterest(owner: string): object {
+    this.prune();
+    if (this.observationInterests.size >= 256) throw costPlanUnavailable();
+    const token = {};
+    this.observationEntry(owner, false).interests.add(token);
+    this.observationInterests.set(token, { owner, waiting: true });
+    return token;
+  }
+  endObservationInterest(token: object): void {
+    const interest = this.observationInterests.get(token);
+    if (!interest) return;
+    this.observationInterests.delete(token);
+    if (!interest.waiting) return;
+    this.prune();
+    const entry = this.observationQueue.get(interest.owner);
+    if (
+      entry?.interests.delete(token) &&
+      !entry.legacy &&
+      entry.interests.size === 0
+    )
+      this.observationQueue.delete(interest.owner);
+    this.pump();
+  }
+  beginObservation(
+    owner: string,
+    capacityTrial?: { fullDemand: number; reservedWeight: number },
+    interestToken?: object,
+  ): AccountReadReservation {
+    this.prune();
+    const now = this.clock();
+    for (const [key, entry] of this.observationPlans)
+      if (entry.seen < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
+        this.observationPlans.delete(key);
+    if (this.cooldownRemaining() > 0) throw this.coolingDown();
+    const interest = interestToken
+      ? this.observationInterests.get(interestToken)
+      : undefined;
+    if (interestToken && (!interest?.waiting || interest.owner !== owner))
+      throw costPlanUnavailable();
+    const entry = this.observationEntry(owner, interestToken === undefined);
+    if (interestToken) entry.interests.add(interestToken);
     if (
       capacityTrial &&
       (!Number.isSafeInteger(capacityTrial.reservedWeight) ||
@@ -423,11 +506,14 @@ export class VenueReadBudget {
     if (this.observation || first !== owner) {
       this.observations.deferred++;
       this.pump();
-      throw this.observationDeferred(
-        Math.min(
-          60000,
-          Math.max(1000, Math.ceil(this.nextObservationAt - now)),
-        ),
+      throw new ObservationAdmissionDeferred(
+        this.observation ? "READ_LOCAL_BUSY" : "READ_LOCAL_FIFO",
+        interestToken
+          ? 1000
+          : Math.min(
+              60000,
+              Math.max(1000, Math.ceil(this.nextObservationAt - now)),
+            ),
       );
     }
     if (now < this.nextObservationAt) {
@@ -436,26 +522,52 @@ export class VenueReadBudget {
         60000,
         Math.max(1, Math.ceil(this.nextObservationAt - now)),
       );
-      // Pacing is waitable only when every other local gate is ready now.
+      // Legacy retry hints remain unchanged. Fleet callers can distinguish
+      // the actual hard gate and may only recheck it before any local ticket.
       if (
         this.exclusive ||
         now < this.blockedUntil ||
         this.used() + reservedWeight > this.limit
       )
-        throw this.observationDeferred(retry);
+        throw new ObservationAdmissionDeferred(
+          this.exclusive
+            ? "READ_LOCAL_EXCLUSIVE"
+            : now < this.blockedUntil
+              ? "READ_LOCAL_QUARANTINE"
+              : "READ_LOCAL_QUOTA",
+          interestToken
+            ? this.exclusive
+              ? 1000
+              : now < this.blockedUntil
+                ? Math.min(
+                    60000,
+                    Math.max(1, Math.ceil(this.blockedUntil - now)),
+                  )
+                : this.denied(true, reservedWeight).details!.retry_after_ms!
+            : retry,
+        );
       throw new ObservationPacingDeferred(retry);
     }
     if (this.exclusive) {
       this.observations.deferred++;
-      throw this.observationDeferred(1000);
+      throw new ObservationAdmissionDeferred("READ_LOCAL_EXCLUSIVE", 1000);
     }
     if (now < this.blockedUntil || this.used() + reservedWeight > this.limit) {
       this.observations.deferred++;
       const error = this.denied(true, reservedWeight);
       this.pump();
-      throw error;
+      if (!interestToken) throw error;
+      throw new ObservationAdmissionDeferred(
+        now < this.blockedUntil ? "READ_LOCAL_QUARANTINE" : "READ_LOCAL_QUOTA",
+        error.details!.retry_after_ms!,
+      );
     }
-    this.observationQueue.delete(owner);
+    if (interestToken) {
+      entry.interests.delete(interestToken);
+      interest!.waiting = false;
+    } else entry.legacy = false;
+    if (!entry.legacy && entry.interests.size === 0)
+      this.observationQueue.delete(owner);
     let learnedCostPlan: ObservationCostPlan | null = null;
     const ticket: AccountReadReservation = {
       id: ++this.observationSequence,
@@ -544,7 +656,7 @@ export class VenueReadBudget {
       "Complete account observation is queued before venue reads begin.",
       true,
       503,
-      { retry_after_ms: retry },
+      { retry_after_ms: retry, reason_code: "READ_LOCAL_TICKET_STALE" },
     );
   }
   private finishObservation() {

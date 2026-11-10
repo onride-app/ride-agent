@@ -157,7 +157,7 @@ it("records typed sent and unsent read errors only as diagnostics without invent
     );
     assert.deepEqual(e.first_submission_failure, {
       code: "VENUE_READ_BUDGET_EXHAUSTED",
-      reason_code: sent ? "OTHER" : "READ_LOCAL_BUDGET_UNSENT",
+      reason_code: sent ? "READ_CORE_BUDGET_SENT" : "READ_LOCAL_BUDGET_UNSENT",
       retryable: true,
       at: 1000,
       elapsed_ms: 500,
@@ -334,7 +334,7 @@ for (const sent of [false, true])
     );
     assert.equal(
       saved.first_submission_failure?.reason_code,
-      sent ? "OTHER" : "READ_LOCAL_BUDGET_UNSENT",
+      sent ? "READ_CORE_BUDGET_SENT" : "READ_LOCAL_BUDGET_UNSENT",
     );
   });
 
