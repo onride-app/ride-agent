@@ -1,4 +1,8 @@
 import { AgentError } from "./contracts.js";
+import {
+  nativeSourceBudgetTerms,
+  type NativeSourcePlan,
+} from "./native-source-plan.js";
 import { UNSENT_READ_BUDGET_REASON } from "./venue-read-transport.js";
 import {
   ACCOUNT_OBSERVATION_PLAN_TTL_MS,
@@ -95,6 +99,8 @@ export interface PreparedSupplementPlan {
   readonly key: string;
   readonly sourceWeight: number;
   readonly historyWeights: Readonly<Record<string, number>>;
+  readonly nativePlan?: NativeSourcePlan;
+  readonly nativeContractKey?: string;
 }
 type Observation = {
   ticket: AccountReadReservation;
@@ -507,6 +513,7 @@ export class VenueReadBudget {
   preparedSupplementPlan(
     key: string,
     historySources: readonly string[],
+    nativePlan?: NativeSourcePlan,
   ): PreparedSupplementPlan {
     if (
       typeof key !== "string" ||
@@ -525,9 +532,13 @@ export class VenueReadBudget {
       if (hint.at < at - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
         this.supplementHints.delete(id);
     const hint = this.supplementHints.get(key);
+    const native = nativePlan
+      ? nativeSourceBudgetTerms(nativePlan, this, key, historySources)
+      : undefined;
     const plan = Object.freeze({
       key,
-      sourceWeight: Math.max(120, hint?.source ?? 0),
+      sourceWeight: Math.max(native?.sourceWeight ?? 120, hint?.source ?? 0),
+      ...(native ? { nativePlan, nativeContractKey: native.contractKey } : {}),
       historyWeights: Object.freeze(
         Object.fromEntries(
           historySources.map((source) => [
@@ -545,9 +556,14 @@ export class VenueReadBudget {
     sources: readonly string[],
   ): boolean {
     if (!this.supplementSnapshots.has(plan)) return false;
-    const current = this.preparedSupplementPlan(plan.key, sources);
+    const current = this.preparedSupplementPlan(
+      plan.key,
+      sources,
+      plan.nativePlan,
+    );
     return (
       current.sourceWeight === plan.sourceWeight &&
+      current.nativeContractKey === plan.nativeContractKey &&
       sources.length === Object.keys(plan.historyWeights).length &&
       sources.every(
         (source) =>

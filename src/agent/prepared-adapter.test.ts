@@ -62,6 +62,7 @@ function execution(p: ReturnType<typeof fixturePortfolio>): Execution {
 type Call = {
   operation: string;
   header: string | undefined;
+  sourceGraph: string | undefined;
   raw: string;
   body: any;
 };
@@ -70,6 +71,7 @@ async function transport(
   work: (adapter: BridgeAdapter, calls: Call[]) => Promise<void>,
   options: {
     finish?: () => unknown | Promise<unknown>;
+    cancel?: () => unknown;
     monotonicClock?: () => number;
   } = {},
 ) {
@@ -81,6 +83,7 @@ async function transport(
     calls.push({
       operation,
       header: req.get("x-ride-read-window"),
+      sourceGraph: req.get("x-ride-source-read-graph"),
       raw: req.body,
       body: JSON.parse(req.body),
     });
@@ -94,7 +97,9 @@ async function transport(
       if (value instanceof AgentError)
         res.status(value.httpStatus).json(failure(value));
       else res.json(value);
-    } else if (operation === "prepare_execution") res.json({ ready: true });
+    } else if (operation === "cancel_prepared_portfolio" && options.cancel)
+      res.json(options.cancel());
+    else if (operation === "prepare_execution") res.json({ ready: true });
     else if (operation === "account") res.json(snapshot());
     else if (operation === "source")
       res.json({
@@ -140,6 +145,93 @@ const readonlyReady = () => ({
   ...ready(),
   purpose: "audit_source",
   execution_eligible: false,
+});
+
+it("Runner readonly preparation and cancellation carry only the private graph header, with unchanged JSON", async () => {
+  await transport(
+    readonlyReady,
+    async (adapter, calls) => {
+      const p = fixturePortfolio(),
+        input = preparedPortfolioInput(p, "audit_source");
+      const result = await adapter.withPreparedPortfolio(
+        "user",
+        input,
+        async () => "read-only-result",
+      );
+      assert.equal(result.state, "complete");
+      await adapter.cancelPreparedPortfolio("user", input);
+      await adapter.account("user", p);
+      for (const operation of [
+        "prepare_portfolio",
+        "cancel_prepared_portfolio",
+      ]) {
+        const call = calls.find((item) => item.operation === operation)!;
+        assert.equal(call.sourceGraph, "readonly-runner-native-v1");
+        assert.equal(call.header, undefined);
+        assert.deepEqual(
+          call.body,
+          JSON.parse(JSON.stringify({ user_id: "user", portfolio: input })),
+        );
+      }
+      for (const call of calls.filter(
+        (item) =>
+          !["prepare_portfolio", "cancel_prepared_portfolio"].includes(
+            item.operation,
+          ),
+      ))
+        assert.equal(call.sourceGraph, undefined);
+    },
+    { cancel: () => ({ ok: true, pending_cancelled: true }) },
+  );
+});
+
+it("ordinary financial preparation preserves the generic bridge graph and existing JSON", async () => {
+  await transport(ready, async (adapter, calls) => {
+    const p = fixturePortfolio(),
+      input = preparedPortfolioInput(p);
+    await adapter.withPreparedPortfolio("user", input, async () => undefined);
+    await adapter.cancelPreparedPortfolio("user", input);
+    assert.ok(calls.length >= 3);
+    assert.ok(calls.every((call) => call.sourceGraph === undefined));
+    assert.deepEqual(
+      calls.find((call) => call.operation === "prepare_portfolio")!.body,
+      JSON.parse(JSON.stringify({ user_id: "user", portfolio: input })),
+    );
+  });
+});
+
+it("a private graph hint cannot be attached to other operations, purposes or unknown graph versions", async () => {
+  await transport(readonlyReady, async (adapter, calls) => {
+    const p = fixturePortfolio();
+    const invoke = (
+      adapter as unknown as { call(...args: unknown[]): Promise<unknown> }
+    ).call.bind(adapter);
+    for (const [operation, input, graph] of [
+      [
+        "account",
+        { user_id: "user", portfolio: p },
+        "readonly-runner-native-v1",
+      ],
+      [
+        "prepare_portfolio",
+        { user_id: "user", portfolio: preparedPortfolioInput(p) },
+        "readonly-runner-native-v1",
+      ],
+      [
+        "prepare_portfolio",
+        {
+          user_id: "user",
+          portfolio: preparedPortfolioInput(p, "audit_source"),
+        },
+        "unknown-version",
+      ],
+    ] as const)
+      await assert.rejects(
+        invoke(operation, input, undefined, undefined, graph),
+        { code: "SOURCE_SCOPE_UNAVAILABLE" },
+      );
+    assert.equal(calls.length, 0);
+  });
 });
 
 it("requires explicit readonly purpose echo and never treats an old warm reply as financial authority", async () => {

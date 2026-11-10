@@ -21,6 +21,7 @@ import {
 import { recommend, fingerprint, type Execution } from "./domain.js";
 import { candidate } from "./fixtures.js";
 import { AccountObservationPlans } from "./account-observation-plans.js";
+import { PerpsSourceIdentities } from "./source-identities.js";
 import { fromPlan } from "./service.js";
 import {
   preparedPortfolioInput,
@@ -95,6 +96,34 @@ function elapsedIoClock(time: Time, clock = () => performance.now()) {
     );
 }
 
+async function driveIo<T>(time: Time, work: Promise<T>) {
+  const sync = elapsedIoClock(time);
+  let done = false,
+    value!: T,
+    error: unknown;
+  void work.then(
+    (v) => {
+      done = true;
+      value = v;
+    },
+    (e) => {
+      done = true;
+      error = e;
+    },
+  );
+  for (let n = 0; !done && n < 25000; n++) {
+    await sync();
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(
+    done,
+    true,
+    "real I/O must settle within the original bounded window",
+  );
+  if (error) throw error;
+  return value;
+}
+
 it("4ms I/O wakes preserve the original5s backoff before real20s HTTP cancellation without counting wakes as milliseconds", async () => {
   for (const aligned of [false, true]) {
     const time = new Time();
@@ -130,6 +159,7 @@ async function fixture(
     threeSources?: boolean;
     existingSourceBackoff?: boolean;
     concentratedSources?: boolean;
+    nativeSources?: boolean;
   } = {},
 ) {
   const time = new Time();
@@ -204,6 +234,25 @@ async function fixture(
     reads: any[] = [],
     events: string[] = [],
     begins: any[] = [];
+  const nativeIdentities = new Map<
+    string,
+    { address: string; requires_rwa: boolean }
+  >();
+  if (options.nativeSources) {
+    sourceRows.forEach((row, i) => {
+      row.trader = b.sourceIdentities.id(row.address);
+      p.sleeves[i].trader.id = row.trader;
+      nativeIdentities.set(row.trader, {
+        address: row.address,
+        requires_rwa: false,
+      });
+    });
+    b.sourceIdentities.resolve = async (id: string) => {
+      const row = nativeIdentities.get(id);
+      assert.ok(row);
+      return { ...row };
+    };
+  }
   let paid = options.cold ? 120 : options.unified ? 532 : 412,
     held = 0,
     frameId = "",
@@ -498,6 +547,7 @@ async function fixture(
           return true;
         },
       },
+      ...(options.nativeSources ? { nativeSourcePlanIssuer: bridge } : {}),
     },
   );
   b.core = async (op: string) => {
@@ -518,6 +568,13 @@ async function fixture(
     return { task_id: "original-fixture-task" };
   };
   b.resolve = async (id: string) => {
+    if (options.nativeSources) {
+      const row = await b.sourceIdentities.resolve(id);
+      return {
+        address: row.address,
+        tags: row.requires_rwa ? ["category:stocks_rwa"] : [],
+      };
+    }
     if (!options.threeSources) return { address: source, tags: [] };
     const selected = sourceRows.find((row) => row.trader === id);
     assert.ok(
@@ -590,12 +647,19 @@ async function fixture(
     end: async () => {},
   };
   t.after(async () => bridge.close());
-  async function prepare(purpose?: "audit_source") {
+  async function prepare(purpose?: "audit_source", nativeGraph = false) {
     return (await time.run(
-      bridge.operation("prepare_portfolio", {
-        user_id: graphUser,
-        portfolio: preparedPortfolioInput(p, purpose),
-      }),
+      bridge.operation(
+        "prepare_portfolio",
+        {
+          user_id: graphUser,
+          portfolio: preparedPortfolioInput(p, purpose),
+        },
+        undefined,
+        undefined,
+        undefined,
+        nativeGraph ? "readonly-runner-native-v1" : undefined,
+      ),
     )) as any;
   }
   async function audit(ready: any) {
@@ -707,6 +771,8 @@ async function fixture(
       paid = value;
     },
     planDemand: () => plan?.demand,
+    sourceRows,
+    nativeIdentities,
     pendingFrames: (value: boolean) => {
       pendingFrames = value;
     },
@@ -981,6 +1047,168 @@ it("testnet and unmanaged read routes return unsupported without invoking paired
   assert.deepEqual(await f.prepare(), { state: "unsupported" });
   assert.equal(f.begins.length, 0);
   assert.equal(f.bank().posts, 0);
+});
+
+for (const nativeGraph of [false, true])
+  it(
+    nativeGraph
+      ? "native readonly graph refuses generic plan evidence and cannot be cancelled through the generic graph"
+      : "a generic no-header readonly window keeps S120 and its existing plan-evidence graph",
+    async (t) => {
+      const f = await fixture(t, {
+        unified: true,
+        threeSources: true,
+        nativeSources: true,
+      });
+      const ready = await f.prepare("audit_source", nativeGraph);
+      assert.equal(ready.state, "ready");
+      assert.equal(f.begins[0].weight, nativeGraph ? 214 : 304);
+      await f.audit(ready);
+      const before = f.reads.length;
+      const work = () =>
+        f.time.run(
+          f.bridge.operation(
+            "read_plan_evidence",
+            {
+              traders: f.p.sleeves.slice(0, 1).map((s) => s.trader),
+            },
+            undefined,
+            undefined,
+            ready.handle,
+          ),
+        );
+      if (nativeGraph) {
+        await assert.rejects(work());
+        assert.equal(
+          f.reads.length,
+          before,
+          "the generic graph cannot spend the bounded native pool",
+        );
+      } else {
+        const result = await work();
+        assert.ok(result);
+        assert.ok(
+          f.reads.length > before,
+          "the old general-purpose read graph still dispatches normally",
+        );
+      }
+      const compact = preparedPortfolioInput(f.p, "audit_source");
+      assert.deepEqual(
+        await f.bridge.operation(
+          "cancel_prepared_portfolio",
+          { user_id: graphUser, portfolio: compact },
+          undefined,
+          undefined,
+          undefined,
+          nativeGraph ? undefined : "readonly-runner-native-v1",
+        ),
+        { ok: true, pending_cancelled: false },
+      );
+      assert.ok(
+        f.bank().held > 0,
+        "a mismatched graph cannot release a live peer",
+      );
+      await f.bridge.operation(
+        "finish_portfolio",
+        { user_id: graphUser },
+        undefined,
+        undefined,
+        ready.handle,
+      );
+      assert.equal(f.bank().held, 0);
+      assert.equal(f.bank().posts, 0);
+    },
+  );
+
+it("a pending native episode is cancelled only by its exact graph and never lends its pin to a generic replacement", async (t) => {
+  const f = await fixture(t, {
+    unified: true,
+    threeSources: true,
+    nativeSources: true,
+  });
+  f.pendingFrames(true);
+  assert.equal((await f.prepare("audit_source", true)).state, "pending");
+  const compact = preparedPortfolioInput(f.p, "audit_source"),
+    original = structuredClone(f.begins[0]);
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: compact,
+    }),
+    { ok: true, pending_cancelled: false },
+  );
+  assert.equal(f.events.includes("end"), false);
+  assert.equal((await f.prepare("audit_source", true)).state, "pending");
+  assert.deepEqual(f.begins[1], original);
+  assert.deepEqual(
+    await f.bridge.operation(
+      "cancel_prepared_portfolio",
+      { user_id: graphUser, portfolio: compact },
+      undefined,
+      undefined,
+      undefined,
+      "readonly-runner-native-v1",
+    ),
+    { ok: true, pending_cancelled: true },
+  );
+  assert.equal(f.events.filter((e) => e === "end").length, 1);
+  assert.equal(f.reads.length, 0);
+});
+
+it("fresh RWA authority cannot mint a discounted source graph from native candidate labels", async (t) => {
+  const f = await fixture(t, {
+    unified: true,
+    threeSources: true,
+    nativeSources: true,
+  });
+  f.nativeIdentities.get(f.p.sleeves[0].trader.id)!.requires_rwa = true;
+  const ready = await f.prepare("audit_source", true);
+  assert.equal(ready.state, "ready");
+  assert.equal(
+    f.begins[0].weight,
+    304,
+    "authoritative broader scope retains the whole original S120",
+  );
+  const entry = [...f.b.preparedEntries.values()][0] as any;
+  assert.equal(entry.nativeSourcePlan, undefined);
+  await f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    ready.handle,
+  );
+  assert.equal(f.reads.length, 0);
+});
+
+it("a prediction-recognized source retains S120 even when its candidate labels and PG identity are native", async (t) => {
+  const f = await fixture(t, {
+    unified: true,
+    threeSources: true,
+    nativeSources: true,
+  });
+  const old = process.env.RIDE_AGENT_PREDICTION_ENABLED;
+  process.env.RIDE_AGENT_PREDICTION_ENABLED = "true";
+  t.after(() => {
+    if (old === undefined) delete process.env.RIDE_AGENT_PREDICTION_ENABLED;
+    else process.env.RIDE_AGENT_PREDICTION_ENABLED = old;
+  });
+  f.b.prediction.recognizes = async () => true;
+  const ready = await f.prepare("audit_source", true);
+  assert.equal(ready.state, "ready");
+  assert.equal(f.begins[0].weight, 304);
+  assert.equal(
+    ([...f.b.preparedEntries.values()][0] as any).nativeSourcePlan,
+    undefined,
+  );
+  await f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    ready.handle,
+  );
+  assert.equal(f.reads.length, 0);
 });
 
 it("successful audit registers a repeated selected trader and identical scope only once", async (t) => {
@@ -1442,6 +1670,7 @@ for (const {
   readonlyFixed,
   incompleteHistory,
   slowHistory,
+  nativeSources,
 } of [
   {
     threeSources: false,
@@ -1485,23 +1714,33 @@ for (const {
     incompleteHistory: false,
     slowHistory: true,
   },
+  {
+    threeSources: true,
+    existingSourceBackoff: false,
+    readonlyFixed: true,
+    incompleteHistory: false,
+    slowHistory: false,
+    nativeSources: true,
+  },
 ])
   it(
     "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, " +
       (readonlyFixed
         ? "readonly mixedFixed A/S/F with zero financial identifiers ("
         : "both fresh scopes and one original outbox (") +
-      (slowHistory
-        ? "slow complete history cannot advance a stale source cursor"
-        : incompleteHistory
-          ? "full history page cannot advance its cursor"
-          : readonlyFixed
-            ? "complete original cursor strategy"
-            : existingSourceBackoff
-              ? "three distinct sources after existing UNSENT backoff"
-              : threeSources
-                ? "three distinct sources"
-                : "one source") +
+      (nativeSources
+        ? "native graph complete original cursor strategy"
+        : slowHistory
+          ? "slow complete history cannot advance a stale source cursor"
+          : incompleteHistory
+            ? "full history page cannot advance its cursor"
+            : readonlyFixed
+              ? "complete original cursor strategy"
+              : existingSourceBackoff
+                ? "three distinct sources after existing UNSENT backoff"
+                : threeSources
+                  ? "three distinct sources"
+                  : "one source") +
       ")",
     { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
     async (t) => {
@@ -1510,6 +1749,7 @@ for (const {
           threeSources,
           existingSourceBackoff,
           concentratedSources: readonlyFixed,
+          nativeSources,
         }),
         url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
       assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
@@ -1545,12 +1785,16 @@ for (const {
       }
       // Only startup dependencies are fixture transports; the actual authenticated
       // Express route, operation dispatcher and all financial read functions run.
+      let actualBridge!: CoreBridge;
       t.mock.method(
         CoreBridge.prototype,
         "migrate",
         async function (this: CoreBridge) {
           await (this as any).pool.end();
           Object.assign(this, f.b);
+          actualBridge = this;
+          if (nativeSources)
+            (this as any).venueReads.nativeSourcePlanIssuer = this;
         },
       );
       const managed = await startManagedCoreBridge({
@@ -1562,6 +1806,24 @@ for (const {
         "http://127.0.0.1:" + (managed.listener.address() as AddressInfo).port,
         fixtureEnv.RIDE_AGENT_EXECUTOR_TOKEN,
       );
+      if (nativeSources) {
+        const identities = new PerpsSourceIdentities(
+          repository.pool,
+          "s".repeat(32),
+          async () => {
+            assert.fail("known source identities must resolve from PG");
+          },
+        );
+        await identities.migrate();
+        await identities.remember(
+          f.sourceRows.map((row) => ({
+            address: row.address,
+            requires_rwa: false,
+          })),
+        );
+        f.b.sourceIdentities = identities;
+        (actualBridge as any).sourceIdentities = identities;
+      }
       adapter.notify = async () => {};
       const originalHistory = Array.from({ length: 5 }, (_, i) => {
         const frozen = {
@@ -1673,7 +1935,10 @@ for (const {
       // The preceding charges have really aged out of the local ledger. This
       // finite external-ledger fixture offers just enough room for the warm pair.
       f.resetBank(
-        900 - (readonlyFixed ? f.planDemand() + 120 + 240 : 2 * f.planDemand()),
+        900 -
+          (readonlyFixed
+            ? f.planDemand() + (nativeSources ? 34 : 120) + 240
+            : 2 * f.planDemand()),
       );
       const originalCursor = state.portfolios[0].sleeves[2]?.fixed_last_fill_at;
       if (incompleteHistory) f.fullSourceHistoryPage();
@@ -1727,7 +1992,7 @@ for (const {
         );
         assert.equal(f.outboxes.size, 0);
         assert.equal(f.bank().posts, 0);
-        assert.equal(f.begins.at(-1).weight, 544);
+        assert.equal(f.begins.at(-1).weight, nativeSources ? 458 : 544);
         assert.equal(f.begins.at(-1).mode, "learned");
         const freshReads = f.reads.slice(before),
           sourceReads = freshReads.filter(
@@ -1790,7 +2055,10 @@ for (const {
           );
           assert.equal(saved.target_blocker, undefined);
           assert.equal(saved.last_error, undefined);
-          assert.equal(f.bank().paid, 356 + 144 + 6 + 65);
+          assert.equal(
+            f.bank().paid,
+            (nativeSources ? 442 : 356) + 144 + 6 + 65,
+          );
         }
         assert.equal(f.bank().held, 0);
         return;
@@ -1897,187 +2165,245 @@ for (const {
       );
     },
   );
-it(
-  "actual CoreBridge keeps a readonly pending544 episode across a fresh real-PG184 to164 generation and audits in local524",
-  {
-    skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL,
-    timeout: 30000,
-  },
-  async (t) => {
-    const f = await fixture(t, { unified: true, threeSources: true });
-    const fixed = f.p.sleeves[2];
-    fixed.copy_mode = "fixed";
-    fixed.fixed_last_fill_at = f.time.at - 10000;
-    f.resetBank(356);
-    const url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
-    assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
-    const admin = new pg.Pool({ connectionString: url.toString(), max: 2 });
-    const schema = "monotone_graph_" + randomUUID().replaceAll("-", "");
-    await admin.query("CREATE SCHEMA " + schema);
-    url.searchParams.set("options", "-c search_path=" + schema);
-    const pool = new pg.Pool({ connectionString: url.toString(), max: 2 });
-    t.after(async () => {
-      await pool.end();
-      await admin.query("DROP SCHEMA " + schema + " CASCADE");
-      await admin.end();
-    });
-    const plans = new AccountObservationPlans(pool);
-    await plans.migrate();
-    const compact = preparedPortfolioInput(f.p, "audit_source");
-    const owner = await f.b.preparedIdentity(graphUser, compact);
-    const signal = new AbortController().signal;
-    let lease = await plans.begin(owner, signal);
-    assert.equal(
-      await plans.complete(lease, { demand: 184, peaks: [164] }, signal),
-      true,
-    );
-    // The fixture keeps its real CoreBridge, VenueReads, Budget and factory;
-    // this replaces only its in-memory plan-store transport with actual PG.
-    f.b.venueReads.observationPlans = plans;
-    const prepare = () =>
-      f.bridge.operation("prepare_portfolio", {
-        user_id: graphUser,
-        portfolio: compact,
-      }) as Promise<any>;
-    f.pendingFrames(true);
-    assert.equal((await prepare()).state, "pending");
-    const original = structuredClone(f.begins[0]);
-    const entry = [...f.b.preparedEntries.values()][0] as any;
-    const originalHandle = entry.handle;
-    const before = await plans.read(owner, signal);
-    assert.equal(before.plan!.demand, 184);
-    assert.equal(f.reads.length, 0);
-    lease = await plans.begin(owner, signal, before);
-    assert.equal(
-      await plans.complete(
-        lease,
-        { demand: 164, peaks: [144, 144, 144] },
-        signal,
-      ),
-      true,
-    );
-    const current = await plans.read(owner, signal);
-    assert.notEqual(current.generation, before.generation);
-    assert.equal(current.plan!.demand, 164);
-    await f.time.advance(1000);
-    assert.equal((await prepare()).state, "pending");
-    assert.equal(f.b.preparedEntries.get(entry.key), entry);
-    assert.equal(entry.handle, originalHandle);
-    assert.deepEqual(f.begins[1], original);
-    assert.equal(f.events.includes("end"), false);
-    assert.equal(f.reads.length, 0);
-    const pendingRow = await pool.query(
-      "SELECT dirty,generation::text,demand FROM ride_agent_account_cost_plans WHERE owner_key=$1",
-      [owner],
-    );
-    assert.equal(pendingRow.rows[0].dirty, false);
-    assert.equal(pendingRow.rows[0].generation, current.generation);
-    f.pendingFrames(false);
-    const ready = await prepare();
-    assert.equal(ready.state, "ready");
-    assert.equal(ready.handle, originalHandle);
-    assert.equal(ready.purpose, "audit_source");
-    assert.equal(ready.execution_eligible, false);
-    assert.deepEqual(f.begins[2], original);
-    assert.equal(f.budget.snapshot().observation_reserved, 524);
-    assert.equal(f.bank().held, 544);
-    assert.equal(f.bank().held + f.bank().paid, 900);
-    const snapshot = (await f.bridge.operation(
-      "account",
-      {
-        user_id: graphUser,
-        portfolio: f.p,
-      },
-      undefined,
-      undefined,
-      ready.handle,
-    )) as any;
-    assert.equal(snapshot.coverage_complete, true);
-    assert.equal(snapshot.observed_at, f.time.at);
-    assert.equal(
-      f.reads.filter((row) =>
-        [
-          "userFillsByTime",
-          "userFunding",
-          "userNonFundingLedgerUpdates",
-        ].includes(row.type),
-      ).length,
-      3,
-    );
-    const after = await pool.query(
-      "SELECT dirty,generation::text FROM ride_agent_account_cost_plans WHERE owner_key=$1",
-      [owner],
-    );
-    assert.equal(after.rows[0].dirty, false);
-    assert.ok(Number(after.rows[0].generation) > Number(current.generation));
-    let fixedSource: any;
-    for (const sleeve of f.p.sleeves) {
-      const beforeSource = f.time.at;
-      const source = (await f.time.run(
+for (const nativeGraph of [false, true])
+  it(
+    nativeGraph
+      ? "actual native CoreBridge keeps pending458 FIRST across real-PG184 to164 with fresh source identities and local438"
+      : "actual CoreBridge keeps a readonly pending544 episode across a fresh real-PG184 to164 generation and audits in local524",
+    {
+      skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL,
+      timeout: 30000,
+    },
+    async (t) => {
+      const f = await fixture(t, {
+        unified: true,
+        threeSources: true,
+        nativeSources: nativeGraph,
+      });
+      const fixed = f.p.sleeves[2];
+      fixed.copy_mode = "fixed";
+      fixed.fixed_last_fill_at = f.time.at - 10000;
+      f.resetBank(nativeGraph ? 442 : 356);
+      const url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
+      assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
+      const admin = new pg.Pool({ connectionString: url.toString(), max: 2 });
+      const schema = "monotone_graph_" + randomUUID().replaceAll("-", "");
+      await admin.query("CREATE SCHEMA " + schema);
+      url.searchParams.set("options", "-c search_path=" + schema);
+      const pool = new pg.Pool({ connectionString: url.toString(), max: 2 });
+      t.after(async () => {
+        await pool.end();
+        await admin.query("DROP SCHEMA " + schema + " CASCADE");
+        await admin.end();
+      });
+      const plans = new AccountObservationPlans(pool);
+      await plans.migrate();
+      if (nativeGraph) {
+        const identities = new PerpsSourceIdentities(
+          pool,
+          "s".repeat(32),
+          async () => {
+            assert.fail("known PG identities must not scan a provider");
+          },
+        );
+        await identities.migrate();
+        await identities.remember(
+          f.sourceRows.map((row) => ({
+            address: row.address,
+            requires_rwa: false,
+          })),
+        );
+        f.b.sourceIdentities = identities;
+      }
+      const compact = preparedPortfolioInput(f.p, "audit_source");
+      const owner = await f.b.preparedIdentity(graphUser, compact);
+      const signal = new AbortController().signal;
+      let lease = await plans.begin(owner, signal);
+      assert.equal(
+        await plans.complete(lease, { demand: 184, peaks: [164] }, signal),
+        true,
+      );
+      // The fixture keeps its real CoreBridge, VenueReads, Budget and factory;
+      // this replaces only its in-memory plan-store transport with actual PG.
+      f.b.venueReads.observationPlans = plans;
+      const prepare = () =>
         f.bridge.operation(
-          "source",
+          "prepare_portfolio",
           {
-            trader_id: sleeve.trader.id,
+            user_id: graphUser,
+            portfolio: compact,
+          },
+          undefined,
+          undefined,
+          undefined,
+          nativeGraph ? "readonly-runner-native-v1" : undefined,
+        ) as Promise<any>;
+      f.pendingFrames(true);
+      assert.equal((await prepare()).state, "pending");
+      const original = structuredClone(f.begins[0]);
+      const entry = [...f.b.preparedEntries.values()][0] as any;
+      const originalHandle = entry.handle;
+      const before = await plans.read(owner, signal);
+      assert.equal(before.plan!.demand, 184);
+      assert.equal(f.reads.length, 0);
+      lease = await plans.begin(owner, signal, before);
+      assert.equal(
+        await plans.complete(
+          lease,
+          { demand: 164, peaks: [144, 144, 144] },
+          signal,
+        ),
+        true,
+      );
+      const current = await plans.read(owner, signal);
+      assert.notEqual(current.generation, before.generation);
+      assert.equal(current.plan!.demand, 164);
+      await f.time.advance(1000);
+      assert.equal((await prepare()).state, "pending");
+      assert.equal(f.b.preparedEntries.get(entry.key), entry);
+      assert.equal(entry.handle, originalHandle);
+      assert.deepEqual(f.begins[1], original);
+      assert.equal(f.events.includes("end"), false);
+      assert.equal(f.reads.length, 0);
+      const pendingRow = await pool.query(
+        "SELECT dirty,generation::text,demand FROM ride_agent_account_cost_plans WHERE owner_key=$1",
+        [owner],
+      );
+      assert.equal(pendingRow.rows[0].dirty, false);
+      assert.equal(pendingRow.rows[0].generation, current.generation);
+      f.pendingFrames(false);
+      const ready = await prepare();
+      assert.equal(ready.state, "ready");
+      assert.equal(ready.handle, originalHandle);
+      assert.equal(ready.purpose, "audit_source");
+      assert.equal(ready.execution_eligible, false);
+      assert.deepEqual(f.begins[2], original);
+      assert.equal(
+        f.budget.snapshot().observation_reserved,
+        nativeGraph ? 438 : 524,
+      );
+      assert.equal(f.bank().held, nativeGraph ? 458 : 544);
+      assert.equal(f.bank().held + f.bank().paid, 900);
+      const snapshot = (await f.bridge.operation(
+        "account",
+        {
+          user_id: graphUser,
+          portfolio: f.p,
+        },
+        undefined,
+        undefined,
+        ready.handle,
+      )) as any;
+      assert.equal(snapshot.coverage_complete, true);
+      assert.equal(snapshot.observed_at, f.time.at);
+      assert.equal(
+        f.reads.filter((row) =>
+          [
+            "userFillsByTime",
+            "userFunding",
+            "userNonFundingLedgerUpdates",
+          ].includes(row.type),
+        ).length,
+        3,
+      );
+      const after = await pool.query(
+        "SELECT dirty,generation::text FROM ride_agent_account_cost_plans WHERE owner_key=$1",
+        [owner],
+      );
+      assert.equal(after.rows[0].dirty, false);
+      assert.ok(Number(after.rows[0].generation) > Number(current.generation));
+      let fixedSource: any;
+      for (const sleeve of f.p.sleeves) {
+        const beforeSource = f.time.at;
+        const source = (await driveIo(
+          f.time,
+          f.bridge.operation(
+            "source",
+            {
+              trader_id: sleeve.trader.id,
+            },
+            undefined,
+            undefined,
+            ready.handle,
+          ),
+        )) as any;
+        assert.ok(
+          source.observed_at >= beforeSource && source.observed_at <= f.time.at,
+        );
+        assert.ok(f.time.at - source.observed_at <= 5000);
+        if (sleeve === fixed) fixedSource = source;
+      }
+      const history = (await driveIo(
+        f.time,
+        f.bridge.operation(
+          "source_fills",
+          {
+            trader_id: fixed.trader.id,
+            market: "perps",
+            start_at: fixed.fixed_last_fill_at,
+            end_at: fixedSource.observed_at,
           },
           undefined,
           undefined,
           ready.handle,
         ),
       )) as any;
-      assert.ok(
-        source.observed_at >= beforeSource && source.observed_at <= f.time.at,
+      assert.equal(history.complete, true);
+      assert.deepEqual(history.fills, []);
+      assert.equal(
+        f.bank().held - f.budget.snapshot().observation_reserved,
+        20,
+        "the extra original Core20 remains outside every current local pool",
       );
-      assert.ok(f.time.at - source.observed_at <= 5000);
-      if (sleeve === fixed) fixedSource = source;
-    }
-    const history = (await f.time.run(
-      f.bridge.operation(
-        "source_fills",
-        {
-          trader_id: fixed.trader.id,
-          market: "perps",
-          start_at: fixed.fixed_last_fill_at,
-          end_at: fixedSource.observed_at,
-        },
-        undefined,
-        undefined,
-        ready.handle,
-      ),
-    )) as any;
-    assert.equal(history.complete, true);
-    assert.deepEqual(history.fills, []);
-    assert.equal(
-      f.bank().held - f.budget.snapshot().observation_reserved,
-      20,
-      "the extra original Core20 remains outside every current local pool",
-    );
-    await assert.rejects(
-      f.bridge.operation(
-        "prepare_execution",
-        {
-          user_id: graphUser,
-          portfolio: preparedProposalInput(f.p),
-          proposal: {},
-        },
-        undefined,
-        undefined,
-        ready.handle,
-      ),
-    );
-    assert.equal(f.p.executions.length, 0);
-    assert.equal(f.outboxes.size, 0);
-    assert.equal(f.bank().posts, 0);
-    await f.bridge.operation(
-      "finish_portfolio",
-      { user_id: graphUser },
-      undefined,
-      undefined,
-      ready.handle,
-    );
-    assert.equal(f.bank().held, 0);
-    assert.equal(f.events.filter((event) => event === "end").length, 1);
-  },
-);
+      await assert.rejects(
+        f.bridge.operation(
+          "prepare_execution",
+          {
+            user_id: graphUser,
+            portfolio: preparedProposalInput(f.p),
+            proposal: {},
+          },
+          undefined,
+          undefined,
+          ready.handle,
+        ),
+      );
+      assert.equal(f.p.executions.length, 0);
+      assert.equal(f.outboxes.size, 0);
+      assert.equal(f.bank().posts, 0);
+      if (nativeGraph) {
+        const beforeUpgrade = f.reads.length;
+        await f.b.sourceIdentities.remember([
+          { address: f.sourceRows[0].address, requires_rwa: true },
+        ]);
+        await assert.rejects(
+          f.bridge.operation(
+            "source",
+            { trader_id: f.sourceRows[0].trader },
+            undefined,
+            undefined,
+            ready.handle,
+          ),
+        );
+        assert.equal(
+          f.reads.length,
+          beforeUpgrade,
+          "latest PG scope growth blocks even a cached native result before new HTTP",
+        );
+        assert.equal(entry.expired, true);
+        await flush();
+      } else
+        await f.bridge.operation(
+          "finish_portfolio",
+          { user_id: graphUser },
+          undefined,
+          undefined,
+          ready.handle,
+        );
+      assert.equal(f.bank().held, 0);
+      assert.equal(f.events.filter((event) => event === "end").length, 1);
+    },
+  );
 
 it("fixed copying preserves its ordinary full source-fill path without booking a paired window", async (t) => {
   const f = await fixture(t);

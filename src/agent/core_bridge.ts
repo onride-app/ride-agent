@@ -77,6 +77,11 @@ import {
   unifiedUsdc,
 } from "./perps_account.js";
 import { readSelectedPlanEvidence } from "./read-evidence.js";
+import type {
+  NativeSourcePlan,
+  NativeSourcePlanBinding,
+  NativeSourcePlanSource,
+} from "./native-source-plan.js";
 import {
   checkPerpsOrder,
   HYPERLIQUID_MIN_OPEN_NOTIONAL_USDC,
@@ -174,6 +179,13 @@ type PreparedEntry = {
   stable: string;
   costOwner: string;
   frameOwner: string;
+  graph?: "readonly-runner-native-v1";
+  nativeSourcePlan?: NativeSourcePlan;
+  nativeSourceContext?: Omit<
+    NativeSourcePlanBinding,
+    "issuer" | "reader" | "budget"
+  >;
+  nativeSourceAddresses?: Readonly<Record<string, string>>;
   sourceEvidenceEnds?: Map<string, Set<number>>;
   historyBindings?: Map<
     string,
@@ -195,7 +207,7 @@ export class CoreBridge {
   private readonly preparedEntries = new Map<string, PreparedEntry>();
   private readonly preparedCreating = new Map<
     string,
-    { stable: string; cancelled: boolean }
+    { stable: string; cancelled: boolean; graph?: "readonly-runner-native-v1" }
   >();
   private readonly preparedSource = new AsyncLocalStorage<PreparedEntry>();
   private venueReads: VenueReads;
@@ -242,6 +254,7 @@ export class CoreBridge {
           this.infoReadRoute === "core" ? "core_shared_info" : "official",
         observationPlans: this.observationPlans,
         requireObservationPlanBinding: true,
+        nativeSourcePlanIssuer: this,
         frameCoordinator:
           this.infoReadRoute === "core" && this.network === "mainnet"
             ? coreFrameCoordinator(this.coreUrl, this.coreToken)
@@ -495,6 +508,8 @@ export class CoreBridge {
     observation?: AccountObservationLimits,
   ) {
     const prepared = this.preparedSource?.getStore();
+    if (prepared?.nativeSourcePlan)
+      await this.validatePreparedNativeSource(prepared, id);
     const validate = () => {
       if (!prepared) return;
       this.checkPreparedSource(prepared, id, minimumRequiresRwa);
@@ -557,6 +572,8 @@ export class CoreBridge {
     }
     if (prepared) {
       validate();
+      if (prepared.nativeSourcePlan)
+        await this.validatePreparedNativeSource(prepared, id);
       const values = prepared.sourceEvidenceEnds?.get(id) ?? new Set<number>();
       if (!values.has(snapshot.observed_at) && values.size >= 64)
         throw this.preparedFailure();
@@ -567,6 +584,7 @@ export class CoreBridge {
   }
   private async readSource(id: string) {
     if (
+      this.venueReads.nativeSourceReadActive?.() !== true &&
       process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
       (await this.prediction.recognizes(id))
     )
@@ -1373,10 +1391,139 @@ export class CoreBridge {
       handoffs,
     );
   }
+  private async preparedNativeSourcePlan(entry: PreparedEntry) {
+    const selected = entry.portfolio.sleeves.filter(
+      (s) => s.state !== "closed",
+    );
+    if (
+      entry.graph !== "readonly-runner-native-v1" ||
+      entry.portfolio.purpose !== "audit_source" ||
+      this.infoReadRoute !== "core" ||
+      this.network !== "mainnet" ||
+      !selected.length ||
+      selected.length > 8 ||
+      selected.some(
+        (s) =>
+          s.trader.market !== "perps" ||
+          sourceRequiresRwa(s.trader as Candidate),
+      )
+    )
+      return;
+    try {
+      const unique = [...new Set(selected.map((s) => s.trader.id))].sort();
+      const sources: NativeSourcePlanSource[] = await Promise.all(
+        unique.map(async (id) => {
+          if (
+            process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
+            (await this.prediction.recognizes(id))
+          )
+            throw this.preparedFailure();
+          const identity = await this.sourceIdentities.resolve(id);
+          if (
+            identity.requires_rwa !== false ||
+            !/^0x[0-9a-f]{40}$/.test(identity.address) ||
+            this.sourceIdentities.id(identity.address) !== id
+          )
+            throw this.preparedFailure();
+          return {
+            id,
+            address: identity.address,
+            requires_rwa: false as const,
+          };
+        }),
+      );
+      if (
+        entry.expired ||
+        entry.deadline <= now() ||
+        this.preparedEntries.get(entry.key) !== entry
+      )
+        throw this.preparedFailure();
+      const context = {
+        costOwner: entry.costOwner,
+        frameOwner: entry.frameOwner,
+        firstDeadline: entry.deadline,
+        operationalBinding: fingerprint([entry.stable, entry.graph]),
+        purpose: "audit_source" as const,
+        network: "mainnet" as const,
+      };
+      let plan!: NativeSourcePlan;
+      plan = this.venueReads.createNativeSourcePlan(
+        this,
+        context,
+        {
+          sources,
+          nonClosedSleeves: selected.length,
+          fixedSourceIds: selected
+            .filter((s) => s.copy_mode === "fixed")
+            .map((s) => s.trader.id),
+        },
+        async (source) => {
+          try {
+            this.assertPrepared(entry);
+            if (
+              entry.nativeSourcePlan !== plan ||
+              fingerprint([entry.stable, entry.graph]) !==
+                context.operationalBinding
+            )
+              throw this.preparedFailure();
+            if (
+              process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
+              (await this.prediction.recognizes(source.id))
+            )
+              throw this.preparedFailure();
+            const current = await this.sourceIdentities.resolve(source.id);
+            if (
+              current.requires_rwa !== false ||
+              current.address !== source.address ||
+              this.sourceIdentities.id(current.address) !== source.id
+            )
+              throw this.preparedFailure();
+            this.assertPrepared(entry);
+            if (
+              entry.nativeSourcePlan !== plan ||
+              fingerprint([entry.stable, entry.graph]) !==
+                context.operationalBinding
+            )
+              throw this.preparedFailure();
+          } catch (error) {
+            // Revoke the entire old graph before a replacement can be booked.
+            // This never edits another entry or forgives already paid reads.
+            await this.finishPrepared(entry).catch(() => {});
+            throw error;
+          }
+        },
+      );
+      return {
+        plan,
+        context,
+        addresses: Object.freeze(
+          Object.fromEntries(sources.map((s) => [s.id, s.address])),
+        ),
+      };
+    } catch {
+      // Unknown/currently broader identities retain the original S contract.
+      // They can never mint a discounted capability from candidate labels.
+      return;
+    }
+  }
+  private async validatePreparedNativeSource(entry: PreparedEntry, id: string) {
+    this.assertPrepared(entry);
+    const plan = entry.nativeSourcePlan,
+      context = entry.nativeSourceContext,
+      address = entry.nativeSourceAddresses?.[id];
+    if (!plan || !context || !address) throw this.preparedFailure();
+    await this.venueReads.validateNativeSourcePlan(this, plan, context, {
+      type: "clearinghouseState",
+      user: address,
+    });
+    this.assertPrepared(entry);
+    if (entry.nativeSourcePlan !== plan) throw this.preparedFailure();
+  }
   private async preparePortfolio(
     user: string,
     value: any,
     limits?: AccountObservationLimits,
+    graph?: "readonly-runner-native-v1",
   ) {
     const reply = (result: Record<string, unknown>) =>
       value?.purpose === "audit_source"
@@ -1392,7 +1539,11 @@ export class CoreBridge {
     if (this.preparedCreating.has(key))
       return reply({ state: "pending", retry_after_ms: 250 });
     if (this.preparedCreating.size >= 64) throw this.preparedFailure();
-    this.preparedCreating.set(key, { stable, cancelled: false });
+    this.preparedCreating.set(key, {
+      stable,
+      cancelled: false,
+      ...(graph ? { graph } : {}),
+    });
     try {
       let entry = this.preparedEntries.get(key);
       // Metadata does not prove ownership of an already granted peer lease.
@@ -1422,7 +1573,10 @@ export class CoreBridge {
       }
       if (
         entry &&
-        (entry.stable !== stable || entry.expired || entry.deadline <= now())
+        (entry.stable !== stable ||
+          entry.graph !== graph ||
+          entry.expired ||
+          entry.deadline <= now())
       ) {
         await this.finishPrepared(entry).catch(() => {});
         this.preparedEntries.delete(key);
@@ -1451,7 +1605,9 @@ export class CoreBridge {
             "prepared-portfolio-v1",
             p.id,
             stable,
+            ...(graph ? [graph] : []),
           ]),
+          ...(graph ? { graph } : {}),
           deadline,
           polling: false,
           expired: false,
@@ -1473,6 +1629,16 @@ export class CoreBridge {
           this.preparedCreating.get(key)?.cancelled
         )
           throw this.preparedFailure();
+        const native = await this.preparedNativeSourcePlan(entry);
+        if (
+          entry.expired ||
+          this.preparedEntries.get(key) !== entry ||
+          this.preparedCreating.get(key)?.cancelled
+        )
+          throw this.preparedFailure();
+        entry.nativeSourcePlan = native?.plan;
+        entry.nativeSourceContext = native?.context;
+        entry.nativeSourceAddresses = native?.addresses;
         const window = await this.venueReads.prepareAccountWindow(
           entry.costOwner,
           entry.frameOwner,
@@ -1481,6 +1647,12 @@ export class CoreBridge {
           limits?.signal,
           {
             purpose: p.purpose ?? "audit_submit",
+            ...(native
+              ? {
+                  nativeSourcePlan: native.plan,
+                  nativeSourceContext: native.context,
+                }
+              : {}),
             historySources:
               p.purpose === "audit_source"
                 ? [
@@ -1493,6 +1665,11 @@ export class CoreBridge {
                 : [],
           },
         );
+        if (!window.nativeSourcePlan) {
+          entry.nativeSourcePlan = undefined;
+          entry.nativeSourceContext = undefined;
+          entry.nativeSourceAddresses = undefined;
+        }
         if (entry.expired || this.preparedEntries.get(key) !== entry) {
           await window.close();
           throw this.preparedFailure();
@@ -1543,7 +1720,11 @@ export class CoreBridge {
     }
   }
 
-  private async cancelPreparedPortfolio(user: string, value: any) {
+  private async cancelPreparedPortfolio(
+    user: string,
+    value: any,
+    graph?: "readonly-runner-native-v1",
+  ) {
     const p = this.preparedInput(value),
       stable = preparedOperationalBinding(p),
       key = fingerprint([user, p.id]);
@@ -1551,6 +1732,7 @@ export class CoreBridge {
     const readonly = p.purpose === "audit_source";
     const reply = (cancelled: boolean) =>
       readonly ? { ok: true, pending_cancelled: cancelled } : { ok: true };
+    if (entry && entry.graph !== graph) return reply(false);
     // A pending interest is not ownership of a peer's ready window.
     if (
       entry?.window &&
@@ -1562,6 +1744,7 @@ export class CoreBridge {
     )
       return reply(false);
     const creating = this.preparedCreating.get(key);
+    if (creating && creating.graph !== graph) return reply(false);
     if (creating?.stable === stable) creating.cancelled = true;
     if (
       readonly &&
@@ -3476,18 +3659,32 @@ export class CoreBridge {
     notificationCaller?: AbortSignal,
     submitObservation?: AccountObservationLimits,
     preparedWindowHandle?: string,
+    sourceReadGraph?: "readonly-runner-native-v1",
   ): Promise<unknown> {
+    if (
+      sourceReadGraph !== undefined &&
+      (sourceReadGraph !== "readonly-runner-native-v1" ||
+        preparedWindowHandle ||
+        !["prepare_portfolio", "cancel_prepared_portfolio"].includes(op) ||
+        input?.portfolio?.purpose !== "audit_source")
+    )
+      throw this.preparedFailure();
     if (op === "prepare_portfolio") {
       if (preparedWindowHandle) throw this.preparedFailure();
       return this.preparePortfolio(
         input.user_id,
         input.portfolio,
         submitObservation,
+        sourceReadGraph,
       );
     }
     if (op === "cancel_prepared_portfolio") {
       if (preparedWindowHandle) throw this.preparedFailure();
-      return this.cancelPreparedPortfolio(input.user_id, input.portfolio);
+      return this.cancelPreparedPortfolio(
+        input.user_id,
+        input.portfolio,
+        sourceReadGraph,
+      );
     }
     if (preparedWindowHandle) {
       const entry = this.preparedHandle(
@@ -3548,6 +3745,7 @@ export class CoreBridge {
             this.sourceFills(input, entry, submitObservation),
           );
         case "read_plan_evidence":
+          if (entry.nativeSourcePlan) throw this.preparedFailure();
           if (!Array.isArray(input.traders) || !input.traders.length)
             throw this.preparedFailure();
           for (const trader of input.traders)
@@ -3833,6 +4031,17 @@ export async function startManagedCoreBridge(
         ? submitObservationCancellation(req, res)
         : undefined;
     try {
+      const sourceReadGraph = req.get("x-ride-source-read-graph");
+      if (
+        sourceReadGraph !== undefined &&
+        sourceReadGraph !== "readonly-runner-native-v1"
+      )
+        throw new AgentError(
+          "VENUE_COST_PLAN_UNAVAILABLE",
+          "Read graph is unavailable.",
+          true,
+          409,
+        );
       res.json(
         await bridge.operation(
           req.params.operation,
@@ -3840,6 +4049,7 @@ export async function startManagedCoreBridge(
           cancellation?.signal,
           submitObservation,
           req.get("x-ride-read-window"),
+          sourceReadGraph,
         ),
       );
     } catch (e) {
