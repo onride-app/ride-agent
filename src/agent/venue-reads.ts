@@ -4,6 +4,19 @@ import { readCost, responseCost } from "./venue-read-cost.js";
 import { framePendingContinuation } from "./core-frame-coordinator.js";
 import { reportVenueReadDiagnostics } from "./venue-read-diagnostics.js";
 import {
+  issueFreshSubmitReadPurpose,
+  registerFreshSubmitReadIssuer,
+  hasFreshSubmitReadCaller,
+  attachFreshSubmitReadPurpose,
+  bindFreshSubmitReadOwner,
+  assertFreshSubmitReadPurpose,
+  freshSubmitPacingPermit,
+  revokeFreshSubmitReadPurpose,
+  type FreshSubmitReadPurpose,
+  type FreshSubmitPacingPermit,
+  type FreshSubmitReadBinding,
+} from "./fresh-submit-read-purpose.js";
+import {
   issueNativeSourcePlan,
   nativeSourcePlanTerms,
   assertNativeSourcePayload,
@@ -118,6 +131,8 @@ type AccountReadScope = {
   nativeSourcePlan?: NativeSourcePlan;
   nativeSourceBinding?: NativeSourcePlanBinding;
   unsentGroup?: UnsentReadGroup;
+  freshSubmitPurpose?: FreshSubmitReadPurpose;
+  freshSubmitPermit?: FreshSubmitPacingPermit;
 };
 export interface PreparedReadWindowOptions {
   purpose?: "audit_submit" | "audit_source";
@@ -262,6 +277,7 @@ export interface VenueReadOptions {
   monotonicClock?: () => number;
   frameCoordinator?: AccountReadFrameCoordinator;
   nativeSourcePlanIssuer?: object;
+  freshSubmitReadIssuer?: object;
 }
 
 // Completed account evidence is never reused. Metadata TTL and same-lane
@@ -291,6 +307,7 @@ export class VenueReads {
   private readonly monotonicClock: () => number;
   private readonly frameCoordinator?: AccountReadFrameCoordinator;
   private readonly nativeSourcePlanIssuer?: object;
+  private readonly freshSubmitReadIssuer?: object;
   private frames = {
     admitted: 0,
     denied: 0,
@@ -324,6 +341,13 @@ export class VenueReads {
     this.transport = options.transport ?? "official";
     this.callerSignal = options.signal;
     this.nativeSourcePlanIssuer = options.nativeSourcePlanIssuer;
+    this.freshSubmitReadIssuer = options.freshSubmitReadIssuer;
+    if (this.freshSubmitReadIssuer)
+      registerFreshSubmitReadIssuer({
+        issuer: this.freshSubmitReadIssuer,
+        reader: this,
+        budget: this.budget,
+      });
     this.observationPlans = options.observationPlans;
     this.requireObservationPlanBinding =
       options.requireObservationPlanBinding ?? false;
@@ -1156,19 +1180,51 @@ export class VenueReads {
     this.preparedWindows.add(window);
     return window;
   }
+  freshSubmitReadPurpose(
+    issuer: object,
+    binding: FreshSubmitReadBinding,
+    caller: object,
+    validate: () => boolean,
+  ): FreshSubmitReadPurpose | undefined {
+    if (!hasFreshSubmitReadCaller(caller)) return undefined;
+    if (
+      issuer !== this.freshSubmitReadIssuer ||
+      !this.frameCoordinator ||
+      this.draining ||
+      this.accountScope.getStore()
+    )
+      throw costPlanUnavailable();
+    return issueFreshSubmitReadPurpose(
+      { issuer, reader: this, budget: this.budget },
+      binding,
+      caller,
+      validate,
+    );
+  }
   async observeAccount<T>(
     work: () => Promise<T>,
     owner?: string,
     limits: AccountObservationLimits = {},
+    freshSubmitPurpose?: FreshSubmitReadPurpose,
   ): Promise<T> {
-    return this.observeAccountScope(work, owner, limits);
+    return this.observeAccountScope(
+      work,
+      owner,
+      limits,
+      undefined,
+      freshSubmitPurpose,
+    );
   }
   private async observeAccountScope<T>(
     work: () => Promise<T>,
     owner?: string,
     limits: AccountObservationLimits = {},
     parent?: AccountReadScope,
+    freshSubmitPurpose?: FreshSubmitReadPurpose,
   ): Promise<T> {
+    // A new purpose can never upgrade an existing prepared/peer ALS scope.
+    if (freshSubmitPurpose && (parent || this.accountScope.getStore()))
+      throw costPlanUnavailable();
     if (this.accountScope.getStore()) return work();
     if (this.draining) throw costPlanUnavailable();
     if (
@@ -1189,15 +1245,44 @@ export class VenueReads {
       monotonicUntil: this.monotonicClock() + remaining,
       queueUntil: this.clock() + 100000,
       waitForFrameAdmission: limits.waitForFrameAdmission === true,
+      freshSubmitPurpose,
       unsentGroup: parent?.unsentGroup ?? {
         active: 0,
         revoked: false,
         candidates: new Set(),
       },
     };
+    if (freshSubmitPurpose) {
+      const available = attachFreshSubmitReadPurpose(
+        freshSubmitPurpose,
+        this,
+        this.budget,
+        scope,
+        limits.signal,
+        limits.deadlineMs,
+        () =>
+          this.accountScope.getStore() === scope &&
+          !this.draining &&
+          !scope.admission.signal.aborted &&
+          scope.until > this.clock() &&
+          scope.monotonicUntil > this.monotonicClock(),
+      );
+      // Bind to the original registered caller, never restart its 20s clock.
+      scope.until = Math.min(scope.until, this.clock() + available);
+      scope.monotonicUntil = Math.min(
+        scope.monotonicUntil,
+        this.monotonicClock() + available,
+      );
+    }
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
-      remaining,
+      Math.max(
+        0,
+        Math.min(
+          scope.until - this.clock(),
+          scope.monotonicUntil - this.monotonicClock(),
+        ),
+      ),
     );
     const callerCancelled = () => scope.admission.abort(limits.signal!.reason);
     limits.signal?.addEventListener("abort", callerCancelled, { once: true });
@@ -1302,6 +1387,8 @@ export class VenueReads {
         scope.admission.abort(error);
         throw error;
       } finally {
+        if (freshSubmitPurpose)
+          revokeFreshSubmitReadPurpose(freshSubmitPurpose);
         if (!finalizing) cleanup();
         scope.reservation?.close(complete);
         if (scope.localInterest)
@@ -1428,6 +1515,8 @@ export class VenueReads {
     continuation?: object,
   ): Promise<void> {
     if (!this.frameCoordinator) return;
+    const waiting = this.waitFreshSubmitSchedule(scope);
+    if (waiting) await waiting;
     const coordinator = this.frameCoordinator;
     // The cold local plan is a full-process-window placeholder (1000), not a
     // proven provider cost. An explicit capacity trial books only its verified
@@ -1540,9 +1629,18 @@ export class VenueReads {
       throw costPlanUnavailable();
     scope.owner = owner;
     scope.planBound = true;
+    if (scope.freshSubmitPurpose)
+      bindFreshSubmitReadOwner(
+        scope.freshSubmitPurpose,
+        this,
+        this.budget,
+        scope,
+        owner,
+      );
   }
   disableAccountCostPlan(): void {
     const scope = this.accountScope.getStore();
+    if (scope?.freshSubmitPurpose) throw costPlanUnavailable();
     if (
       !scope ||
       scope.reservationPromise ||
@@ -1567,6 +1665,51 @@ export class VenueReads {
       true,
       503,
     );
+  }
+  private waitFreshSubmitSchedule(
+    scope: AccountReadScope,
+  ): Promise<void> | undefined {
+    if (!scope.freshSubmitPurpose) return;
+    const probe = () => {
+      assertFreshSubmitReadPurpose(
+        scope.freshSubmitPurpose!,
+        this,
+        this.budget,
+        scope,
+        scope.owner!,
+      );
+      this.accountReadTimeout();
+      const schedule = this.budget.preparedObservationSchedule(scope.owner!);
+      // This capability changes one soft predicate, not FIFO or active work.
+      return schedule.ready || schedule.reason === "READ_LOCAL_PACING"
+        ? undefined
+        : schedule.retryAfterMs;
+    };
+    let retry = probe();
+    if (retry === undefined) return;
+    return (async () => {
+      while (retry !== undefined) {
+        const remaining = this.accountReadTimeout();
+        const delay = Math.min(retry, remaining);
+        await new Promise<void>((resolve, reject) => {
+          const signal = this.callerSignal
+            ? AbortSignal.any([scope.admission.signal, this.callerSignal])
+            : scope.admission.signal;
+          const cancel = () => {
+            this.timers.clearTimeout(timer);
+            signal.removeEventListener("abort", cancel);
+            reject(signal.reason);
+          };
+          const timer = this.timers.setTimeout(() => {
+            signal.removeEventListener("abort", cancel);
+            resolve();
+          }, delay);
+          signal.addEventListener("abort", cancel, { once: true });
+          if (signal.aborted) cancel();
+        });
+        retry = probe();
+      }
+    })();
   }
   accountReadTimeout(maximum = 20000): number {
     const scope = this.accountScope.getStore();
@@ -1595,6 +1738,10 @@ export class VenueReads {
     const signal = this.callerSignal
       ? AbortSignal.any([scope.admission.signal, this.callerSignal])
       : scope.admission.signal;
+    // Preserve an active same-owner attempt before touching PG. This pure
+    // precheck never inserts a local interest before a real Core grant.
+    const waiting = this.waitFreshSubmitSchedule(scope);
+    if (waiting) await waiting;
     let durableHint:
       Awaited<ReturnType<ObservationPlanStore["read"]>> | undefined;
     let restored = false;
@@ -1837,6 +1984,15 @@ export class VenueReads {
       }
       if (continuation) this.pendingPreparedBookings.delete(continuation);
       scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
+      if (scope.freshSubmitPurpose)
+        scope.freshSubmitPermit = freshSubmitPacingPermit(
+          scope.freshSubmitPurpose,
+          this,
+          this.budget,
+          scope,
+          scope.owner!,
+          scope.localInterest,
+        );
     }
     let deferred: unknown;
     for (;;) {
@@ -1875,6 +2031,8 @@ export class VenueReads {
                   }
                 : undefined,
               scope.localInterest,
+              undefined,
+              scope.freshSubmitPermit,
             );
         scope.reservation = reservation;
         // The hint may change while the private grant is in flight. Never
@@ -2273,6 +2431,14 @@ export class VenueReads {
       if (scope?.preparedParent) await this.claimPreparedChild(scope);
       if (admissionSignal.aborted) throw admissionSignal.reason;
       this.accountReadTimeout();
+      if (scope?.freshSubmitPurpose)
+        assertFreshSubmitReadPurpose(
+          scope.freshSubmitPurpose,
+          this,
+          this.budget,
+          scope,
+          scope.owner!,
+        );
       // Queue time belongs to the enclosing 20-second account observation.
       // Bound HTTP/JSON work to 12 seconds after admission instead of consuming
       // its wire window in the queue; the whole-operation boundary stays 20s.

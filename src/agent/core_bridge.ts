@@ -41,6 +41,7 @@ import {
 } from "./prepared-portfolio.js";
 import { notificationCancellation } from "./notification-cancellation.js";
 import { submitObservationCancellation } from "./submit-observation-cancellation.js";
+import type { FreshSubmitReadPurpose } from "./fresh-submit-read-purpose.js";
 import { NotificationReceipts } from "./notification-receipts.js";
 import {
   VenueOrderSnapshots,
@@ -255,6 +256,7 @@ export class CoreBridge {
         observationPlans: this.observationPlans,
         requireObservationPlanBinding: true,
         nativeSourcePlanIssuer: this,
+        freshSubmitReadIssuer: this,
         frameCoordinator:
           this.infoReadRoute === "core" && this.network === "mainnet"
             ? coreFrameCoordinator(this.coreUrl, this.coreToken)
@@ -1930,6 +1932,7 @@ export class CoreBridge {
     p: Portfolio | null,
     bind = false,
     observation?: AccountObservationLimits,
+    freshSubmitPurpose?: FreshSubmitReadPurpose,
   ): Promise<AccountSnapshot> {
     return this.venueReads.observeAccount(
       () => this.readPerpsAccount(user, p, bind),
@@ -1948,6 +1951,7 @@ export class CoreBridge {
         ].sort(),
       ]),
       observation,
+      freshSubmitPurpose,
     );
   }
   private perpsCostOwner(
@@ -3000,15 +3004,135 @@ export class CoreBridge {
         );
       payload = saved.rows[0].payload;
     } else {
-      const readAccount = () =>
-        this.perpsAccount(user, p, false, {
-          signal: observation?.signal,
-          deadlineMs: Math.min(
-            e.expires_at,
-            observation?.deadlineMs ?? Infinity,
+      // No outbox is only this existing fresh-read route. It proves neither
+      // exchange absence nor permission to replay an old/unknown execution.
+      const frozen = (value: Execution) => ({
+        id: value.id,
+        key: value.key,
+        target_quantity: value.target_quantity,
+        allocations: value.allocations,
+        revision: value.revision,
+        created_at: value.created_at,
+        expires_at: value.expires_at,
+      });
+      const executionBinding = (value: Execution) => ({
+        ...frozen(value),
+        fingerprint: value.fingerprint,
+        status: value.status,
+        task_id: value.task_id,
+        observed_quantity: value.observed_quantity,
+        reserve_usdc: value.reserve_usdc,
+        error: value.error,
+        unfilled_allocations: value.unfilled_allocations,
+        retirement: value.retirement,
+        first_submission_failure: value.first_submission_failure,
+      });
+      const eligible = () =>
+        this.infoReadRoute === "core" &&
+        this.network === "mainnet" &&
+        e.status === "queued" &&
+        e.task_id === null &&
+        e.observed_quantity === null &&
+        e.retirement === undefined &&
+        e.first_submission_failure === undefined &&
+        e.unfilled_allocations === undefined &&
+        e.error === null &&
+        p.sleeves.length > 0 &&
+        p.sleeves.length <= 8 &&
+        Object.keys(e.allocations).length <= 8 &&
+        e.key.startsWith("perps:") &&
+        e.revision === p.revision &&
+        typeof (p.venue_accounts?.perps ?? p.account_id) === "string" &&
+        p.executions.filter((execution) => execution.id === e.id).length ===
+          1 &&
+        fingerprint(
+          executionBinding(
+            p.executions.find((execution) => execution.id === e.id)!,
           ),
-          waitForFrameAdmission: true,
+        ) === fingerprint(executionBinding(e)) &&
+        Number.isSafeInteger(e.created_at) &&
+        e.created_at <= now() &&
+        e.expires_at === e.created_at + 60000 &&
+        e.expires_at > now() &&
+        e.fingerprint === fingerprint(frozen(e));
+      // Bounded authority and this execution only. Never reserialize the full
+      // account snapshot, history, other executions or performance per poll/read.
+      const currentBinding = () =>
+        fingerprint({
+          user,
+          network: this.network,
+          portfolio: p.id,
+          account: p.account_id,
+          venue_accounts: p.venue_accounts,
+          revision: p.revision,
+          control: p.control_id,
+          state: p.state,
+          loss_latched: p.loss_latched,
+          reconciliation: p.reconciliation,
+          asset_filter_version: p.asset_filter_version,
+          ledger_started_at: p.ledger_started_at,
+          preferences: p.preferences,
+          sleeves: p.sleeves.map((s) => ({
+            copy_id: s.copy_id,
+            state: s.state,
+            initialized: s.initialized,
+            amount_usdc: s.amount_usdc,
+            leverage_mode: s.leverage_mode,
+            leverage_cap: s.leverage_cap,
+            stop_loss_pct: s.stop_loss_pct,
+            loss_policy: s.loss_policy,
+            emergency_exit_pct: s.emergency_exit_pct,
+            copy_mode: s.copy_mode,
+            fixed_margin_usdc: s.fixed_margin_usdc,
+            proportional_multiplier: s.proportional_multiplier,
+            trader: {
+              id: s.trader.id,
+              market: s.trader.market,
+              assets: s.trader.assets,
+              asset_category: s.trader.asset_category,
+              asset_categories: s.trader.asset_categories,
+            },
+            source_revision: s.source_revision,
+            intent: s.intents[e.key],
+            owned: s.lots[e.key],
+          })),
+          execution: executionBinding(e),
         });
+      let purpose: FreshSubmitReadPurpose | undefined;
+      if (!prepared && observation && eligible()) {
+        const binding = currentBinding();
+        purpose = this.venueReads.freshSubmitReadPurpose(
+          this,
+          {
+            user,
+            portfolio: p.id,
+            account: (p.venue_accounts?.perps ?? p.account_id)!,
+            revision: p.revision,
+            control: p.control_id ?? "",
+            execution: e.id,
+            fingerprint: e.fingerprint,
+            expiresAt: e.expires_at,
+            currentBinding: binding,
+          },
+          observation,
+          () => eligible() && currentBinding() === binding,
+        );
+      }
+      const readAccount = () =>
+        this.perpsAccount(
+          user,
+          p,
+          false,
+          {
+            signal: observation?.signal,
+            deadlineMs: Math.min(
+              e.expires_at,
+              observation?.deadlineMs ?? Infinity,
+            ),
+            waitForFrameAdmission: true,
+          },
+          purpose,
+        );
       const snap = prepared
         ? await this.assertPrepared(prepared).read(readAccount, observation)
         : await readAccount();
