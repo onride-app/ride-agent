@@ -20,10 +20,14 @@ import {
   type ReadLane,
   type ReadTicket,
   type AccountReadReservation,
+  type AccountReadBundle,
   VenueReadBudget,
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
+const unsupportedPreparedBundles = new WeakSet<AgentError>();
+export const isPreparedBundleUnsupported = (error: unknown): boolean =>
+  error instanceof AgentError && unsupportedPreparedBundles.has(error);
 export type VenueReadEvidence = {
   value: any;
   // The original dispatch time after admission, never the completion/cache-hit
@@ -51,7 +55,27 @@ type AccountReadScope = {
   queueUntil: number;
   waitForFrameAdmission: boolean;
   activateEvidenceDeadline?(): void;
+  frameOwner?: string;
+  preparingBundle?: boolean;
+  preparedParent?: AccountReadScope;
+  preparedIdentityVerified?: boolean;
+  preparedHint?: Awaited<ReturnType<ObservationPlanStore["read"]>>;
+  preparedClaim?: Promise<void>;
 };
+export interface PreparedAccountWindow {
+  readonly mode: "cold" | "warm";
+  readonly expires_at: number;
+  read<T>(
+    work: () => Promise<T>,
+    limits?: AccountObservationLimits,
+  ): Promise<T>;
+  supplement<T>(
+    work: () => Promise<T>,
+    limits?: AccountObservationLimits,
+  ): Promise<T>;
+  close(): Promise<void>;
+  assertNextChildReady(): void;
+}
 export type AccountReadFrameLease = {
   frame_id: string;
   expires_at: number;
@@ -76,6 +100,7 @@ export interface AccountReadFrameCoordinator {
   ): Promise<AccountReadFrameLease>;
   end(frameId: string): Promise<void>;
   close?(): Promise<void>;
+  cancelPending?(continuation: object): Promise<void>;
 }
 type Counters = {
   calls: number;
@@ -161,6 +186,8 @@ export interface VenueReadOptions {
 // Completed account evidence is never reused. Metadata TTL and same-lane
 // single-flight are unchanged. Both HL hosts share one process weighted gate.
 export class VenueReads {
+  private readonly preparedWindows = new Set<PreparedAccountWindow>();
+  private readonly preparedOwners = new Set<string>();
   private flights = new Map<string, Promise<VenueReadEvidence>>();
   private cache = new Map<string, Entry>();
   private readonly budget: VenueReadBudget;
@@ -299,6 +326,246 @@ export class VenueReads {
       throw this.unavailable();
     }
   }
+  async cancelPreparedPending(continuation: object): Promise<void> {
+    if (!this.frameCoordinator?.cancelPending) throw costPlanUnavailable();
+    await this.frameCoordinator.cancelPending(continuation);
+  }
+  async prepareAccountWindow(
+    owner: string,
+    frameOwner: string,
+    firstDeadline: number,
+    continuation?: object,
+    callerSignal?: AbortSignal,
+  ): Promise<PreparedAccountWindow> {
+    if (
+      !this.frameCoordinator ||
+      this.draining ||
+      this.preparedWindows.size >= 64 ||
+      this.accountScope.getStore() ||
+      !/^[0-9a-f]{64}$/.test(owner) ||
+      !/^[0-9a-f]{64}$/.test(frameOwner) ||
+      firstDeadline <= this.clock() ||
+      firstDeadline > this.clock() + 100000
+    )
+      throw costPlanUnavailable();
+    const scope: AccountReadScope = {
+      id: ++this.accountSequence,
+      owner,
+      frameOwner,
+      planBound: true,
+      until: this.clock() + 20000,
+      monotonicUntil: this.monotonicClock() + 20000,
+      admission: new AbortController(),
+      queueUntil: firstDeadline,
+      waitForFrameAdmission: false,
+      preparingBundle: true,
+    };
+    let timer = this.timers.setTimeout(
+      () => scope.admission.abort(this.accountDeadline()),
+      20000,
+    );
+    scope.activateEvidenceDeadline = () => {
+      // Queue metadata was not evidence work. The FIRST real grant starts the
+      // existing20s lease; every subsequent child only consumes this remainder.
+      scope.until = scope.frameLease!.expires_at;
+      scope.monotonicUntil =
+        this.monotonicClock() + Math.max(0, scope.until - this.clock());
+      this.timers.clearTimeout(timer);
+      timer = this.timers.setTimeout(
+        () => scope.admission.abort(this.accountDeadline()),
+        Math.max(0, scope.until - this.clock()),
+      );
+    };
+    const cancelled = () => scope.admission.abort(callerSignal!.reason);
+    callerSignal?.addEventListener("abort", cancelled, { once: true });
+    if (callerSignal?.aborted) cancelled();
+    let parent: AccountReadBundle;
+    try {
+      parent = (await this.accountScope.run(scope, () =>
+        this.reserveObservation(scope, { continuation }),
+      )) as AccountReadBundle;
+      if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
+    } catch (error) {
+      this.timers.clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", cancelled);
+      scope.reservation?.close(false);
+      if (scope.localInterest)
+        this.budget.endObservationInterest(scope.localInterest);
+      this.releaseFrame(scope);
+      throw error;
+    }
+    callerSignal?.removeEventListener("abort", cancelled);
+    this.preparedOwners.add(owner);
+    let closed = false,
+      reading = false,
+      reads = 0,
+      failed = false;
+    const supplement = async <T>(
+      work: () => Promise<T>,
+      limits: AccountObservationLimits = {},
+    ) => {
+      if (closed || reading || reads < 1 || scope.admission.signal.aborted)
+        throw costPlanUnavailable();
+      reading = true;
+      const ticket = parent.beginSupplement();
+      const sourceScope: AccountReadScope = {
+        ...scope,
+        id: ++this.accountSequence,
+        reservation: ticket,
+        preparingBundle: false,
+        preparedParent: scope,
+        preparedIdentityVerified: true,
+        planLease: undefined,
+        durableAttempted: false,
+        preparedHint: undefined,
+        preparedClaim: undefined,
+        admission: new AbortController(),
+      };
+      sourceScope.until = Math.min(scope.until, limits.deadlineMs ?? Infinity);
+      sourceScope.monotonicUntil = Math.min(
+        scope.monotonicUntil,
+        this.monotonicClock() + Math.max(0, sourceScope.until - this.clock()),
+      );
+      const stop = () =>
+        sourceScope.admission.abort(scope.admission.signal.reason);
+      scope.admission.signal.addEventListener("abort", stop, { once: true });
+      const callerStop = () =>
+        sourceScope.admission.abort(limits.signal!.reason);
+      limits.signal?.addEventListener("abort", callerStop, { once: true });
+      if (limits.signal?.aborted) callerStop();
+      let complete = false;
+      try {
+        const value = await this.accountScope.run(sourceScope, async () => {
+          this.accountReadTimeout();
+          const value = await this.abortable(
+            work(),
+            sourceScope.admission.signal,
+          );
+          this.accountReadTimeout();
+          return value;
+        });
+        ticket.close(true);
+        complete = true;
+        return value;
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        ticket.close(complete);
+        scope.admission.signal.removeEventListener("abort", stop);
+        limits.signal?.removeEventListener("abort", callerStop);
+        reading = false;
+      }
+    };
+    const window: PreparedAccountWindow = {
+      mode: parent.childCount === 1 ? "cold" : "warm",
+      expires_at: scope.until,
+      supplement,
+      assertNextChildReady: () => {
+        if (
+          closed ||
+          reading ||
+          failed ||
+          reads !== 1 ||
+          parent.childCount !== 2 ||
+          scope.admission.signal.aborted ||
+          scope.until <= this.clock() ||
+          scope.monotonicUntil <= this.monotonicClock()
+        )
+          throw costPlanUnavailable();
+        const hint = this.budget.peekObservationFramePlan(
+          owner,
+          parent.childLimit,
+        );
+        if (hint.cold || hint.fullDemand > parent.childLimit)
+          throw costPlanUnavailable();
+        parent.assertNextChildReady();
+      },
+      read: async <T>(
+        work: () => Promise<T>,
+        limits: AccountObservationLimits = {},
+      ) => {
+        if (
+          closed ||
+          reading ||
+          scope.admission.signal.aborted ||
+          reads >= parent.childCount
+        )
+          throw costPlanUnavailable();
+        reading = true;
+        try {
+          const value = await this.observeAccount(
+            async () => {
+              const child = this.accountScope.getStore()!;
+              child.preparedParent = scope;
+              child.owner = owner;
+              child.planBound = true;
+              child.frameOwner = frameOwner;
+              child.frameLease = scope.frameLease;
+              child.until = Math.min(child.until, scope.until);
+              child.monotonicUntil = Math.min(
+                child.monotonicUntil,
+                scope.monotonicUntil,
+              );
+              child.planAttempt =
+                this.budget.beginObservationPlanAttempt(owner);
+              if (!this.observationPlans) throw costPlanUnavailable();
+              const before = this.monotonicClock();
+              const hint = await this.observationPlans.read(
+                owner,
+                child.admission.signal,
+              );
+              this.accountReadTimeout();
+              if (
+                (hint.plan && hint.plan.demand > parent.childLimit) ||
+                (window.mode === "warm" &&
+                  (!hint.plan ||
+                    hint.remainingTtlMs - (this.monotonicClock() - before) <=
+                      0))
+              )
+                throw costPlanUnavailable();
+              child.preparedHint = hint;
+              child.reservation = parent.beginChild();
+              reads++;
+              return work();
+            },
+            owner,
+            {
+              signal: limits.signal
+                ? AbortSignal.any([limits.signal, scope.admission.signal])
+                : scope.admission.signal,
+              deadlineMs: Math.min(limits.deadlineMs ?? Infinity, scope.until),
+            },
+          );
+          return value;
+        } catch (error) {
+          failed = true;
+          throw error;
+        } finally {
+          reading = false;
+        }
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        this.preparedWindows.delete(window);
+        this.preparedOwners.delete(owner);
+        this.timers.clearTimeout(timer);
+        scope.admission.signal.removeEventListener("abort", expired);
+        scope.admission.abort(costPlanUnavailable());
+        parent.close(reads > 0 && !failed && !reading);
+        if (scope.localInterest)
+          this.budget.endObservationInterest(scope.localInterest);
+        this.releaseFrame(scope);
+      },
+    };
+    const expired = () => {
+      void window.close().catch(() => {});
+    };
+    scope.admission.signal.addEventListener("abort", expired, { once: true });
+    this.preparedWindows.add(window);
+    return window;
+  }
   async observeAccount<T>(
     work: () => Promise<T>,
     owner?: string,
@@ -400,6 +667,7 @@ export class VenueReads {
             } catch {
               this.costPlans.persist_failed++;
               this.invalidateCostPlan(scope);
+              if (scope.preparedParent) throw costPlanUnavailable();
             } finally {
               cleanup();
             }
@@ -409,6 +677,9 @@ export class VenueReads {
             () => this.accountFinalizers.delete(finalizer),
             () => this.accountFinalizers.delete(finalizer),
           );
+          // Before a new financial ID exists, a bundle audit must have really
+          // published its original single-scope generation, not merely queued CAS.
+          if (scope.preparedParent) await finalizer;
         } else if (scope.durableAttempted) this.invalidateCostPlan(scope);
         return value;
       } catch (error) {
@@ -433,6 +704,9 @@ export class VenueReads {
   }
   async drainAccounts(): Promise<void> {
     this.draining = true;
+    await Promise.allSettled(
+      [...this.preparedWindows].map((window) => window.close()),
+    );
     for (const scope of this.activeAccountScopes)
       // Cancel only fleet admissions still waiting for their local ticket.
       // Already admitted reads retain the original graceful completion and
@@ -447,7 +721,8 @@ export class VenueReads {
       await Promise.allSettled([...this.accountFinalizers]);
   }
   private releaseFrame(scope: AccountReadScope): void {
-    if (!scope.frameLease || !this.frameCoordinator) return;
+    if (scope.preparedParent || !scope.frameLease || !this.frameCoordinator)
+      return;
     const frameId = scope.frameLease.frame_id;
     scope.releasedFrames ??= new Set();
     if (scope.releasedFrames.has(frameId)) return;
@@ -472,10 +747,11 @@ export class VenueReads {
     scope: AccountReadScope,
     reservation: { weight: number; mode: "learned" | "cold_trial" },
     signal: AbortSignal,
+    firstContinuation?: object,
   ): Promise<void> {
     if (!this.frameCoordinator) return;
     if (reservation.mode === "cold_trial") this.frames.capacity_trials++;
-    let continuation: object | undefined;
+    let continuation: object | undefined = firstContinuation;
     for (;;) {
       this.accountReadTimeout();
       if (signal.aborted) throw signal.reason;
@@ -537,7 +813,7 @@ export class VenueReads {
     const weight = reservation.weight;
     const pending = coordinator
       .begin(
-        scope.owner!,
+        scope.frameOwner ?? scope.owner!,
         weight,
         scope.queueUntil,
         signal,
@@ -590,8 +866,43 @@ export class VenueReads {
   accountObservedAt(): number {
     return this.accountScope.getStore()?.observedAt ?? this.clock();
   }
+  private async claimPreparedChild(scope: AccountReadScope): Promise<void> {
+    if (!scope.preparedParent || scope.preparedHint === undefined) return;
+    if (!scope.preparedIdentityVerified || !this.observationPlans)
+      throw costPlanUnavailable();
+    scope.preparedClaim ??= (async () => {
+      scope.durableAttempted = true;
+      const signal = this.callerSignal
+        ? AbortSignal.any([scope.admission.signal, this.callerSignal])
+        : scope.admission.signal;
+      try {
+        scope.planLease = await this.observationPlans!.begin(
+          scope.owner!,
+          signal,
+          scope.preparedHint,
+          Math.min(
+            this.accountReadTimeout(),
+            Math.floor(scope.monotonicUntil - this.monotonicClock()),
+          ),
+        );
+        this.accountReadTimeout();
+        this.costPlans.claimed++;
+      } catch {
+        this.costPlans.claim_failed++;
+        this.invalidateCostPlan(scope);
+        throw costPlanUnavailable();
+      }
+    })();
+    await scope.preparedClaim;
+  }
   bindAccountCostPlan(owner: string): void {
     const scope = this.accountScope.getStore();
+    if (scope?.preparedParent) {
+      if (owner !== scope.owner || scope.preparedParent.owner !== owner)
+        throw costPlanUnavailable();
+      scope.preparedIdentityVerified = true;
+      return;
+    }
     if (
       !scope ||
       scope.reservationPromise ||
@@ -646,6 +957,7 @@ export class VenueReads {
   }
   private async reserveObservation(
     scope: AccountReadScope,
+    bundle?: { continuation?: object },
   ): Promise<AccountReadReservation> {
     // A near-ready FIFO slot should not be lost to a complete monitor cycle's
     // reconciliation and commit work. Uncoordinated reads retain their original
@@ -660,6 +972,12 @@ export class VenueReads {
     let durableHint:
       Awaited<ReturnType<ObservationPlanStore["read"]>> | undefined;
     let restored = false;
+    if (
+      !scope.preparingBundle &&
+      !scope.preparedParent &&
+      this.preparedOwners.has(scope.owner!)
+    )
+      throw costPlanUnavailable();
     if (this.observationPlans && !scope.planDisabled) {
       if (this.requireObservationPlanBinding && !scope.planBound)
         throw costPlanUnavailable();
@@ -714,7 +1032,25 @@ export class VenueReads {
         trialCapacity,
       );
       if (
-        (!hint.cold && hint.fullDemand > this.frameCoordinator.capacity) ||
+        bundle &&
+        !hint.cold &&
+        hint.fullDemand <= this.frameCoordinator.capacity &&
+        hint.fullDemand * 2 > this.frameCoordinator.capacity
+      ) {
+        const unsupported = new AgentError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          "This complete single-scope cost is not eligible for a paired read window.",
+          true,
+          503,
+          { reason_code: "READ_FRAME_CAPACITY", retry_after_ms: 60000 },
+        );
+        unsupportedPreparedBundles.add(unsupported);
+        throw unsupported;
+      }
+      if (
+        (!hint.cold &&
+          hint.fullDemand * (bundle ? 2 : 1) >
+            this.frameCoordinator.capacity) ||
         (hint.cold && trialCapacity < Math.min(120, this.budget.limit))
       ) {
         throw new AgentError(
@@ -729,7 +1065,7 @@ export class VenueReads {
         ...hint,
         reservedWeight: hint.cold
           ? Math.min(hint.fullDemand, trialCapacity)
-          : hint.fullDemand,
+          : hint.fullDemand * (bundle ? 2 : 1),
       };
       await this.reserveFrame(
         scope,
@@ -738,6 +1074,7 @@ export class VenueReads {
           mode: fleetPlan.cold ? "cold_trial" : "learned",
         },
         signal,
+        bundle?.continuation,
       );
       scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
     }
@@ -759,16 +1096,26 @@ export class VenueReads {
           )
             throw costPlanUnavailable();
         }
-        const reservation = this.budget.beginObservation(
-          scope.owner!,
-          fleetPlan?.cold
-            ? {
-                fullDemand: fleetPlan.fullDemand,
-                reservedWeight: fleetPlan.reservedWeight,
-              }
-            : undefined,
-          scope.localInterest,
-        );
+        const reservation = bundle
+          ? this.budget.beginObservationBundle(
+              scope.owner!,
+              fleetPlan!.cold
+                ? fleetPlan!.reservedWeight
+                : fleetPlan!.fullDemand,
+              fleetPlan!.cold ? 1 : 2,
+              scope.localInterest!,
+              fleetPlan!.cold,
+            )
+          : this.budget.beginObservation(
+              scope.owner!,
+              fleetPlan?.cold
+                ? {
+                    fullDemand: fleetPlan.fullDemand,
+                    reservedWeight: fleetPlan.reservedWeight,
+                  }
+                : undefined,
+              scope.localInterest,
+            );
         scope.reservation = reservation;
         // The hint may change while the private grant is in flight. Never
         // spend a ticket whose actual full demand differs from that booking.
@@ -782,6 +1129,10 @@ export class VenueReads {
           scope.reservation = undefined;
           this.releaseFrame(scope);
           throw costPlanUnavailable();
+        }
+        if (bundle) {
+          scope.preparedHint = durableHint;
+          return reservation;
         }
         if (this.observationPlans && durableHint) {
           scope.durableAttempted = true;
@@ -883,6 +1234,9 @@ export class VenueReads {
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       this.checkCooldown(method, lane);
       const scope = this.accountScope.getStore();
+      if (scope?.preparedParent) {
+        if (!scope.preparedIdentityVerified) throw costPlanUnavailable();
+      }
       if (scope?.owner && !scope.reservation) {
         if (scope.admissionError) throw scope.admissionError;
         try {
@@ -1076,6 +1430,11 @@ export class VenueReads {
       this.checkCooldown(cost.method, lane, false);
       if (admissionSignal.aborted) throw admissionSignal.reason;
       if (signal.aborted) throw signal.reason;
+      // A cached metadata hit never claims/dirty-marks a financial cost plan.
+      // Claim only this new dispatch, after its real local ticket is ready.
+      if (scope?.preparedParent) await this.claimPreparedChild(scope);
+      if (admissionSignal.aborted) throw admissionSignal.reason;
+      this.accountReadTimeout();
       // Queue time belongs to the enclosing 20-second account observation.
       // Bound HTTP/JSON work to 12 seconds after admission instead of consuming
       // its wire window in the queue; the whole-operation boundary stays 20s.
@@ -1135,7 +1494,7 @@ export class VenueReads {
               ...(scope?.frameLease
                 ? {
                     frame_id: scope.frameLease.frame_id,
-                    frame_owner: scope.owner!,
+                    frame_owner: scope.frameOwner ?? scope.owner!,
                   }
                 : {}),
             },

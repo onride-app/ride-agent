@@ -48,6 +48,12 @@ import {
   submissionDiagnosticStart,
 } from "./submission-failure-diagnostics.js";
 import { orderedSourceFills } from "./source-fill-evidence.js";
+import type { PreparedPortfolioWindow, SourceSnapshot } from "./adapter.js";
+import {
+  preparedPortfolioInput,
+  preparedOperationalBinding,
+  type PreparedPortfolioInput,
+} from "./prepared-portfolio.js";
 import {
   runMonitorTrace,
   monitorPhase,
@@ -74,9 +80,53 @@ function commitOriginalRetirement(
     "Original expired execution was not accepted; its ID is permanently rejected.";
 }
 
+function preparationCandidate(state: State): PreparedPortfolioInput | null {
+  const active = state.portfolios.filter((p) => p.state !== "closed");
+  if (active.length !== 1) return null;
+  const p = active[0];
+  if (
+    !(p.venue_accounts?.perps ?? p.account_id) ||
+    !p.ledger_started_at ||
+    p.loss_latched ||
+    !["active", "attention"].includes(p.state) ||
+    p.sleeves.length === 0 ||
+    p.sleeves.some(
+      (s) =>
+        s.trader.market !== "perps" ||
+        s.state !== "active" ||
+        !s.initialized ||
+        s.copy_mode === "fixed",
+    ) ||
+    state.portfolios.some((portfolio) =>
+      portfolio.executions.some(
+        (e) => !["completed", "failed", "superseded"].includes(e.status),
+      ),
+    )
+  )
+    return null;
+  return structuredClone(preparedPortfolioInput(p));
+}
+
+class PreparedSelectionChanged extends Error {}
+type TickAdmission =
+  | { kind: "legacy" }
+  | { kind: "discover" }
+  | {
+      kind: "prepared";
+      expected: PreparedPortfolioInput;
+      window: PreparedPortfolioWindow;
+    };
+
 export class AgentRunner {
   private sourceTimes = new Map<string, number>();
   private venueRetryAt = new Map<string, number>();
+  // Routing metadata from already committed monitor transactions only. It is
+  // never an account/source observation and adds no history hydration/read.
+  private preparationCandidates = new Map<
+    string,
+    PreparedPortfolioInput | null
+  >();
+  private pendingPreparations = new Map<string, PreparedPortfolioInput>();
   private notifications: NotificationDispatcher;
   constructor(private service: AgentService) {
     this.notifications = new NotificationDispatcher(
@@ -92,23 +142,122 @@ export class AgentRunner {
     await this.notifications.flush();
   }
   async tick(user: string): Promise<void> {
-    return runMonitorTrace(() => this.tickBody(user));
+    return runMonitorTrace(() => this.routeTick(user));
   }
-  private async tickBody(user: string): Promise<void> {
+  private async routeTick(user: string): Promise<void> {
+    const adapter = this.service.adapter;
+    if (!adapter.withPreparedPortfolio) return this.tickBody(user);
+    const candidate = this.preparationCandidates.get(user);
+    if (!candidate) return this.tickBody(user, { kind: "discover" });
+    if (this.pendingPreparations.size >= 2000)
+      this.pendingPreparations.delete(
+        this.pendingPreparations.keys().next().value!,
+      );
+    this.pendingPreparations.set(user, candidate);
+    const clearOwnPending = () => {
+      if (this.pendingPreparations.get(user) === candidate)
+        this.pendingPreparations.delete(user);
+    };
+    let entered = false;
+    try {
+      const result = await adapter.withPreparedPortfolio(
+        user,
+        candidate,
+        async (window) => {
+          clearOwnPending();
+          entered = true;
+          await this.tickBody(user, {
+            kind: "prepared",
+            expected: candidate,
+            window,
+          });
+        },
+      );
+      if (result.state === "complete") return;
+      if (result.state === "unsupported") {
+        clearOwnPending();
+        return this.tickBody(user);
+      }
+    } catch (error) {
+      // Never rerun a callback that may already have committed its one ID or
+      // entered the original financial path. Only the first-state gate can
+      // prove that no callback work began.
+      if (entered && !(error instanceof PreparedSelectionChanged)) throw error;
+    }
+    // Pending preparation must still run existing audits, controls, recovery
+    // and notifications, while eligible new targets remain unmaterialized.
+    await this.tickBody(user, { kind: "discover" });
+  }
+  private async tickBody(
+    user: string,
+    admission: TickAdmission = { kind: "legacy" },
+  ): Promise<void> {
     const { repository, adapter } = this.service;
-    const transact = <T>(
+    const createdPreparedIds = new Set<string>();
+    let attemptedPendingCancellation = false;
+    let preparedInterrupted = false;
+    const leavePreparedForRisk = async () => {
+      if (admission.kind !== "prepared" || preparedInterrupted) return;
+      preparedInterrupted = true;
+      await admission.window.release?.();
+    };
+    const transact = async <T>(
       phase: "audit_control" | "observe_plan" | "durable_notify",
       work: MonitorCallback<T>,
-    ) =>
-      monitorPhase(phase, () =>
+    ) => {
+      let nextCandidate: PreparedPortfolioInput | null | undefined;
+      const checked: MonitorCallback<T> = async (state, history) => {
+        if (phase === "audit_control" && admission.kind === "prepared") {
+          const current = preparationCandidate(state);
+          if (
+            !current ||
+            current.id !== admission.expected.id ||
+            preparedOperationalBinding(current) !==
+              preparedOperationalBinding(admission.expected)
+          )
+            throw new PreparedSelectionChanged();
+        }
+        const result = await work(state, history);
+        nextCandidate = preparationCandidate(state);
+        return result;
+      };
+      const result = await monitorPhase(phase, () =>
         repository.transactMonitor
           ? repository.transactMonitor(
               user,
-              work,
+              checked,
               this.notifications.acknowledgementIds(user),
             )
-          : repository.transact(user, work),
+          : repository.transact(user, checked),
       );
+      if (adapter.withPreparedPortfolio && nextCandidate !== undefined) {
+        if (this.preparationCandidates.size >= 2000)
+          this.preparationCandidates.delete(
+            this.preparationCandidates.keys().next().value!,
+          );
+        this.preparationCandidates.set(user, nextCandidate);
+        const pending = this.pendingPreparations.get(user);
+        if (
+          pending &&
+          !attemptedPendingCancellation &&
+          adapter.cancelPreparedPortfolio &&
+          (!nextCandidate ||
+            preparedOperationalBinding(nextCandidate) !==
+              preparedOperationalBinding(pending))
+        ) {
+          attemptedPendingCancellation = true;
+          try {
+            await adapter.cancelPreparedPortfolio(user, pending);
+            if (this.pendingPreparations.get(user) === pending)
+              this.pendingPreparations.delete(user);
+          } catch {
+            // Resource cleanup never replaces a committed audit, reconciliation
+            // or risk action. Retry at most once on a later ordinary tick.
+          }
+        }
+      }
+      return result;
+    };
     // Planning is committed before any submission. A process crash cannot
     // erase a possibly submitted execution identifier or its frozen payload.
     const prefetches = new Map<string, ReturnType<typeof observeSources>>();
@@ -139,7 +288,8 @@ export class AgentRunner {
         // This uses persisted error data, so a runner restart cannot bypass
         // the delay. Durable submission reconciliation below still runs.
         if (venueReadRetryPending(p)) continue;
-        if (!sourceReadRetryPending(p)) prefetches.set(p.id, startSources(p));
+        if (admission.kind !== "prepared" && !sourceReadRetryPending(p))
+          prefetches.set(p.id, startSources(p));
         let auditComplete = false;
         try {
           if (!p.account_id) {
@@ -348,6 +498,7 @@ export class AgentRunner {
             );
           }
           if (p.loss_latched) {
+            await leavePreparedForRisk();
             await adapter.fence(user, p);
             await adapter.cancelIncreasing(user, p);
           }
@@ -355,8 +506,10 @@ export class AgentRunner {
             if (s.state === "closed") continue;
             if (["closing", "loss_triggered"].includes(s.state)) {
               for (const x of Object.values(s.intents)) x.quantity = "0";
-              if (s.state === "loss_triggered" && !p.loss_latched)
+              if (s.state === "loss_triggered" && !p.loss_latched) {
+                await leavePreparedForRisk();
                 await adapter.fence(user, p);
+              }
               continue;
             }
             const currentProfit = profit.sleeves.find(
@@ -385,6 +538,7 @@ export class AgentRunner {
                 for (const execution of p.executions)
                   if (execution.status === "queued")
                     execution.status = "superseded";
+                await leavePreparedForRisk();
                 await adapter.fence(user, p);
                 await adapter.cancelIncreasing(user, p);
                 event(
@@ -464,6 +618,7 @@ export class AgentRunner {
           string,
           ReturnType<typeof adapter.source>
         >();
+        const plannedSources: SourceSnapshot[] = [];
         const getSources = () => (sources ??= startSources(p));
         const publicFailures = new Set<unknown>();
         let replayedSourceError: MonitorError | undefined;
@@ -619,6 +774,7 @@ export class AgentRunner {
               sourceCheckedAt,
               p.sleeves.indexOf(s) + 1,
             );
+            plannedSources.push(source);
             if (!fresh(snap.observed_at))
               throw new AgentError(
                 "ACCOUNT_STALE",
@@ -1173,6 +1329,64 @@ export class AgentRunner {
               );
               continue;
             }
+            if (
+              admission.kind === "prepared" &&
+              !preparedInterrupted &&
+              (p.loss_latched || p.sleeves.some((s) => s.state !== "active"))
+            )
+              await leavePreparedForRisk();
+            if (
+              admission.kind === "discover" &&
+              preparationCandidate(state)?.id === p.id
+            )
+              continue;
+            const prepared =
+              admission.kind === "prepared" && !preparedInterrupted;
+            if (
+              prepared &&
+              (admission.window.mode === "cold" || createdPreparedIds.size > 0)
+            )
+              continue;
+            let preparation:
+              | Awaited<
+                  ReturnType<NonNullable<typeof adapter.prepareExecution>>
+                >
+              | undefined;
+            if (prepared) {
+              if (!adapter.prepareExecution)
+                throw new AgentError(
+                  "EXECUTOR_UNAVAILABLE",
+                  "Prepared execution support is unavailable.",
+                  true,
+                  503,
+                );
+              preparation = await adapter.prepareExecution(user, p, {
+                key,
+                target_quantity: q,
+                allocations,
+                revision: p.revision,
+                reserve_usdc: reduction ? "0.000000" : cash(reserve),
+              });
+              if (
+                !preparation ||
+                preparation.expires_at <= now() ||
+                !fresh(snap.observed_at) ||
+                plannedSources.some(
+                  (source) =>
+                    !sourceEvidenceReady(source) ||
+                    !fresh(source.observed_at, 5000) ||
+                    source.positions.some(
+                      (position) => !fresh(position.observed_at, 5000),
+                    ),
+                )
+              )
+                throw new AgentError(
+                  "SOURCE_STALE",
+                  "Fresh evidence expired before prepared target creation.",
+                  true,
+                  503,
+                );
+            }
             const id = uid("execution");
             const frozen = {
               id,
@@ -1183,7 +1397,7 @@ export class AgentRunner {
               created_at: now(),
               expires_at: now() + 60_000,
             };
-            p.executions.push({
+            const execution: Execution = {
               ...frozen,
               fingerprint: fingerprint(frozen),
               status: "queued",
@@ -1191,7 +1405,10 @@ export class AgentRunner {
               observed_quantity: null,
               reserve_usdc: reduction ? "0.000000" : cash(reserve),
               error: null,
-            });
+            };
+            preparation?.bind(execution);
+            p.executions.push(execution);
+            if (prepared) createdPreparedIds.add(id);
           }
           for (const s of p.sleeves.filter((s) =>
             ["wind_down", "risk_off", "closing", "loss_triggered"].includes(
@@ -1213,6 +1430,7 @@ export class AgentRunner {
             p.sleeves.every((s) => s.state === "closed") &&
             p.reconciliation === "complete"
           ) {
+            await leavePreparedForRisk();
             await adapter.release(user, p);
             p.state = "closed";
             eventOnce(
@@ -1332,6 +1550,12 @@ export class AgentRunner {
             for (const e of p.executions.filter(
               (e) => ["queued", "uncertain"].includes(e.status) && !e.task_id,
             )) {
+              if (
+                admission.kind === "prepared" &&
+                !preparedInterrupted &&
+                !createdPreparedIds.has(e.id)
+              )
+                continue;
               if (e.retirement !== undefined) {
                 const request = perpsRecoveryRequest(
                   user,
@@ -1467,6 +1691,7 @@ export class AgentRunner {
                 );
               }
             }
+          if (admission.kind === "prepared") await admission.window.release?.();
           const prefs = state.notification_preferences;
           if (prefs?.daily_digest) {
             const local = localDay(now(), prefs.timezone),

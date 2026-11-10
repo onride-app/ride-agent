@@ -2,6 +2,7 @@
 import "dotenv/config";
 import express from "express";
 import type { Server } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { VERSION } from "../version.js";
 import { firebaseAccount } from "./firebase.js";
 import pg from "pg";
@@ -15,14 +16,29 @@ import {
 import { DepositReads } from "./deposits.js";
 import { PredictionVenue } from "./prediction.js";
 import { AgentError, failure, errorDetails } from "./contracts.js";
-import { VenueReads, type AccountObservationLimits } from "./venue-reads.js";
+import {
+  VenueReads,
+  isPreparedBundleUnsupported,
+  type AccountObservationLimits,
+  type PreparedAccountWindow,
+} from "./venue-reads.js";
 import { drainBridge } from "./bridge-shutdown.js";
 import {
   AccountObservationPlans,
   ACCOUNT_OBSERVATION_COST_CONTRACT,
 } from "./account-observation-plans.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
-import { coreFrameCoordinator } from "./core-frame-coordinator.js";
+import {
+  coreFrameCoordinator,
+  framePendingContinuation,
+} from "./core-frame-coordinator.js";
+import {
+  preparedPortfolioInput,
+  preparedOperationalBinding,
+  preparedProposalBinding,
+  preparedWriteBinding,
+  type PreparedPortfolioInput,
+} from "./prepared-portfolio.js";
 import { notificationCancellation } from "./notification-cancellation.js";
 import { submitObservationCancellation } from "./submit-observation-cancellation.js";
 import { NotificationReceipts } from "./notification-receipts.js";
@@ -148,7 +164,32 @@ const required = (key: string) => {
   if (!v) throw new Error(`${key} is required`);
   return v;
 };
+type PreparedEntry = {
+  handle: string;
+  key: string;
+  user: string;
+  portfolio: PreparedPortfolioInput;
+  stable: string;
+  costOwner: string;
+  frameOwner: string;
+  deadline: number;
+  pin?: object;
+  window?: PreparedAccountWindow;
+  polling: boolean;
+  timer: ReturnType<typeof setTimeout>;
+  expired: boolean;
+  auditHash?: string;
+  proposal?: string;
+  writeBinding?: string;
+  attempted?: { id: string; fingerprint: string };
+};
 export class CoreBridge {
+  private readonly preparedEntries = new Map<string, PreparedEntry>();
+  private readonly preparedCreating = new Map<
+    string,
+    { stable: string; cancelled: boolean }
+  >();
+  private readonly preparedSource = new AsyncLocalStorage<PreparedEntry>();
   private venueReads: VenueReads;
   private observationPlans: AccountObservationPlans;
   private readonly infoReadRoute: "official" | "core";
@@ -224,6 +265,10 @@ export class CoreBridge {
     );
   }
   drainAccounts(): Promise<void> {
+    for (const entry of this.preparedEntries.values()) {
+      clearTimeout(entry.timer);
+      entry.expired = true;
+    }
     return this.venueReads.drainAccounts();
   }
   close(): Promise<void> {
@@ -437,8 +482,13 @@ export class CoreBridge {
       );
   }
   async source(id: string, minimumRequiresRwa = false) {
+    const prepared = this.preparedSource?.getStore();
+    if (prepared) this.checkPreparedSource(prepared, id, minimumRequiresRwa);
     if (minimumRequiresRwa) await this.sourceIdentities.resolve(id, true);
-    const snapshot = await this.sourceFeed.read(id);
+    const snapshot = await this.sourceFeed.read(
+      id,
+      prepared ? (work) => prepared.window!.supplement(work) : undefined,
+    );
     if (
       snapshot.observation_scope_requires_rwa !== undefined ||
       minimumRequiresRwa
@@ -1133,6 +1183,398 @@ export class CoreBridge {
       blockers: [...new Set(check.blockers as string[])],
       idempotent_existing: check.idempotent_existing as boolean,
     };
+  }
+  private preparedFailure(): AgentError {
+    return new AgentError(
+      "VENUE_COST_PLAN_UNAVAILABLE",
+      "Prepared read window is unavailable; complete fresh evidence remains required.",
+      true,
+      503,
+    );
+  }
+  private preparedInput(value: any): PreparedPortfolioInput {
+    const allowed = new Set([
+      "id",
+      "revision",
+      "control_id",
+      "account_id",
+      "venue_accounts",
+      "ledger_started_at",
+      "preferences",
+      "loss_latched",
+      "state",
+      "sleeves",
+      "handoff_binding",
+      "has_nonterminal_executions",
+      "audit_snapshot_hash",
+      "write_binding",
+    ]);
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      Object.keys(value).some((k) => !allowed.has(k)) ||
+      JSON.stringify(value).length > 32768 ||
+      typeof value.id !== "string" ||
+      !value.id ||
+      !Number.isSafeInteger(value.revision) ||
+      value.revision < 0 ||
+      typeof value.account_id !== "string" ||
+      !value.account_id ||
+      !Number.isSafeInteger(value.ledger_started_at) ||
+      value.ledger_started_at <= 0 ||
+      !Array.isArray(value.sleeves) ||
+      value.sleeves.length < 1 ||
+      value.sleeves.length > 8 ||
+      value.sleeves.some(
+        (s: any) =>
+          !s ||
+          typeof s.copy_id !== "string" ||
+          (s.copy_mode !== undefined &&
+            !["ride_recommends", "fixed", "proportional"].includes(
+              s.copy_mode,
+            )) ||
+          s.trader?.market !== "perps" ||
+          typeof s.trader.id !== "string" ||
+          !Array.isArray(s.trader.assets) ||
+          s.trader.assets.some((a: any) => typeof a !== "string"),
+      ) ||
+      value.has_nonterminal_executions !== false ||
+      value.state === "closed"
+    )
+      throw this.preparedFailure();
+    const {
+      audit_snapshot_hash: _audit,
+      write_binding: _write,
+      ...compact
+    } = value;
+    return compact as PreparedPortfolioInput;
+  }
+  private assertPrepared(entry: PreparedEntry): PreparedAccountWindow {
+    if (
+      entry.expired ||
+      !entry.window ||
+      entry.window.expires_at <= now() ||
+      this.preparedEntries.get(entry.key) !== entry
+    )
+      throw this.preparedFailure();
+    return entry.window;
+  }
+  private preparedHandle(
+    handle: string,
+    user?: string,
+    portfolioId?: string,
+  ): PreparedEntry {
+    if (!/^[0-9a-f]{64}$/.test(handle)) throw this.preparedFailure();
+    const entry = [...this.preparedEntries.values()].find(
+      (e) => e.handle === handle,
+    );
+    if (
+      !entry ||
+      (user !== undefined && entry.user !== user) ||
+      (portfolioId !== undefined && entry.portfolio.id !== portfolioId)
+    )
+      throw this.preparedFailure();
+    return entry;
+  }
+  private async finishPrepared(entry: PreparedEntry): Promise<void> {
+    entry.expired = true;
+    clearTimeout(entry.timer);
+    if (entry.window) await entry.window.close();
+    else if (entry.pin) await this.venueReads.cancelPreparedPending(entry.pin);
+  }
+  private async preparedIdentity(user: string, p: PreparedPortfolioInput) {
+    const accountId = p.venue_accounts?.perps ?? p.account_id;
+    if (typeof accountId !== "string" || !accountId)
+      throw this.preparedFailure();
+    const identity = await this.core("perps_account", {
+      user_id: user,
+      account_id: accountId,
+    });
+    if (
+      identity.account_id !== accountId ||
+      identity.network !== (this.network === "mainnet" ? 2 : 1) ||
+      typeof identity.master !== "string" ||
+      !/^0x[0-9a-f]{40}$/i.test(identity.master) ||
+      typeof identity.agent !== "string" ||
+      !/^0x[0-9a-f]{40}$/i.test(identity.agent) ||
+      !Number.isSafeInteger(identity.wallet_generation) ||
+      identity.wallet_generation < 0
+    )
+      throw this.preparedFailure();
+    const handoffs = manualMarkets(identity, accountId);
+    return this.perpsCostOwner(
+      user,
+      p as unknown as Portfolio,
+      false,
+      identity,
+      accountId,
+      handoffs,
+    );
+  }
+  private async preparePortfolio(
+    user: string,
+    value: any,
+    limits?: AccountObservationLimits,
+  ) {
+    if (this.infoReadRoute !== "core" || this.network !== "mainnet")
+      return { state: "unsupported" };
+    const p = this.preparedInput(value),
+      stable = preparedOperationalBinding(p);
+    if (typeof user !== "string" || !user || user.length > 256)
+      throw this.preparedFailure();
+    const key = fingerprint([user, p.id]);
+    if (this.preparedCreating.has(key))
+      return { state: "pending", retry_after_ms: 250 };
+    if (this.preparedCreating.size >= 64) throw this.preparedFailure();
+    this.preparedCreating.set(key, { stable, cancelled: false });
+    try {
+      let entry = this.preparedEntries.get(key);
+      // Metadata does not prove ownership of an already granted peer lease.
+      // Only its handle, expiry or drain may end that live read capability.
+      if (entry?.window && !entry.expired && entry.window.expires_at > now())
+        return p.sleeves.some((s) => s.copy_mode === "fixed")
+          ? { state: "unsupported" }
+          : { state: "pending", retry_after_ms: 250 };
+      if (p.sleeves.some((s) => s.copy_mode === "fixed")) {
+        if (entry && !entry.window && entry.stable === stable) {
+          await this.finishPrepared(entry).catch(() => {});
+          this.preparedEntries.delete(key);
+        }
+        return { state: "unsupported" };
+      }
+      for (const [id, old] of this.preparedEntries) {
+        if (old.deadline <= now() && old !== entry) {
+          await this.finishPrepared(old).catch(() => {});
+          this.preparedEntries.delete(id);
+        }
+      }
+      if (
+        entry &&
+        (entry.stable !== stable || entry.expired || entry.deadline <= now())
+      ) {
+        await this.finishPrepared(entry).catch(() => {});
+        this.preparedEntries.delete(key);
+        // A changed/expired episode is never immediately replaced in this call.
+        throw this.preparedFailure();
+      }
+      if (entry?.window || entry?.polling)
+        return { state: "pending", retry_after_ms: 250 };
+      if (!entry) {
+        if (this.preparedEntries.size >= 64) throw this.preparedFailure();
+        const costOwner = await this.preparedIdentity(user, p);
+        if (this.preparedCreating.get(key)?.cancelled)
+          throw this.preparedFailure();
+        if (this.preparedEntries.size >= 64) throw this.preparedFailure();
+        const handle = (randomUUID() + randomUUID()).replaceAll("-", "");
+        const deadline = now() + 100000;
+        const created: PreparedEntry = {
+          handle,
+          key,
+          user,
+          portfolio: p,
+          stable,
+          costOwner,
+          frameOwner: fingerprint([
+            costOwner,
+            "prepared-portfolio-v1",
+            p.id,
+            stable,
+          ]),
+          deadline,
+          polling: false,
+          expired: false,
+          timer: setTimeout(() => {
+            void this.finishPrepared(created).catch(() => {});
+          }, 100000),
+        };
+        created.timer.unref();
+        entry = created;
+        this.preparedEntries.set(key, entry);
+      }
+      entry.polling = true;
+      try {
+        const currentOwner = await this.preparedIdentity(user, p);
+        if (
+          currentOwner !== entry.costOwner ||
+          entry.expired ||
+          this.preparedEntries.get(key) !== entry ||
+          this.preparedCreating.get(key)?.cancelled
+        )
+          throw this.preparedFailure();
+        const window = await this.venueReads.prepareAccountWindow(
+          entry.costOwner,
+          entry.frameOwner,
+          entry.deadline,
+          entry.pin,
+          limits?.signal,
+        );
+        if (entry.expired || this.preparedEntries.get(key) !== entry) {
+          await window.close();
+          throw this.preparedFailure();
+        }
+        entry.window = window;
+        clearTimeout(entry.timer);
+        entry.timer = setTimeout(
+          () => {
+            void this.finishPrepared(entry!).catch(() => {});
+          },
+          Math.max(0, window.expires_at - now()),
+        );
+        entry.timer.unref();
+        return {
+          state: "ready",
+          handle: entry.handle,
+          mode: window.mode,
+          expires_at: window.expires_at,
+        };
+      } catch (error) {
+        if (isPreparedBundleUnsupported(error)) {
+          await this.finishPrepared(entry).catch(() => {});
+          if (this.preparedEntries.get(key) === entry)
+            this.preparedEntries.delete(key);
+          return { state: "unsupported" };
+        }
+        const pin = framePendingContinuation(error);
+        if (pin && (entry.expired || this.preparedEntries.get(key) !== entry)) {
+          await this.venueReads.cancelPreparedPending(pin).catch(() => {});
+          throw this.preparedFailure();
+        }
+        if (pin && !entry.expired && this.preparedEntries.get(key) === entry) {
+          if (entry.pin && entry.pin !== pin) throw this.preparedFailure();
+          entry.pin = pin;
+          return {
+            state: "pending",
+            retry_after_ms:
+              (error as AgentError).details?.retry_after_ms ?? 1000,
+          };
+        }
+        await this.finishPrepared(entry).catch(() => {});
+        throw error;
+      } finally {
+        entry.polling = false;
+      }
+    } finally {
+      this.preparedCreating.delete(key);
+    }
+  }
+
+  private async cancelPreparedPortfolio(user: string, value: any) {
+    const p = this.preparedInput(value),
+      stable = preparedOperationalBinding(p),
+      key = fingerprint([user, p.id]);
+    const entry = this.preparedEntries.get(key);
+    // A pending interest is not ownership of a peer's ready window.
+    if (entry?.window) return { ok: true };
+    const creating = this.preparedCreating.get(key);
+    if (creating?.stable === stable) creating.cancelled = true;
+    if (entry && entry.stable === stable) {
+      await this.finishPrepared(entry).catch(() => {});
+      if (this.preparedEntries.get(key) === entry)
+        this.preparedEntries.delete(key);
+    }
+    return { ok: true };
+  }
+
+  private checkPreparedSource(
+    entry: PreparedEntry,
+    id: string,
+    requiresRwa: boolean,
+  ) {
+    this.assertPrepared(entry);
+    if (!entry.auditHash) throw this.preparedFailure();
+    const selected = entry.portfolio.sleeves.find(
+      (s) => s.state !== "closed" && s.trader.id === id,
+    );
+    if (
+      !selected ||
+      sourceRequiresRwa(selected.trader as Candidate) !== requiresRwa
+    )
+      throw this.preparedFailure();
+  }
+  private async preparedAccount(
+    entry: PreparedEntry,
+    user: string,
+    p: Portfolio,
+    limits?: AccountObservationLimits,
+  ) {
+    const window = this.assertPrepared(entry);
+    const compact = preparedPortfolioInput(p);
+    if (
+      entry.auditHash ||
+      entry.attempted ||
+      compact.has_nonterminal_executions ||
+      preparedOperationalBinding(compact) !== entry.stable
+    )
+      throw this.preparedFailure();
+    const snap = await window.read(() => this.account(user, p), limits);
+    this.assertPrepared(entry);
+    entry.auditHash = fingerprint(snap);
+    return snap;
+  }
+  private prepareExecution(entry: PreparedEntry, value: any, proposal: any) {
+    const window = this.assertPrepared(entry),
+      p = this.preparedInput(value);
+    window.assertNextChildReady();
+    if (
+      window.mode !== "warm" ||
+      !entry.auditHash ||
+      entry.proposal ||
+      entry.attempted ||
+      value.audit_snapshot_hash !== entry.auditHash ||
+      preparedOperationalBinding(p) !== entry.stable ||
+      typeof value.write_binding !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.write_binding) ||
+      !proposal ||
+      typeof proposal.key !== "string" ||
+      !proposal.key.startsWith("perps:") ||
+      typeof proposal.target_quantity !== "string" ||
+      !Number.isFinite(Number(proposal.target_quantity)) ||
+      proposal.revision !== p.revision ||
+      typeof proposal.reserve_usdc !== "string" ||
+      !Number.isFinite(Number(proposal.reserve_usdc)) ||
+      !proposal.allocations ||
+      Array.isArray(proposal.allocations)
+    )
+      throw this.preparedFailure();
+    entry.proposal = preparedProposalBinding(proposal);
+    entry.writeBinding = value.write_binding;
+    return { ready: true };
+  }
+  private bindPreparedExecution(
+    entry: PreparedEntry,
+    user: string,
+    p: Portfolio,
+    e: Execution,
+  ) {
+    const window = this.assertPrepared(entry);
+    if (
+      window.mode !== "warm" ||
+      entry.user !== user ||
+      entry.portfolio.id !== p.id ||
+      entry.attempted ||
+      !entry.proposal ||
+      entry.proposal !== preparedProposalBinding(e) ||
+      preparedOperationalBinding(preparedPortfolioInput(p)) !== entry.stable ||
+      preparedWriteBinding(p, e.id, user) !== entry.writeBinding ||
+      e.status !== "queued" ||
+      e.task_id ||
+      p.executions.filter((x) => x.id === e.id).length !== 1 ||
+      e.expires_at !== e.created_at + 60000 ||
+      e.created_at > now() ||
+      e.fingerprint !==
+        fingerprint({
+          id: e.id,
+          key: e.key,
+          target_quantity: e.target_quantity,
+          allocations: e.allocations,
+          revision: e.revision,
+          created_at: e.created_at,
+          expires_at: e.expires_at,
+        })
+    )
+      throw this.preparedFailure();
+    entry.attempted = { id: e.id, fingerprint: e.fingerprint };
   }
   async perpsAccount(
     user: string,
@@ -2162,6 +2604,7 @@ export class CoreBridge {
     p: Portfolio,
     e: Execution,
     observation?: AccountObservationLimits,
+    prepared?: PreparedEntry,
   ): Promise<{ task_id: string }> {
     if (e.retirement !== undefined)
       throw new AgentError(
@@ -2173,6 +2616,7 @@ export class CoreBridge {
       "SELECT fingerprint,payload,response FROM ride_agent_core_outbox WHERE execution_id=$1 AND user_id=$2 AND portfolio_id=$3",
       [e.id, user, p.id],
     );
+    if (prepared && existing.rowCount) throw this.preparedFailure();
     if (!existing.rowCount && e.expires_at <= now())
       throw new AgentError(
         "EXECUTION_REJECTED",
@@ -2205,11 +2649,18 @@ export class CoreBridge {
         );
       payload = saved.rows[0].payload;
     } else {
-      const snap = await this.perpsAccount(user, p, false, {
-        signal: observation?.signal,
-        deadlineMs: Math.min(e.expires_at, observation?.deadlineMs ?? Infinity),
-        waitForFrameAdmission: true,
-      });
+      const readAccount = () =>
+        this.perpsAccount(user, p, false, {
+          signal: observation?.signal,
+          deadlineMs: Math.min(
+            e.expires_at,
+            observation?.deadlineMs ?? Infinity,
+          ),
+          waitForFrameAdmission: true,
+        });
+      const snap = prepared
+        ? await this.assertPrepared(prepared).read(readAccount, observation)
+        : await readAccount();
       if (
         snap.manual_markets?.some(
           (handoff) => e.key === `perps:${handoff.coin}`,
@@ -2377,6 +2828,12 @@ export class CoreBridge {
           true,
           503,
         );
+      if (prepared) {
+        this.assertPrepared(prepared);
+        // Read credit ends before the first durable financial write. Its timer
+        // never cancels an outboxed action or adds another financial retry.
+        await this.finishPrepared(prepared);
+      }
       await this.pool.query(
         "INSERT INTO ride_agent_core_outbox(execution_id,user_id,portfolio_id,fingerprint,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
         [e.id, user, p.id, e.fingerprint, payload],
@@ -2763,7 +3220,86 @@ export class CoreBridge {
     input: any,
     notificationCaller?: AbortSignal,
     submitObservation?: AccountObservationLimits,
+    preparedWindowHandle?: string,
   ): Promise<unknown> {
+    if (op === "prepare_portfolio") {
+      if (preparedWindowHandle) throw this.preparedFailure();
+      return this.preparePortfolio(
+        input.user_id,
+        input.portfolio,
+        submitObservation,
+      );
+    }
+    if (op === "cancel_prepared_portfolio") {
+      if (preparedWindowHandle) throw this.preparedFailure();
+      return this.cancelPreparedPortfolio(input.user_id, input.portfolio);
+    }
+    if (preparedWindowHandle) {
+      const entry = this.preparedHandle(
+        preparedWindowHandle,
+        input.user_id,
+        input.portfolio?.id ?? input.portfolio_id,
+      );
+      switch (op) {
+        case "finish_portfolio":
+          await this.finishPrepared(entry).catch(() => {});
+          this.preparedEntries.delete(entry.key);
+          return { ok: true };
+        case "prepare_execution":
+          return this.prepareExecution(entry, input.portfolio, input.proposal);
+        case "account":
+          return this.preparedAccount(
+            entry,
+            input.user_id,
+            input.portfolio,
+            submitObservation,
+          );
+        case "submit":
+          this.bindPreparedExecution(
+            entry,
+            input.user_id,
+            input.portfolio,
+            input.execution,
+          );
+          return this.preparedSource.run(entry, () =>
+            this.submit(
+              input.user_id,
+              input.portfolio,
+              input.execution,
+              submitObservation,
+              entry,
+            ),
+          );
+        case "source":
+          this.checkPreparedSource(
+            entry,
+            input.trader_id,
+            input.minimum_requires_rwa === true,
+          );
+          return this.preparedSource.run(entry, () =>
+            this.source(input.trader_id, input.minimum_requires_rwa === true),
+          );
+        case "read_plan_evidence":
+          if (!Array.isArray(input.traders) || !input.traders.length)
+            throw this.preparedFailure();
+          for (const trader of input.traders)
+            this.checkPreparedSource(
+              entry,
+              trader.id,
+              sourceRequiresRwa(trader),
+            );
+          return this.assertPrepared(entry).supplement(() =>
+            readSelectedPlanEvidence(input.traders, {
+              resolveTrader: (id) => this.resolve(id),
+              info: (payload) => this.info(payload, true),
+            }),
+          );
+        default:
+          throw this.preparedFailure();
+      }
+    }
+    if (["prepare_execution", "finish_portfolio"].includes(op))
+      throw this.preparedFailure();
     switch (op) {
       case "read_plan_evidence":
         return readSelectedPlanEvidence(input?.traders, {
@@ -3079,7 +3615,9 @@ export async function startManagedCoreBridge(
         ? notificationCancellation(req, res)
         : undefined;
     const submitObservation =
-      req.params.operation === "submit"
+      req.params.operation === "submit" ||
+      req.params.operation === "prepare_portfolio" ||
+      (req.params.operation === "account" && !!req.get("x-ride-read-window"))
         ? submitObservationCancellation(req, res)
         : undefined;
     try {
@@ -3089,6 +3627,7 @@ export async function startManagedCoreBridge(
           req.body,
           cancellation?.signal,
           submitObservation,
+          req.get("x-ride-read-window"),
         ),
       );
     } catch (e) {

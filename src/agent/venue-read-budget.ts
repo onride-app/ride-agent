@@ -82,6 +82,14 @@ export interface AccountReadReservation {
   close(complete?: boolean): void;
   costPlan(): ObservationCostPlan | null;
 }
+/** A bounded parent holds capacity only; only completed children learn costs. */
+export interface AccountReadBundle extends AccountReadReservation {
+  readonly childLimit: number;
+  readonly childCount: number;
+  beginChild(): AccountReadReservation;
+  beginSupplement(): AccountReadReservation;
+  assertNextChildReady(): void;
+}
 type Observation = {
   ticket: AccountReadReservation;
   owner: string;
@@ -101,6 +109,14 @@ type Observation = {
   planAttempt?: object;
   capacityTrialLimit?: number;
   trialExceeded?: boolean;
+  supplement?: boolean;
+  bundle?: {
+    limit: number;
+    count: number;
+    opened: number;
+    child?: Observation;
+    supplementRemaining?: number;
+  };
 };
 type Owner = {
   served: number;
@@ -476,6 +492,7 @@ export class VenueReadBudget {
     owner: string,
     capacityTrial?: { fullDemand: number; reservedWeight: number },
     interestToken?: object,
+    bundle?: { childLimit: number; count: 1 | 2 },
   ): AccountReadReservation {
     this.prune();
     const now = this.clock();
@@ -501,7 +518,21 @@ export class VenueReadBudget {
           .cold)
     )
       throw costPlanUnavailable();
-    const reservedWeight = capacityTrial?.reservedWeight ?? entry.demand;
+    if (
+      bundle &&
+      (!Number.isSafeInteger(bundle.childLimit) ||
+        bundle.childLimit < 120 ||
+        ![1, 2].includes(bundle.count) ||
+        bundle.childLimit * bundle.count > this.limit ||
+        (capacityTrial
+          ? bundle.count !== 1 ||
+            bundle.childLimit !== capacityTrial.reservedWeight
+          : bundle.childLimit !== entry.demand))
+    )
+      throw costPlanUnavailable();
+    const reservedWeight = bundle
+      ? bundle.childLimit * bundle.count
+      : (capacityTrial?.reservedWeight ?? entry.demand);
     const first = this.observationQueue.keys().next().value;
     if (this.observation || first !== owner) {
       this.observations.deferred++;
@@ -585,6 +616,16 @@ export class VenueReadBudget {
         if (this.observation?.ticket !== ticket) return;
         this.observation.closed = true;
         this.observation.complete = complete;
+        if (this.observation.bundle) {
+          for (const lane of ["account", "source"] as const)
+            for (const waiter of [...this.queues[lane]])
+              if (this.ownsObservation(waiter.observation)) {
+                this.queues[lane].splice(this.queues[lane].indexOf(waiter), 1);
+                waiter.signal.removeEventListener("abort", waiter.cancel);
+                this.observation.sampleInvalid = true;
+                waiter.reject(this.observationDeferred(1000));
+              }
+        }
         if (
           [...this.queues.account, ...this.queues.source].some(
             (waiter) => waiter.observation === ticket,
@@ -637,6 +678,15 @@ export class VenueReadBudget {
           : undefined,
       planAttempt: this.observationPlanAttempts.get(owner)?.token,
       ...(capacityTrial ? { capacityTrialLimit: reservedWeight } : {}),
+      ...(bundle
+        ? {
+            bundle: {
+              limit: bundle.childLimit,
+              count: bundle.count,
+              opened: 0,
+            },
+          }
+        : {}),
     };
     this.observations.started++;
     if (this.recentObservationWeights.length) {
@@ -650,6 +700,157 @@ export class VenueReadBudget {
     }
     return ticket;
   }
+  beginObservationBundle(
+    owner: string,
+    childLimit: number,
+    count: 1 | 2,
+    interestToken: object,
+    cold = false,
+  ): AccountReadBundle {
+    const ticket = this.beginObservation(
+      owner,
+      cold ? { fullDemand: this.limit, reservedWeight: childLimit } : undefined,
+      interestToken,
+      { childLimit, count },
+    );
+    const openChild = (supplement = false) => {
+      const parent = this.observation;
+      if (
+        parent?.ticket !== ticket ||
+        parent.closed ||
+        parent.sampleInvalid ||
+        !parent.bundle ||
+        parent.bundle.child ||
+        (supplement
+          ? parent.bundle.opened < 1 ||
+            parent.bundle.supplementRemaining === undefined
+          : parent.bundle.opened >= count)
+      )
+        throw costPlanUnavailable();
+      const scopeLimit = supplement
+        ? parent.bundle.supplementRemaining!
+        : childLimit;
+      let learned: ObservationCostPlan | null = null;
+      const childTicket: AccountReadReservation = {
+        id: ++this.observationSequence,
+        weight: scopeLimit,
+        fullDemand: ticket.fullDemand,
+        capacityTrial: cold,
+        costPlan: () => (learned ? structuredClone(learned) : null),
+        close: (complete = false) => {
+          const child = parent.bundle?.child;
+          if (
+            this.observation !== parent ||
+            parent.closed ||
+            child?.ticket !== childTicket ||
+            child.closed
+          )
+            return;
+          child.closed = true;
+          child.complete = complete;
+          if (
+            child.pending ||
+            [...this.queues.account, ...this.queues.source].some(
+              (w) => w.observation === childTicket,
+            )
+          ) {
+            child.sampleInvalid = true;
+            child.complete = false;
+          }
+          if (child.hadUncertain || child.sampleInvalid || child.trialExceeded)
+            child.complete = false;
+          if (child.complete && !supplement && child.committed > 0)
+            this.learnObservation(child);
+          if (supplement)
+            parent.bundle!.supplementRemaining = Math.max(
+              0,
+              parent.bundle!.supplementRemaining! - child.committed,
+            );
+          else if (child.complete && parent.bundle!.opened === 1)
+            parent.bundle!.supplementRemaining = Math.max(
+              0,
+              childLimit - child.committed,
+            );
+          if (!child.complete) {
+            parent.sampleInvalid = true;
+            if (
+              !supplement &&
+              (child.committed || child.hadUncertain || child.sampleInvalid)
+            )
+              this.invalidateObservationPlan(owner, child.planAttempt);
+          }
+          if (!child.pending) parent.bundle!.child = undefined;
+          if (complete && !child.complete) throw this.trialExhausted();
+        },
+      };
+      const prior = this.observationPlans.get(owner);
+      if (!supplement) parent.bundle.opened++;
+      parent.bundle.child = {
+        ticket: childTicket,
+        owner,
+        remaining: scopeLimit,
+        committed: 0,
+        peak: 0,
+        pending: 0,
+        closed: false,
+        complete: false,
+        grew: false,
+        hadUncertain: false,
+        sampleInvalid: false,
+        admittedPeak: 0,
+        started: this.clock(),
+        capacityTrialLimit: scopeLimit,
+        supplement,
+        publishCostPlan: (value) => {
+          learned = value;
+        },
+        previousPlan:
+          prior && validObservationCostPlan(prior, this.limit)
+            ? { demand: prior.demand, peaks: [...prior.peaks] }
+            : undefined,
+        planAttempt: this.observationPlanAttempts.get(owner)?.token,
+      };
+      return childTicket;
+    };
+    return Object.assign(ticket, {
+      childLimit,
+      childCount: count,
+      beginChild: () => openChild(),
+      beginSupplement: () => openChild(true),
+      assertNextChildReady: () => {
+        const parent = this.observation;
+        if (
+          parent?.ticket !== ticket ||
+          parent.closed ||
+          parent.sampleInvalid ||
+          !parent.bundle ||
+          parent.bundle.count !== 2 ||
+          parent.bundle.opened !== 1 ||
+          parent.bundle.child ||
+          parent.remaining <
+            childLimit + (parent.bundle.supplementRemaining ?? 0)
+        )
+          throw costPlanUnavailable();
+      },
+    });
+  }
+  private ownsObservation(ticket: AccountReadReservation | undefined) {
+    return (
+      !!ticket &&
+      (this.observation?.ticket === ticket ||
+        this.observation?.bundle?.child?.ticket === ticket)
+    );
+  }
+  private observationMeter(
+    ticket: AccountReadReservation | undefined,
+  ): Observation | undefined {
+    if (!ticket) return undefined;
+    return this.observation?.bundle?.child?.ticket === ticket
+      ? this.observation.bundle.child
+      : this.observation?.ticket === ticket
+        ? this.observation
+        : undefined;
+  }
   private observationDeferred(retry: number) {
     return new AgentError(
       "VENUE_READ_BUDGET_EXHAUSTED",
@@ -659,23 +860,7 @@ export class VenueReadBudget {
       { retry_after_ms: retry, reason_code: "READ_LOCAL_TICKET_STALE" },
     );
   }
-  private finishObservation() {
-    const frame = this.observation;
-    if (!frame?.closed || frame.pending) return;
-    // Fleet admission may reject before the first dispatch. That is no cost
-    // sample and no evidence of scope growth: preserve a valid learned hint
-    // rather than replacing it with the cold full-window placeholder.
-    if (
-      !frame.complete &&
-      frame.committed === 0 &&
-      !frame.grew &&
-      !frame.hadUncertain &&
-      !frame.sampleInvalid
-    ) {
-      this.observation = undefined;
-      this.pump();
-      return;
-    }
+  private learnObservation(frame: Observation) {
     // Include a metadata miss margin. An expanding scope/history raises the
     // high-water mark before admission and fails closed if it cannot fit.
     const previous =
@@ -698,6 +883,8 @@ export class VenueReadBudget {
       peaks,
       attempt: frame.planAttempt,
     });
+    const queued = this.observationQueue.get(frame.owner);
+    if (queued) queued.demand = this.observationPlans.get(frame.owner)!.demand;
     if (
       frame.complete &&
       !frame.hadUncertain &&
@@ -710,6 +897,25 @@ export class VenueReadBudget {
       );
       if (plan) frame.publishCostPlan(plan);
     }
+  }
+  private finishObservation() {
+    const frame = this.observation;
+    if (!frame?.closed || frame.pending) return;
+    // Fleet admission may reject before the first dispatch. That is no cost
+    // sample and no evidence of scope growth: preserve a valid learned hint
+    // rather than replacing it with the cold full-window placeholder.
+    if (
+      !frame.complete &&
+      frame.committed === 0 &&
+      !frame.grew &&
+      !frame.hadUncertain &&
+      !frame.sampleInvalid
+    ) {
+      this.observation = undefined;
+      this.pump();
+      return;
+    }
+    if (!frame.bundle) this.learnObservation(frame);
     // Spread complete frames rather than spending the window in a burst.
     // Settled ledger costs form the base; unknown charges keep their original
     // conservative weight. Qualified known cost samples and real source bounds
@@ -721,7 +927,8 @@ export class VenueReadBudget {
         Math.min(this.limit, frame.committed),
       ].slice(-5);
     if (frame.complete) {
-      const demand = this.observationPlans.get(frame.owner)!.demand;
+      const demand =
+        this.observationPlans.get(frame.owner)?.demand ?? this.limit;
       this.recentSuccessfulObservationFrames = [
         ...this.recentSuccessfulObservationFrames,
         {
@@ -748,17 +955,21 @@ export class VenueReadBudget {
       frame.started + this.observationPacingMs(pacedWeight),
     );
     const queued = this.observationQueue.get(frame.owner);
-    if (queued) queued.demand = this.observationPlans.get(frame.owner)!.demand;
+    if (queued)
+      queued.demand =
+        this.observationPlans.get(frame.owner)?.demand ?? this.limit;
     if (frame.complete) this.observations.completed++;
     if (frame.grew) this.observations.growth++;
     this.observation = undefined;
     this.pump();
   }
   private protectedWeight(observation?: AccountReadReservation) {
-    if (this.observation)
-      return this.observation.ticket === observation
-        ? 0
+    if (this.observation) {
+      const meter = this.observationMeter(observation);
+      return meter
+        ? Math.max(0, this.observation.remaining - meter.remaining)
         : this.observation.remaining;
+    }
     return this.observationQueue.values().next().value?.demand ?? 0;
   }
   private canBorrowPacingWeight(waiter: Waiter) {
@@ -803,11 +1014,8 @@ export class VenueReadBudget {
     for (const lane of ["account", "source"] as const) {
       for (const waiter of this.queues[lane]) {
         waiter.signal.removeEventListener("abort", waiter.cancel);
-        if (
-          waiter.observation &&
-          this.observation?.ticket === waiter.observation
-        )
-          this.observation.sampleInvalid = true;
+        const meter = this.observationMeter(waiter.observation);
+        if (meter) meter.sampleInvalid = true;
         waiter.reject(this.coolingDown());
       }
       this.queues[lane] = [];
@@ -879,8 +1087,8 @@ export class VenueReadBudget {
     observation?: AccountReadReservation,
   ): Promise<ReadTicket> {
     const reject = (error: Error): Promise<ReadTicket> => {
-      if (observation && this.observation?.ticket === observation)
-        this.observation.sampleInvalid = true;
+      const meter = this.observationMeter(observation);
+      if (meter) meter.sampleInvalid = true;
       return Promise.reject(error);
     };
     if (this.cooldownRemaining() > 0) return reject(this.coolingDown());
@@ -894,11 +1102,14 @@ export class VenueReadBudget {
       return reject(this.denied(true));
     if (
       observation &&
-      (this.observation?.ticket !== observation || this.observation.closed)
+      (!this.ownsObservation(observation) ||
+        this.observation!.closed ||
+        this.observationMeter(observation)?.closed ||
+        (this.observation!.bundle && observation === this.observation!.ticket))
     )
       return reject(this.observationDeferred(1000));
     if (observation) {
-      const frame = this.observation!;
+      const frame = this.observationMeter(observation)!;
       frame.peak = Math.max(frame.peak, frame.committed + cost);
       if (
         frame.capacityTrialLimit !== undefined &&
@@ -950,8 +1161,8 @@ export class VenueReadBudget {
         const index = this.queues[lane].indexOf(waiter);
         if (index < 0) return;
         this.queues[lane].splice(index, 1);
-        if (observation && this.observation?.ticket === observation)
-          this.observation.sampleInvalid = true;
+        const meter = this.observationMeter(observation);
+        if (meter) meter.sampleInvalid = true;
         signal.removeEventListener("abort", waiter.cancel);
         reject(this.denied(waiter.budgetBlocked, waiter.cost));
         this.pump();
@@ -970,9 +1181,7 @@ export class VenueReadBudget {
   private candidate(lane: ReadLane): Waiter | undefined {
     const queue =
       lane === "account" && this.observation
-        ? this.queues.account.filter(
-            (w) => w.observation === this.observation!.ticket,
-          )
+        ? this.queues.account.filter((w) => this.ownsObservation(w.observation))
         : this.queues[lane];
     // A reserved complete frame may use two bounded wire reads concurrently.
     // The same weighted ledger still reserves every request before dispatch;
@@ -1043,14 +1252,11 @@ export class VenueReadBudget {
           candidates.find(
             (w) =>
               w &&
-              w.observation === this.observation?.ticket &&
+              this.ownsObservation(w.observation) &&
               this.observation !== undefined,
           ) ?? candidates.find(Boolean);
         if (!next) break;
-        const trialFrame =
-          next.observation && this.observation?.ticket === next.observation
-            ? this.observation
-            : undefined;
+        const trialFrame = this.observationMeter(next.observation);
         if (
           trialFrame?.capacityTrialLimit !== undefined &&
           (trialFrame.trialExceeded || next.cost > trialFrame.remaining)
@@ -1094,14 +1300,15 @@ export class VenueReadBudget {
         this.queues[next.lane].splice(this.queues[next.lane].indexOf(next), 1);
         next.signal.removeEventListener("abort", next.cancel);
         const frame = next.observation ? this.observation! : undefined;
+        const meter = this.observationMeter(next.observation);
         const charge: Charge = {
           at: this.clock(),
           lane: next.lane,
           weight: next.unknownSurcharge
             ? Math.min(
                 this.limit - used - protection,
-                frame?.capacityTrialLimit !== undefined
-                  ? frame.remaining
+                meter?.capacityTrialLimit !== undefined
+                  ? meter.remaining
                   : Infinity,
               )
             : next.cost,
@@ -1127,6 +1334,13 @@ export class VenueReadBudget {
           frame.admittedPeak = Math.max(frame.admittedPeak, frame.committed);
           frame.pending++;
         }
+        if (meter && meter !== frame) {
+          meter.remaining -= Math.min(meter.remaining, charge.weight);
+          meter.committed += measured;
+          meter.peak = Math.max(meter.peak, meter.committed);
+          meter.admittedPeak = Math.max(meter.admittedPeak, meter.committed);
+          meter.pending++;
+        }
         this.active[next.lane]++;
         this.lastLane = next.lane;
         const turn = this.turns[next.lane];
@@ -1143,6 +1357,7 @@ export class VenueReadBudget {
           if (!charge.sent || charge.settled) return;
           charge.settled = true;
           if (frame) frame.hadUncertain = true;
+          if (meter) meter.hadUncertain = true;
           charge.at = this.clock();
           this.owners[next.lane].get(next.owner)!.pending -= reservation;
           if (next.unknownSurcharge)
@@ -1150,6 +1365,10 @@ export class VenueReadBudget {
           if (frame && next.unknownSurcharge) {
             frame.committed += charge.weight - measured;
             frame.peak = Math.max(frame.peak, frame.committed);
+          }
+          if (meter && meter !== frame && next.unknownSurcharge) {
+            meter.committed += charge.weight - measured;
+            meter.peak = Math.max(meter.peak, meter.committed);
           }
         };
         next.resolve({
@@ -1186,13 +1405,24 @@ export class VenueReadBudget {
                 frame.sampleInvalid = true;
               }
             }
+            if (meter && meter !== frame) {
+              if (weight === 0) meter.sampleInvalid = true;
+              meter.committed += weight - measured;
+              meter.remaining += Math.max(0, held - weight);
+              meter.peak = Math.max(meter.peak, meter.committed);
+              if (meter.committed > meter.capacityTrialLimit!) {
+                meter.trialExceeded = true;
+                meter.sampleInvalid = true;
+              }
+            }
             this.owners[next.lane].get(next.owner)!.served -= refund;
             this.owners[next.lane].get(next.owner)!.pending -= reservation;
             if (turn) turn.served -= refund;
             this.pump();
             // The full actual fee is already recorded above, including debt.
             // It cannot become a successful or partial account observation.
-            if (frame?.trialExceeded) throw this.trialExhausted();
+            if (frame?.trialExceeded || meter?.trialExceeded)
+              throw this.trialExhausted();
           },
           uncertain,
           release: () => {
@@ -1209,12 +1439,26 @@ export class VenueReadBudget {
                 frame.committed -= measured;
                 frame.remaining += held;
               }
+              if (meter && meter !== frame) {
+                meter.sampleInvalid = true;
+                meter.committed -= measured;
+                meter.remaining += held;
+              }
             }
             this.active[next.lane]--;
             if (this.exclusive === charge) this.exclusive = undefined;
             if (turn) turn.lastActivity = this.clock();
             if (frame) {
               frame.pending--;
+              if (meter && meter !== frame) {
+                meter.pending--;
+                if (
+                  meter.closed &&
+                  !meter.pending &&
+                  frame.bundle?.child === meter
+                )
+                  frame.bundle.child = undefined;
+              }
               this.finishObservation();
             }
             this.pump();
