@@ -10,6 +10,7 @@ import { recommend } from "./domain.js";
 import { candidate, snapshot } from "./fixtures.js";
 import { fromPlan } from "./service.js";
 import { recordFirstSubmissionFailure } from "./submission-failure-diagnostics.js";
+import { isObservationAdmissionDeferred } from "./venue-read-budget.js";
 import {
   CoordinatedReadError,
   isUnsentReadBudgetDenial,
@@ -95,7 +96,63 @@ it("preserves only verified unsent budget provenance across the real bridge erro
         assert.equal(isUnsentReadBudgetDenial(error), eligible);
         assert.equal(
           error.details?.reason_code,
-          eligible ? UNSENT_READ_BUDGET_REASON : undefined,
+          eligible
+            ? UNSENT_READ_BUDGET_REASON
+            : code === "VENUE_READ_BUDGET_EXHAUSTED" && sent
+              ? "READ_CORE_BUDGET_SENT"
+              : undefined,
+        );
+        return true;
+      });
+    });
+  }
+});
+
+it("private HTTP preserves bounded BEGIN diagnostics without turning remote reasons into trusted local wait brands", async () => {
+  for (const reason of [
+    "READ_LOCAL_BUSY",
+    "READ_LOCAL_FIFO",
+    "READ_LOCAL_PACING",
+    "READ_LOCAL_QUOTA",
+    "READ_LOCAL_EXCLUSIVE",
+    "READ_LOCAL_QUARANTINE",
+    "READ_LOCAL_TICKET_STALE",
+    "READ_CORE_BUDGET_SENT",
+  ]) {
+    const app = express();
+    app.post("/internal/agent/source", (_req, res) =>
+      res
+        .status(503)
+        .json(
+          failure(
+            new AgentError(
+              "VENUE_READ_BUDGET_EXHAUSTED",
+              "fixed fixture refusal",
+              true,
+              503,
+              { reason_code: reason, retry_after_ms: 1000 },
+            ),
+          ),
+        ),
+    );
+    await loopback(app, async (adapter) => {
+      await assert.rejects(adapter.source(candidate(1)), (error) => {
+        assert.ok(error instanceof AgentError);
+        assert.equal(error.details?.reason_code, reason);
+        assert.equal(isObservationAdmissionDeferred(error), false);
+        assert.equal(isUnsentReadBudgetDenial(error), false);
+        const execution: any = {};
+        recordFirstSubmissionFailure(
+          execution,
+          error,
+          0,
+          () => 1,
+          () => 1,
+        );
+        assert.equal(execution.first_submission_failure.reason_code, reason);
+        assert.deepEqual(
+          Object.keys(execution.first_submission_failure).sort(),
+          ["at", "code", "elapsed_ms", "reason_code", "retryable"],
         );
         return true;
       });

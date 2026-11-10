@@ -13,7 +13,7 @@ import {
 } from "./venue-read-transport.js";
 import {
   sharedVenueReadBudget,
-  ObservationPacingDeferred,
+  isObservationAdmissionDeferred,
   readTimers,
   type BudgetTimers,
   type ReadLane,
@@ -45,6 +45,7 @@ type AccountReadScope = {
   monotonicUntil: number;
   planAttempt?: object;
   frameLease?: AccountReadFrameLease;
+  localInterest?: object;
   releasedFrames?: Set<string>;
   queueUntil: number;
   activateEvidenceDeadline?(): void;
@@ -411,6 +412,8 @@ export class VenueReads {
       } finally {
         if (!finalizing) cleanup();
         scope.reservation?.close(complete);
+        if (scope.localInterest)
+          this.budget.endObservationInterest(scope.localInterest);
         this.releaseFrame(scope);
       }
     });
@@ -580,10 +583,10 @@ export class VenueReads {
   ): Promise<AccountReadReservation> {
     // A near-ready FIFO slot should not be lost to a complete monitor cycle's
     // reconciliation and commit work. Uncoordinated reads retain their original
-    // one-second wait. Fleet grants may wait only for known local pacing.
+    // one-second wait. Fleet grants may recheck only branded local BEGIN gates.
     // The original scope,
-    // caller and Core lease deadlines keep running; quota and FIFO denials
-    // release unused fleet credit immediately.
+    // caller and Core lease deadlines keep running. Every hard gate remains
+    // authoritative; final failure releases only this scope's unused credit.
     const until = Math.min(scope.until, this.clock() + 1000);
     const signal = this.callerSignal
       ? AbortSignal.any([scope.admission.signal, this.callerSignal])
@@ -670,6 +673,7 @@ export class VenueReads {
         },
         signal,
       );
+      scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
     }
     let deferred: unknown;
     for (;;) {
@@ -678,6 +682,17 @@ export class VenueReads {
       if (!this.frameCoordinator && deferred && this.clock() > until)
         throw deferred;
       try {
+        if (fleetPlan) {
+          const current = this.budget.peekObservationFramePlan(
+            scope.owner!,
+            fleetPlan.reservedWeight,
+          );
+          if (
+            current.fullDemand !== fleetPlan.fullDemand ||
+            current.cold !== fleetPlan.cold
+          )
+            throw costPlanUnavailable();
+        }
         const reservation = this.budget.beginObservation(
           scope.owner!,
           fleetPlan?.cold
@@ -686,6 +701,7 @@ export class VenueReads {
                 reservedWeight: fleetPlan.reservedWeight,
               }
             : undefined,
+          scope.localInterest,
         );
         scope.reservation = reservation;
         // The hint may change while the private grant is in flight. Never
@@ -731,10 +747,12 @@ export class VenueReads {
         }
         return reservation;
       } catch (error) {
-        const fleetPacing =
-          this.frameCoordinator && error instanceof ObservationPacingDeferred;
-        const waitUntil = fleetPacing ? scope.until : until;
-        if (this.frameCoordinator && !fleetPacing) {
+        const fleetBegin =
+          this.frameCoordinator &&
+          !scope.reservation &&
+          isObservationAdmissionDeferred(error);
+        const waitUntil = fleetBegin ? scope.until : until;
+        if (this.frameCoordinator && !fleetBegin) {
           this.releaseFrame(scope);
           throw error;
         }
@@ -748,7 +766,7 @@ export class VenueReads {
           typeof retry !== "number" ||
           !Number.isSafeInteger(retry) ||
           retry < 1 ||
-          (fleetPacing
+          (fleetBegin
             ? retry >=
               Math.min(
                 waitUntil - this.clock(),

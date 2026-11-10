@@ -26,3 +26,19 @@ payload decision reads it. Even a diagnostic `READ_LOCAL_BUDGET_UNSENT` concerns
 one rejected read and cannot prove that a financial action was not accepted.
 Transport-level `EXECUTOR_UNAVAILABLE` remains that observed boundary category;
 message parsing or elapsed time does not reconstruct a lower-level root cause.
+
+Local whole-account BEGIN refusals distinguish busy work, live FIFO, pacing,
+quota, exclusive unknown response and quarantine with fixed diagnostic reasons.
+Only internally branded BEGIN refusals may be rechecked, before a local ticket
+or any provider read, while the existing Core grant and original caller,
+execution, wall-clock and monotonic deadlines all remain valid. Every attempt
+rechecks the original gates. A known retry outside the remaining window fails
+closed; no paid charge, unknown debt, cooldown or quota is forgiven.
+
+Core-mode local FIFO interests exist only for live post-grant admissions. Each
+scope cancels its own opaque reference, preserving other live references and
+legacy FIFO expiry. Uncoordinated reads keep their original one-second wait.
+`READ_LOCAL_TICKET_STALE` and authenticated `READ_CORE_BUDGET_SENT` remain
+fail-only read diagnostics. Neither can authorize a BEGIN wait, retry a sent
+read or establish acceptance or absence of a financial action. Completed
+account evidence is never reused by this scheduling change.

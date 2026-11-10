@@ -30,19 +30,19 @@ export class CoordinatedReadError extends AgentError {
       "Coordinated venue read is unavailable; fresh evidence is required.",
       code !== "VENUE_READ_UNSUPPORTED",
       503,
-      retryAfterMs === undefined &&
-        !(
-          code === "VENUE_READ_BUDGET_EXHAUSTED" &&
-          upstreamRequestSent === false
-        )
+      retryAfterMs === undefined && code !== "VENUE_READ_BUDGET_EXHAUSTED"
         ? undefined
         : {
             ...(retryAfterMs === undefined
               ? {}
               : { retry_after_ms: retryAfterMs }),
-            ...(code === "VENUE_READ_BUDGET_EXHAUSTED" &&
-            upstreamRequestSent === false
-              ? { reason_code: UNSENT_READ_BUDGET_REASON }
+            ...(code === "VENUE_READ_BUDGET_EXHAUSTED"
+              ? {
+                  reason_code:
+                    upstreamRequestSent === false
+                      ? UNSENT_READ_BUDGET_REASON
+                      : "READ_CORE_BUDGET_SENT",
+                }
               : {}),
           },
     );
