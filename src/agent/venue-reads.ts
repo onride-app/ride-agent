@@ -44,6 +44,17 @@ type PendingPreparedBooking = {
   readonly booked: ObservationFleetPlan;
   latest: ObservationFleetPlan;
 };
+type UnsentReadGroup = {
+  active: number;
+  revoked: boolean;
+  candidates: Set<AccountReadScope>;
+};
+type UnsentReadState = {
+  revoked: boolean;
+  forbidden: boolean;
+  localUnsent: number;
+  attempts: Set<{ verifiedUnsent: boolean }>;
+};
 const unsupportedPreparedBundles = new WeakSet<AgentError>();
 export const isPreparedBundleUnsupported = (error: unknown): boolean =>
   error instanceof AgentError && unsupportedPreparedBundles.has(error);
@@ -81,6 +92,7 @@ type AccountReadScope = {
   preparedHint?: Awaited<ReturnType<ObservationPlanStore["read"]>>;
   preparedClaim?: Promise<void>;
   preparedHistoryGuard?: (payload: unknown) => void;
+  unsentGroup?: UnsentReadGroup;
 };
 export interface PreparedReadWindowOptions {
   purpose?: "audit_submit" | "audit_source";
@@ -222,6 +234,10 @@ export interface VenueReadOptions {
 // Completed account evidence is never reused. Metadata TTL and same-lane
 // single-flight are unchanged. Both HL hosts share one process weighted gate.
 export class VenueReads {
+  private readonly unsentStates = new WeakMap<
+    AccountReadScope,
+    UnsentReadState
+  >();
   private readonly preparedWindows = new Set<PreparedAccountWindow>();
   private readonly preparedOwners = new Set<string>();
   private readonly preparingFrameOwners = new Set<string>();
@@ -367,6 +383,87 @@ export class VenueReads {
       throw this.unavailable();
     }
   }
+  private unsentState(scope: AccountReadScope): UnsentReadState {
+    let state = this.unsentStates.get(scope);
+    if (!state) {
+      state = {
+        revoked: false,
+        forbidden: false,
+        localUnsent: 0,
+        attempts: new Set(),
+      };
+      this.unsentStates.set(scope, state);
+    }
+    return state;
+  }
+  private trackReadActivity<T>(
+    scope: AccountReadScope | undefined,
+    work: () => Promise<T>,
+  ): Promise<T> {
+    const group = scope?.unsentGroup;
+    if (!group) return work();
+    group.active++;
+    const release = () => {
+      group.active--;
+      this.tryReturnUnsent(group);
+    };
+    let pending: Promise<T>;
+    try {
+      pending = work();
+    } catch (error) {
+      release();
+      throw error;
+    }
+    void pending.then(release, release);
+    return pending;
+  }
+  private tryReturnUnsent(group: UnsentReadGroup): void {
+    if (!group.revoked || group.active !== 0) return;
+    for (const scope of group.candidates) {
+      const state = this.unsentStates.get(scope),
+        lease = scope.planLease;
+      group.candidates.delete(scope);
+      if (
+        !state?.revoked ||
+        state.forbidden ||
+        !lease?.plan ||
+        !this.observationPlans?.returnUnsent ||
+        (!state.localUnsent && !state.attempts.size) ||
+        [...state.attempts].some((attempt) => !attempt.verifiedUnsent)
+      )
+        continue;
+      const remaining = Math.floor(
+        Math.min(
+          scope.until - this.clock(),
+          scope.monotonicUntil - this.monotonicClock(),
+        ),
+      );
+      if (remaining <= 0) continue;
+      // Metadata cleanup has no business authority. It cannot inherit the
+      // aborted read signal, renew a lease, or outlive the original deadlines.
+      const signal = AbortSignal.timeout(Math.min(2000, remaining));
+      const cleanup = Promise.resolve()
+        .then(async () => {
+          if (
+            signal.aborted ||
+            !group.revoked ||
+            scope.until <= this.clock() ||
+            scope.monotonicUntil <= this.monotonicClock()
+          )
+            return;
+          if (group.active !== 0) {
+            group.candidates.add(scope);
+            return;
+          }
+          await this.observationPlans!.returnUnsent!(lease, signal);
+        })
+        .catch(() => {
+          // Unknown metadata outcomes retain the original business failure.
+        });
+      this.accountFinalizers.add(cleanup);
+      void cleanup.finally(() => this.accountFinalizers.delete(cleanup));
+    }
+  }
   async cancelPreparedPending(continuation: object): Promise<void> {
     if (!this.frameCoordinator?.cancelPending) throw costPlanUnavailable();
     const booking = this.pendingPreparedBookings.get(continuation);
@@ -440,6 +537,7 @@ export class VenueReads {
       queueUntil: firstDeadline,
       waitForFrameAdmission: false,
       preparingBundle: true,
+      unsentGroup: { active: 0, revoked: false, candidates: new Set() },
     };
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -529,7 +627,7 @@ export class VenueReads {
         const value = await this.accountScope.run(sourceScope, async () => {
           this.accountReadTimeout();
           const value = await this.abortable(
-            work(),
+            this.trackReadActivity(sourceScope, work),
             sourceScope.admission.signal,
           );
           this.accountReadTimeout();
@@ -638,7 +736,8 @@ export class VenueReads {
       mode: parent.capacityTrial ? "cold" : "warm",
       purpose: options.purpose ?? "audit_submit",
       expires_at: scope.until,
-      supplement,
+      supplement: (work, limits) =>
+        this.trackReadActivity(scope, () => supplement(work, limits)),
       history: async <T>(
         source: string,
         work: () => Promise<T>,
@@ -651,7 +750,9 @@ export class VenueReads {
           typeof guard !== "function"
         )
           throw costPlanUnavailable();
-        return supplement(work, limits, { source, guard });
+        return this.trackReadActivity(scope, () =>
+          supplement(work, limits, { source, guard }),
+        );
       },
       sourceRetryLimits: () => {
         if (closed || failed || reads < 1 || scope.admission.signal.aborted)
@@ -663,60 +764,65 @@ export class VenueReads {
           ),
         );
       },
-      readSource: async <T>(
+      readSource: <T>(
         work: (limits: PreparedSourceRetryLimits) => Promise<T>,
         limits: AccountObservationLimits = {},
-      ): Promise<T> => {
-        if (
-          closed ||
-          failed ||
-          reads < 1 ||
-          (reading && !supplementReading) ||
-          scope.admission.signal.aborted
-        )
-          throw costPlanUnavailable();
-        if (
-          limits.deadlineMs !== undefined &&
-          !Number.isSafeInteger(limits.deadlineMs)
-        )
-          throw this.accountDeadline();
-        const until = Math.min(scope.until, limits.deadlineMs ?? Infinity),
-          monotonicUntil = Math.min(
-            scope.monotonicUntil,
-            this.monotonicClock() + Math.max(0, until - this.clock()),
-          ),
-          admission = new AbortController(),
-          stop = () => admission.abort(scope.admission.signal.reason),
-          callerStop = () => admission.abort(limits.signal!.reason),
-          remainingMs = () =>
-            Math.min(
-              until - this.clock(),
-              monotonicUntil - this.monotonicClock(),
-            );
-        scope.admission.signal.addEventListener("abort", stop, { once: true });
-        limits.signal?.addEventListener("abort", callerStop, { once: true });
-        if (scope.admission.signal.aborted) stop();
-        if (limits.signal?.aborted) callerStop();
-        const timer = this.timers.setTimeout(
-          () => admission.abort(this.accountDeadline()),
-          Math.max(0, remainingMs()),
-        );
-        try {
-          if (admission.signal.aborted) throw admission.signal.reason;
-          if (remainingMs() <= 0) throw this.accountDeadline();
-          const value = await this.abortable(
-            work(this.sourceRetryWindow(admission.signal, remainingMs)),
-            admission.signal,
+      ): Promise<T> =>
+        this.trackReadActivity(scope, async () => {
+          if (
+            closed ||
+            failed ||
+            reads < 1 ||
+            (reading && !supplementReading) ||
+            scope.admission.signal.aborted
+          )
+            throw costPlanUnavailable();
+          if (
+            limits.deadlineMs !== undefined &&
+            !Number.isSafeInteger(limits.deadlineMs)
+          )
+            throw this.accountDeadline();
+          const until = Math.min(scope.until, limits.deadlineMs ?? Infinity),
+            monotonicUntil = Math.min(
+              scope.monotonicUntil,
+              this.monotonicClock() + Math.max(0, until - this.clock()),
+            ),
+            admission = new AbortController(),
+            stop = () => admission.abort(scope.admission.signal.reason),
+            callerStop = () => admission.abort(limits.signal!.reason),
+            remainingMs = () =>
+              Math.min(
+                until - this.clock(),
+                monotonicUntil - this.monotonicClock(),
+              );
+          scope.admission.signal.addEventListener("abort", stop, {
+            once: true,
+          });
+          limits.signal?.addEventListener("abort", callerStop, { once: true });
+          if (scope.admission.signal.aborted) stop();
+          if (limits.signal?.aborted) callerStop();
+          const timer = this.timers.setTimeout(
+            () => admission.abort(this.accountDeadline()),
+            Math.max(0, remainingMs()),
           );
-          if (admission.signal.aborted) throw admission.signal.reason;
-          if (remainingMs() <= 0) throw this.accountDeadline();
-          return value;
-        } finally {
-          this.timers.clearTimeout(timer);
-          scope.admission.signal.removeEventListener("abort", stop);
-          limits.signal?.removeEventListener("abort", callerStop);
-        }
-      },
+          try {
+            if (admission.signal.aborted) throw admission.signal.reason;
+            if (remainingMs() <= 0) throw this.accountDeadline();
+            const value = await this.abortable(
+              this.trackReadActivity(scope, () =>
+                work(this.sourceRetryWindow(admission.signal, remainingMs)),
+              ),
+              admission.signal,
+            );
+            if (admission.signal.aborted) throw admission.signal.reason;
+            if (remainingMs() <= 0) throw this.accountDeadline();
+            return value;
+          } finally {
+            this.timers.clearTimeout(timer);
+            scope.admission.signal.removeEventListener("abort", stop);
+            limits.signal?.removeEventListener("abort", callerStop);
+          }
+        }),
       assertNextChildReady: () => {
         if (
           closed ||
@@ -752,8 +858,9 @@ export class VenueReads {
         )
           throw costPlanUnavailable();
         reading = true;
+        scope.unsentGroup!.active++;
         try {
-          const value = await this.observeAccount(
+          const value = await this.observeAccountScope(
             async () => {
               const child = this.accountScope.getStore()!;
               child.preparedParent = scope;
@@ -795,6 +902,7 @@ export class VenueReads {
                 : scope.admission.signal,
               deadlineMs: Math.min(limits.deadlineMs ?? Infinity, scope.until),
             },
+            scope,
           );
           return value;
         } catch (error) {
@@ -802,11 +910,14 @@ export class VenueReads {
           throw error;
         } finally {
           reading = false;
+          scope.unsentGroup!.active--;
+          this.tryReturnUnsent(scope.unsentGroup!);
         }
       },
       close: async () => {
         if (closed) return;
         closed = true;
+        scope.unsentGroup!.revoked = true;
         this.preparedWindows.delete(window);
         this.preparedOwners.delete(owner);
         this.timers.clearTimeout(timer);
@@ -818,6 +929,7 @@ export class VenueReads {
         if (scope.localInterest)
           this.budget.endObservationInterest(scope.localInterest);
         this.releaseFrame(scope);
+        this.tryReturnUnsent(scope.unsentGroup!);
       },
     };
     const expired = () => {
@@ -831,6 +943,14 @@ export class VenueReads {
     work: () => Promise<T>,
     owner?: string,
     limits: AccountObservationLimits = {},
+  ): Promise<T> {
+    return this.observeAccountScope(work, owner, limits);
+  }
+  private async observeAccountScope<T>(
+    work: () => Promise<T>,
+    owner?: string,
+    limits: AccountObservationLimits = {},
+    parent?: AccountReadScope,
   ): Promise<T> {
     if (this.accountScope.getStore()) return work();
     if (this.draining) throw costPlanUnavailable();
@@ -852,6 +972,11 @@ export class VenueReads {
       monotonicUntil: this.monotonicClock() + remaining,
       queueUntil: this.clock() + 100000,
       waitForFrameAdmission: limits.waitForFrameAdmission === true,
+      unsentGroup: parent?.unsentGroup ?? {
+        active: 0,
+        revoked: false,
+        candidates: new Set(),
+      },
     };
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -882,6 +1007,7 @@ export class VenueReads {
         remaining,
       );
     };
+    scope.unsentGroup!.active++;
     const observing = this.accountScope.run(scope, async () => {
       let abort!: () => void;
       const cancelled = new Promise<never>((_, reject) => {
@@ -897,7 +1023,10 @@ export class VenueReads {
       };
       try {
         if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
-        const value = await Promise.race([work(), cancelled]);
+        const value = await Promise.race([
+          this.trackReadActivity(scope, work),
+          cancelled,
+        ]);
         this.accountReadTimeout();
         // All successful work has returned before cost publication. A failed,
         // still-pending, unknown or otherwise invalid scope yields no plan.
@@ -912,7 +1041,7 @@ export class VenueReads {
           // Only the operational CAS runs in this tracked finalizer, under the
           // SAME original timer. Dirty state remains until its real commit.
           finalizing = true;
-          const finalizer = (async () => {
+          const finalizer = this.trackReadActivity(scope, async () => {
             try {
               if (
                 signal.aborted ||
@@ -932,7 +1061,7 @@ export class VenueReads {
             } finally {
               cleanup();
             }
-          })();
+          });
           this.accountFinalizers.add(finalizer);
           void finalizer.then(
             () => this.accountFinalizers.delete(finalizer),
@@ -944,6 +1073,14 @@ export class VenueReads {
         } else if (scope.durableAttempted) this.invalidateCostPlan(scope);
         return value;
       } catch (error) {
+        const state = this.unsentState(scope);
+        state.revoked = true;
+        if (
+          error instanceof AgentError &&
+          (error.code === "VENUE_RATE_LIMITED" ||
+            error.details?.reason_code === "READ_FRAME_CAPACITY")
+        )
+          state.forbidden = true;
         if (scope.durableAttempted) this.invalidateCostPlan(scope);
         scope.admission.abort(error);
         throw error;
@@ -953,6 +1090,11 @@ export class VenueReads {
         if (scope.localInterest)
           this.budget.endObservationInterest(scope.localInterest);
         this.releaseFrame(scope);
+        if (!complete && scope.planLease) {
+          scope.unsentGroup!.candidates.add(scope);
+          if (!parent) scope.unsentGroup!.revoked = true;
+          this.tryReturnUnsent(scope.unsentGroup!);
+        }
       }
     });
     this.accountObservations.add(observing);
@@ -961,6 +1103,8 @@ export class VenueReads {
     } finally {
       this.accountObservations.delete(observing);
       this.activeAccountScopes.delete(scope);
+      scope.unsentGroup!.active--;
+      this.tryReturnUnsent(scope.unsentGroup!);
     }
   }
   async drainAccounts(): Promise<void> {
@@ -991,16 +1135,18 @@ export class VenueReads {
     scope.frameLease = undefined;
     // end releases only the unused Core booking. Sent or uncertain requests
     // remain charged in Core's shared rolling ledger, independent of this call.
-    const releasing = Promise.resolve()
-      .then(() => this.frameCoordinator!.end(frameId))
-      .then(
-        () => {
-          this.frames.released++;
-        },
-        () => {
-          this.frames.release_failed++;
-        },
-      );
+    const releasing = this.trackReadActivity(scope, () =>
+      Promise.resolve()
+        .then(() => this.frameCoordinator!.end(frameId))
+        .then(
+          () => {
+            this.frames.released++;
+          },
+          () => {
+            this.frames.release_failed++;
+          },
+        ),
+    );
     this.accountFinalizers.add(releasing);
     void releasing.finally(() => this.accountFinalizers.delete(releasing));
   }
@@ -1137,13 +1283,15 @@ export class VenueReads {
         ? AbortSignal.any([scope.admission.signal, this.callerSignal])
         : scope.admission.signal;
       try {
-        scope.planLease = await this.observationPlans!.begin(
-          scope.owner!,
-          signal,
-          scope.preparedHint,
-          Math.min(
-            this.accountReadTimeout(),
-            Math.floor(scope.monotonicUntil - this.monotonicClock()),
+        scope.planLease = await this.trackReadActivity(scope, () =>
+          this.observationPlans!.begin(
+            scope.owner!,
+            signal,
+            scope.preparedHint,
+            Math.min(
+              this.accountReadTimeout(),
+              Math.floor(scope.monotonicUntil - this.monotonicClock()),
+            ),
           ),
         );
         this.accountReadTimeout();
@@ -1502,11 +1650,13 @@ export class VenueReads {
               Math.floor(scope.monotonicUntil - this.monotonicClock()),
             );
             if (remainingLease <= 0) throw this.accountDeadline();
-            scope.planLease = await this.observationPlans.begin(
-              scope.owner!,
-              signal,
-              durableHint,
-              remainingLease,
+            scope.planLease = await this.trackReadActivity(scope, () =>
+              this.observationPlans!.begin(
+                scope.owner!,
+                signal,
+                durableHint,
+                remainingLease,
+              ),
             );
             this.accountReadTimeout();
             if (signal.aborted) throw signal.reason;
@@ -1666,13 +1816,8 @@ export class VenueReads {
             this.accountScope.getStore() ? 20000 : this.deadlineMs,
           ),
         );
-        flight = this.perform(
-          url,
-          payload,
-          lane,
-          cost,
-          controller.signal,
-          evidence,
+        flight = this.trackReadActivity(scope, () =>
+          this.perform(url, payload, lane, cost, controller.signal, evidence),
         )
           .then((value) => {
             if (controller.signal.aborted) throw controller.signal.reason;
@@ -1782,6 +1927,8 @@ export class VenueReads {
     const user = (payload as { user?: unknown })?.user;
     const owner = typeof user === "string" && user.length ? user : undefined;
     const scope = this.accountScope.getStore();
+    const unsent = scope ? this.unsentState(scope) : undefined;
+    let attempt: { verifiedUnsent: boolean } | undefined;
     const requestSignal = this.callerSignal
       ? AbortSignal.any([signal, this.callerSignal])
       : signal;
@@ -1874,37 +2021,49 @@ export class VenueReads {
       )
         scope.observedAt ??= this.clock();
       sent = true;
+      if (unsent) {
+        attempt = { verifiedUnsent: false };
+        unsent.attempts.add(attempt);
+      }
       this.count(cost.method, lane, "actual_fetch");
       this.count(cost.method, lane, "reserved_weight", ticket.reservation);
       if (cost.unknownSurcharge) this.count(cost.method, lane, "unknown_fetch");
       let response: Response;
       try {
         response = await this.abortable(
-          this.fetcher(
-            url,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(payload),
-              signal: wireSignal,
-              redirect: "error",
-            },
-            {
-              deadline_ms: wireDeadline,
-              ...(scope?.frameLease
-                ? {
-                    frame_id: scope.frameLease.frame_id,
-                    frame_owner: scope.frameOwner ?? scope.owner!,
-                  }
-                : {}),
-            },
+          this.trackReadActivity(scope, () =>
+            this.fetcher(
+              url,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+                signal: wireSignal,
+                redirect: "error",
+              },
+              {
+                deadline_ms: wireDeadline,
+                ...(scope?.frameLease
+                  ? {
+                      frame_id: scope.frameLease.frame_id,
+                      frame_owner: scope.frameOwner ?? scope.owner!,
+                    }
+                  : {}),
+              },
+            ),
           ),
           wireSignal,
         );
       } catch (error) {
         if (error instanceof CoordinatedReadError) {
           this.count(cost.method, lane, "coordinated_denied");
-          if (!error.upstreamRequestSent) {
+          if (error.upstreamRequestSent === false) {
+            if (
+              attempt &&
+              this.transport === "core_shared_info" &&
+              error.code !== "VENUE_RATE_LIMITED"
+            )
+              attempt.verifiedUnsent = true;
             ticket.settle(0);
             settled = true;
             this.count(cost.method, lane, "coordinated_no_upstream");
@@ -1967,7 +2126,10 @@ export class VenueReads {
       }
       let data: unknown;
       try {
-        data = await this.abortable(response.json(), wireSignal);
+        data = await this.abortable(
+          this.trackReadActivity(scope, () => response.json()),
+          wireSignal,
+        );
       } catch {
         if (wireSignal.aborted) throw wireSignal.reason;
         this.count(cost.method, lane, "invalid_response");
@@ -2011,6 +2173,13 @@ export class VenueReads {
       if (capacityFailure) throw capacityFailure;
       return data;
     } catch (error) {
+      if (
+        unsent &&
+        error instanceof AgentError &&
+        (error.code === "VENUE_RATE_LIMITED" ||
+          error.details?.reason_code === "READ_FRAME_CAPACITY")
+      )
+        unsent.forbidden = true;
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       if (
         error instanceof AgentError &&
@@ -2030,6 +2199,7 @@ export class VenueReads {
         this.count(cost.method, lane, "local_cooldown_denied");
       throw error;
     } finally {
+      if (unsent && !sent) unsent.localUnsent++;
       if (admissionTimer !== undefined)
         this.timers.clearTimeout(admissionTimer);
       if (wireTimer !== undefined) this.timers.clearTimeout(wireTimer);
