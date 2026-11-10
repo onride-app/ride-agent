@@ -1178,7 +1178,10 @@ export class VenueReadBudget {
     this.blockedUntil = this.clock() + 60000;
     this.pump();
   }
-  private candidate(lane: ReadLane): Waiter | undefined {
+  private candidate(
+    lane: ReadLane,
+    deferredGrace?: (until: number) => void,
+  ): Waiter | undefined {
     const queue =
       lane === "account" && this.observation
         ? this.queues.account.filter((w) => this.ownsObservation(w.observation))
@@ -1209,7 +1212,10 @@ export class VenueReadBudget {
         return shared;
       // Allow dependent Promise.all stages to enqueue without switching
       // account halfway through its full-scope observation.
-      if (now - current.lastActivity < 2) return;
+      if (now - current.lastActivity < 2) {
+        deferredGrace?.(current.lastActivity + 2);
+        return;
+      }
       delete this.turns[lane];
     }
     const chosen = queue.reduce((best, next) => {
@@ -1235,6 +1241,7 @@ export class VenueReadBudget {
     this.pumping = true;
     if (this.wake !== undefined) this.timers.clearTimeout(this.wake);
     this.wake = undefined;
+    let deferredGrace: number | undefined;
     try {
       this.prune();
       for (;;) {
@@ -1244,9 +1251,13 @@ export class VenueReadBudget {
         // actual response cost is settled and the hold is refunded.
         if (this.exclusive) break;
         const first = this.lastLane === "account" ? "source" : "account";
+        let candidateGrace: number | undefined;
+        const defer = (until: number) => {
+          candidateGrace = Math.min(candidateGrace ?? Infinity, until);
+        };
         const candidates = [
-          this.candidate(first),
-          this.candidate(first === "account" ? "source" : "account"),
+          this.candidate(first, defer),
+          this.candidate(first === "account" ? "source" : "account", defer),
         ];
         const next =
           candidates.find(
@@ -1255,7 +1266,13 @@ export class VenueReadBudget {
               this.ownsObservation(w.observation) &&
               this.observation !== undefined,
           ) ?? candidates.find(Boolean);
-        if (!next) break;
+        if (!next) {
+          // Preserve the deadline that actually prevented selection. It may
+          // expire before the later scheduling clock read; reselect once then
+          // instead of sleeping until the whole20s/12s owner turn expires.
+          deferredGrace = candidateGrace;
+          break;
+        }
         const trialFrame = this.observationMeter(next.observation);
         if (
           trialFrame?.capacityTrialLimit !== undefined &&
@@ -1489,6 +1506,7 @@ export class VenueReadBudget {
               expiry,
               turnExpiry,
               grace,
+              deferredGrace ?? expiry,
               interestExpiry,
               this.blockedUntil > now ? this.blockedUntil : expiry,
             ) - now,

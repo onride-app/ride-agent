@@ -38,6 +38,10 @@ A proposed changed-source basket must pass the existing risk checks before repla
 
 The private first-submission diagnostic may classify the first failed source-position predicate with a fixed reason code. It retains the same five-field shape and no source values, account identifiers or response bodies. The predicate order, rejection message and risk limits remain unchanged; an already recorded diagnostic is never rewritten. These codes identify a rejection path and provide no acceptance, absence or retry authority.
 
+## Fairness wake boundary
+
+The shared local budget gives dependent reads a two-millisecond owner grace period. A candidate blocked by that grace records its original wake deadline. If the clock crosses the boundary before the scheduler installs its timer, the next pump still runs promptly and rechecks admission; it must not postpone that candidate until the full account/source turn expires. This changes scheduling only. Quota, protected capacity, cooldown, exclusive unknown-response holds, fees and caller deadlines remain authoritative.
+
 ## Validation scope
 
 Local tests exercise the actual Runner, PostgreSQL state/history commits, BridgeAdapter, authenticated managed HTTP handler, CoreBridge, full Standard and unified/WS account graphs, VenueReads, local budget and Core frame factory with isolated provider/Core transports. Separate tests cover a full 900 bank, independent child costs, selected-source surplus, real cost-plan generations, concurrent preparation, identity/proposal mutation, cold and unsupported paths, original deadlines, late cancellation and an already-outboxed response across parent expiry. Existing wire, recovery, retirement and PostgreSQL shutdown regressions remain required.

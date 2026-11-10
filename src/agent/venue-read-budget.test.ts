@@ -69,6 +69,153 @@ class FakeTime {
   }
 }
 
+async function graceBoundary(t: TestContext, lane: "account" | "source") {
+  const time = new FakeTime(),
+    budget = new VenueReadBudget({ clock: time.clock, timers: time.timers }),
+    signal = new AbortController().signal;
+  for (const [cost, owner] of [[2, "wallet"], [20], [20], [20]] as const) {
+    const paid = await budget.acquire(lane, cost, owner, signal);
+    paid.sent();
+    paid.settle(cost);
+    paid.release();
+  }
+  assert.equal(budget.snapshot().used, 62);
+  const original = (budget as any).candidate.bind(budget);
+  let crossed = false;
+  t.mock.method(budget as any, "candidate", (...args: any[]) => {
+    const value = original(...args);
+    // Let real elapsed time cross the exact grace boundary after selection
+    // declined, before pump takes its later scheduling clock reading.
+    if (
+      args[0] === lane &&
+      value === undefined &&
+      (budget as any).queues[lane].length &&
+      time.at === 1
+    ) {
+      time.at = 2;
+      crossed = true;
+    }
+    return value;
+  });
+  time.at = 1;
+  return { time, budget, crossed: () => crossed };
+}
+
+for (const lane of ["account", "source"] as const) {
+  it(`reselects ${lane} after its actual2ms grace crosses between selection and scheduling`, async (t) => {
+    const f = await graceBoundary(t, lane),
+      caller = new AbortController();
+    const deadline = f.time.timers.setTimeout(() => caller.abort(), 10000);
+    let admitted = false;
+    const work = f.budget
+      .acquire(lane, 20, undefined, caller.signal)
+      .then((ticket) => {
+        admitted = true;
+        return ticket;
+      });
+    await flush();
+    assert.equal(f.crossed(), true);
+    assert.equal(f.time.at, 2);
+    assert.equal(admitted, false);
+    assert.equal(f.budget.snapshot().used, 62);
+    const wake = [...(f.time as any).events.values()]
+      .map((e: any) => e.at)
+      .sort((a, b) => a - b);
+    assert.equal(
+      wake[0],
+      3,
+      "the crossed grace is rechecked in1ms, not at20s/12s turn expiry",
+    );
+    await f.time.advance(1);
+    const ticket = await work;
+    assert.equal(admitted, true);
+    ticket.sent();
+    ticket.settle(20);
+    ticket.release();
+    assert.equal(f.budget.snapshot().used, 82);
+    f.time.timers.clearTimeout(deadline);
+    assert.equal((f.time as any).events.size, 0);
+    assert.equal(f.time.fired, 1);
+  });
+
+  it(`a crossed ${lane} grace cannot forgive hard quota or create an expired-turn busy loop`, async (t) => {
+    const f = await graceBoundary(t, lane),
+      caller = new AbortController();
+    const deadline = f.time.timers.setTimeout(() => caller.abort(), 10000);
+    let admitted = false;
+    const work = f.budget
+      .acquire(lane, 939, undefined, caller.signal)
+      .then((ticket) => {
+        admitted = true;
+        return ticket;
+      });
+    const rejected = assert.rejects(work, {
+      code: "VENUE_READ_BUDGET_EXHAUSTED",
+    });
+    await f.time.advance(1);
+    assert.equal(f.crossed(), true);
+    assert.equal(admitted, false);
+    assert.equal(f.budget.snapshot().used, 62);
+    await f.time.advance(100);
+    assert.equal(
+      f.time.fired,
+      2,
+      "the captured grace and the newly selected owner's original grace are bounded wakeups",
+    );
+    assert.equal(admitted, false);
+    await f.time.advance(9900);
+    await rejected;
+    assert.equal(admitted, false);
+    assert.equal(f.budget.snapshot().used, 62);
+    f.time.timers.clearTimeout(deadline);
+    assert.equal((f.time as any).events.size, 0);
+  });
+
+  it(`a provider cooldown supersedes a crossed ${lane} grace without a probe or polling loop`, async (t) => {
+    const f = await graceBoundary(t, lane),
+      caller = new AbortController();
+    const work = f.budget.acquire(lane, 20, undefined, caller.signal);
+    const rejected = assert.rejects(work, { code: "VENUE_RATE_LIMITED" });
+    await flush();
+    assert.equal(f.crossed(), true);
+    f.budget.note429(1000);
+    await rejected;
+    await f.time.advance(100);
+    assert.equal(f.budget.snapshot().used, 62);
+    assert.equal(f.budget.snapshot().provider_cooldown_ms, 59900);
+    assert.equal(f.time.fired, 0);
+    assert.equal((f.time as any).events.size, 0);
+  });
+}
+
+it("unknown exclusive credit remains held across a crossed grace and cannot be probed or busy-polled", async (t) => {
+  const f = await graceBoundary(t, "account"),
+    caller = new AbortController();
+  const work = f.budget.acquire("account", 20, undefined, caller.signal);
+  const rejected = assert.rejects(work, { code: "VENUE_READ_DEADLINE" });
+  await flush();
+  assert.equal(f.crossed(), true);
+  const unknown = await f.budget.acquire(
+    "source",
+    20,
+    "other",
+    new AbortController().signal,
+    true,
+  );
+  unknown.sent();
+  await f.time.advance(101);
+  assert.equal(f.budget.snapshot().unknown_exclusive, true);
+  assert.equal(f.budget.snapshot().used, 1000);
+  assert.ok(f.time.fired <= 1);
+  caller.abort();
+  await rejected;
+  unknown.uncertain();
+  unknown.release();
+  assert.equal(f.budget.snapshot().used, 1000);
+  assert.equal(f.budget.snapshot().quarantine_ms, 60000);
+  assert.equal((f.time as any).events.size, 0);
+});
+
 it("marks only a pre-dispatch local budget rejection and preserves account reason identities", async () => {
   const time = new FakeTime(),
     budget = new VenueReadBudget({ clock: time.clock, timers: time.timers });
