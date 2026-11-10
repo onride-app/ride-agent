@@ -80,6 +80,33 @@ function commitOriginalRetirement(
     "Original expired execution was not accepted; its ID is permanently rejected.";
 }
 
+function ownedReductionAllocations(
+  p: Portfolio,
+  key: string,
+  target: string,
+  observed: string,
+): Record<string, string> | null {
+  const delta = D(target).minus(observed);
+  const allocations: Record<string, string> = {};
+  let total = D(0);
+  for (const sleeve of p.sleeves) {
+    const owned = D(sleeve.lots[key]?.quantity ?? 0);
+    const desired = D(sleeve.intents[key]?.quantity ?? 0);
+    const part = desired.minus(owned);
+    if (part.isZero()) continue;
+    if (
+      owned.isZero() ||
+      desired.abs().gt(owned.abs()) ||
+      (!desired.isZero() && desired.isPositive() !== owned.isPositive()) ||
+      part.isPositive() !== delta.isPositive()
+    )
+      return null;
+    allocations[sleeve.copy_id] = part.toString();
+    total = total.plus(part);
+  }
+  return total.eq(delta) ? allocations : null;
+}
+
 function preparationCandidate(state: State): PreparedPortfolioInput | null {
   const active = state.portfolios.filter((p) => p.state !== "closed");
   if (active.length !== 1) return null;
@@ -1172,6 +1199,7 @@ export class AgentRunner {
           p.last_error = undefined;
           if (p.state === "attention")
             p.state = p.loss_latched ? "loss_triggered" : "active";
+          let sourceUpdateBlocked = false;
           if (plannedChanges.size) {
             const basket = structuredClone(p);
             for (const sleeve of basket.sleeves) {
@@ -1184,6 +1212,7 @@ export class AgentRunner {
               p.target_blocker = undefined;
             } catch (error) {
               if (error instanceof AgentError) {
+                sourceUpdateBlocked = true;
                 p.target_blocker = describeRiskBlocker(
                   error,
                   basket,
@@ -1216,8 +1245,11 @@ export class AgentRunner {
               price = snap.prices[key];
             let q = target?.quantity ?? "0";
             if (!price) continue;
-            let allocations = internalCross(p, key, price);
-            checkpoint(state, p, key, now());
+            if (sourceUpdateBlocked && D(q).eq(observed)) continue;
+            let allocations = sourceUpdateBlocked
+              ? {}
+              : internalCross(p, key, price);
+            if (!sourceUpdateBlocked) checkpoint(state, p, key, now());
             if (D(q).eq(observed)) continue;
             if (p.preferences.portfolio_kind && key.startsWith("perps:")) {
               const check = checkPerpsOrder(snap, key, q);
@@ -1256,8 +1288,10 @@ export class AgentRunner {
                   q = "0";
                   for (const sleeve of p.sleeves)
                     if (sleeve.intents[key]) sleeve.intents[key].quantity = "0";
-                  allocations = internalCross(p, key, price);
-                  checkpoint(state, p, key, now());
+                  if (!sourceUpdateBlocked) {
+                    allocations = internalCross(p, key, price);
+                    checkpoint(state, p, key, now());
+                  }
                 } else continue;
               }
             } else if (
@@ -1311,6 +1345,16 @@ export class AgentRunner {
             const reduction =
               D(q).abs().lte(D(observed).abs()) &&
               (D(q).isZero() || D(q).isPositive() === D(observed).isPositive());
+            // Rejected source changes cannot authorize increases or virtual
+            // ownership transfers from old intents. Only independently owned,
+            // one-direction reductions can proceed without an internal cross.
+            if (sourceUpdateBlocked) {
+              if (!reduction) continue;
+              const owned = ownedReductionAllocations(p, key, q, observed);
+              if (!owned) continue;
+              allocations = owned;
+              checkpoint(state, p, key, now());
+            }
             if (
               !reduction &&
               outstanding

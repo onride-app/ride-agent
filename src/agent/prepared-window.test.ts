@@ -13,6 +13,9 @@ import {
 } from "./venue-read-transport.js";
 import { SourceFeed } from "./source-feed.js";
 import { AgentError } from "./contracts.js";
+import { observeSources } from "./source-observations.js";
+import type { Candidate } from "./domain.js";
+import type { VenueAdapter } from "./adapter.js";
 async function flush() {
   for (let n = 0; n < 200; n++) await Promise.resolve();
 }
@@ -566,4 +569,367 @@ it("a queued outside SourceFeed flight is never adopted and a later normal-backo
   feed.close();
   await f.reads.drainAccounts();
   assert.equal(f.bank().dirty, false);
+});
+
+function nativeSourceFeed(f: ReturnType<typeof fixture>) {
+  const identities: string[] = [];
+  const feed = new SourceFeed(
+    async (id) => {
+      identities.push(id);
+      const evidence = await f.reads.readWithEvidence(
+        "https://api.hyperliquid.xyz/info",
+        { type: "clearinghouseState", user: id },
+        0,
+        "source",
+      );
+      return {
+        observed_at: evidence.observed_at,
+        revision: id,
+        account_value_usdc: "1",
+        positions: [],
+        complete: true,
+      };
+    },
+    {
+      clock: f.time.clock,
+      timers: { setInterval: () => 1, clearInterval: () => {} },
+    },
+  );
+  return { feed, identities };
+}
+
+it("serializes the actual Runner source worker pool through SourceFeed at full900 without borrowing the second scope", async () => {
+  const f = fixture(),
+    window = await f.prepare();
+  await f.time.run(window.read(f.audit));
+  const { feed, identities } = nativeSourceFeed(f);
+  const traders = ["one", "two", "three"].map((id) => ({ id })) as Candidate[];
+  const adapter = {
+    source: (trader: Candidate) =>
+      feed.read(trader.id, (work) => window.supplement(work)),
+  } as VenueAdapter;
+  const observations = await f.time.run(
+    observeSources(adapter, traders).finish(),
+  );
+  assert.deepEqual(identities, ["one", "two", "three"]);
+  for (const trader of traders) {
+    const observed = observations.get(trader.id)!;
+    assert.equal(observed.ok, true);
+    if (observed.ok) {
+      assert.equal(observed.value.revision, trader.id);
+      assert.ok(f.time.at - observed.value.observed_at <= 5000);
+    }
+  }
+  assert.equal(f.bank().paid, 622);
+  assert.equal(f.bank().held, 278);
+  assert.equal(f.bank().used, 900);
+  window.assertNextChildReady();
+  await f.time.run(window.read(f.audit));
+  assert.equal(f.bank().paid, 706);
+  assert.equal(f.bank().used, 900);
+  assert.equal(f.bank().dirty, false);
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.budget.snapshot().used, 174);
+  assert.equal(f.time.events.size, 0);
+});
+
+it("revalidates sources after a slow fresh second scope using only the first scope surplus and the original deadline", async () => {
+  const f = fixture(),
+    window = await f.prepare(),
+    expiry = window.expires_at;
+  await f.time.run(window.read(f.audit));
+  const { feed, identities } = nativeSourceFeed(f);
+  const first = await f.time.run(
+    feed.read("one", (work) => window.supplement(work)),
+  );
+  await f.time.run(
+    window.read(async () => {
+      await new Promise<void>((resolve) =>
+        f.time.timers.setTimeout(resolve, 6000),
+      );
+      return f.audit();
+    }),
+  );
+  assert.ok(f.time.at - first.observed_at > 5000);
+  const fresh = await f.time.run(
+    feed.read("one", (work) => window.supplement(work)),
+  );
+  assert.deepEqual(identities, ["one", "one"]);
+  assert.ok(fresh.observed_at > first.observed_at);
+  assert.ok(f.time.at - fresh.observed_at <= 5000);
+  assert.equal(window.expires_at, expiry);
+  assert.equal(f.bank().paid, 704);
+  assert.equal(f.bank().used, 900);
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+});
+
+it("closing or draining a window rejects all queued supplemental work without starting it", async () => {
+  for (const close of ["close", "drain"] as const) {
+    const f = fixture(),
+      window = await f.prepare();
+    await f.time.run(window.read(f.audit));
+    let entered = 0;
+    const first = window.supplement(async () => {
+      entered++;
+      return new Promise<void>(() => {});
+    });
+    const second = window.supplement(async () => {
+      entered++;
+    });
+    const results = Promise.allSettled([first, second]);
+    await flush();
+    assert.equal(entered, 1);
+    if (close === "close") await window.close();
+    else await f.reads.drainAccounts();
+    const values = await results;
+    assert.ok(values.every((x) => x.status === "rejected"));
+    assert.equal(entered, 1);
+    await f.reads.drainAccounts();
+    assert.equal(f.bank().held, 0);
+    assert.equal(f.bank().dirty, false);
+    assert.equal(f.time.events.size, 0);
+  }
+});
+
+it("a queued caller abort cannot let later work overtake the active supplemental child or authorize the second scope", async () => {
+  const f = fixture(),
+    window = await f.prepare();
+  await f.time.run(window.read(f.audit));
+  let release!: () => void,
+    entered = 0;
+  const first = window.supplement(async () => {
+    entered++;
+    await new Promise<void>((resolve) => (release = resolve));
+    return "first";
+  });
+  const abort = new AbortController(),
+    cause = new Error("synthetic queued cancellation");
+  const second = window.supplement(
+    async () => {
+      entered++;
+    },
+    { signal: abort.signal },
+  );
+  const third = window.supplement(async () => {
+    entered++;
+  });
+  const secondFailed = assert.rejects(second, (error) => error === cause);
+  const thirdFailed = assert.rejects(third, {
+    code: "VENUE_COST_PLAN_UNAVAILABLE",
+  });
+  await flush();
+  abort.abort(cause);
+  await secondFailed;
+  await flush();
+  assert.equal(entered, 1);
+  assert.throws(() => window.assertNextChildReady());
+  release();
+  assert.equal(await first, "first");
+  await thirdFailed;
+  assert.equal(entered, 1);
+  await assert.rejects(window.read(f.audit), {
+    code: "VENUE_COST_PLAN_UNAVAILABLE",
+  });
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+
+it("queued source deadlines consume their original cutoff and cannot renew the parent lease", async () => {
+  const f = fixture(),
+    window = await f.prepare(),
+    expiry = window.expires_at;
+  await f.time.run(window.read(f.audit));
+  let release!: () => void,
+    entered = 0;
+  const first = window.supplement(async () => {
+    entered++;
+    await new Promise<void>((resolve) => (release = resolve));
+  });
+  const second = window.supplement(
+    async () => {
+      entered++;
+    },
+    { deadlineMs: f.time.at + 500 },
+  );
+  const failed = assert.rejects(second, { code: "VENUE_READ_DEADLINE" });
+  await f.time.advance(500);
+  await failed;
+  assert.equal(entered, 1);
+  assert.equal(window.expires_at, expiry);
+  release();
+  await first;
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+
+it("a supplemental failure is preserved and cannot be erased by an earlier successful source", async () => {
+  const f = fixture(),
+    window = await f.prepare();
+  await f.time.run(window.read(f.audit));
+  const cause = new AgentError(
+    "VENUE_RATE_LIMITED",
+    "synthetic cooldown",
+    true,
+    503,
+  );
+  const first = window.supplement(async () => "success");
+  const second = window.supplement(async () => {
+    throw cause;
+  });
+  const third = window.supplement(async () =>
+    assert.fail("a failed window cannot dispatch later work"),
+  );
+  const all = Promise.allSettled([first, second, third]);
+  const results = await all;
+  assert.deepEqual(results[0], { status: "fulfilled", value: "success" });
+  assert.equal(results[1].status, "rejected");
+  if (results[1].status === "rejected") assert.equal(results[1].reason, cause);
+  assert.equal(results[2].status, "rejected");
+  assert.throws(() => window.assertNextChildReady());
+  await assert.rejects(window.read(f.audit), {
+    code: "VENUE_COST_PLAN_UNAVAILABLE",
+  });
+  await window.close();
+  await f.reads.drainAccounts();
+});
+
+it("caps queued supplemental children without starting extra work or changing the available credit", async () => {
+  const f = fixture(),
+    window = await f.prepare();
+  await f.time.run(window.read(f.audit));
+  let release!: () => void,
+    entered = 0;
+  const first = window.supplement(async () => {
+    entered++;
+    await new Promise<void>((resolve) => (release = resolve));
+  });
+  const queued = Array.from({ length: 63 }, () =>
+    window.supplement(async () => {
+      entered++;
+    }),
+  );
+  await assert.rejects(
+    window.supplement(async () => assert.fail("queue overflow cannot start")),
+    { code: "VENUE_COST_PLAN_UNAVAILABLE" },
+  );
+  await flush();
+  assert.equal(entered, 1);
+  release();
+  await Promise.all([first, ...queued]);
+  assert.equal(entered, 64);
+  assert.equal(f.bank().paid, 616);
+  window.assertNextChildReady();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+
+it("keeps sent supplemental wire costs and unknown quarantine at the real12s timeout, then rejects queued work and the second scope", async () => {
+  for (const unknown of [false, true]) {
+    const f = fixture(),
+      window = await f.prepare();
+    await f.time.run(window.read(f.audit));
+    f.hang(true);
+    const started = f.time.at;
+    let laterCalls = 0;
+    const active = window.supplement(() =>
+      f.reads.read(
+        "https://api.hyperliquid.xyz/info",
+        {
+          type: unknown ? "userFunding" : "clearinghouseState",
+          user: "supplement",
+        },
+        0,
+        "source",
+      ),
+    );
+    const queued = window.supplement(async () => {
+      laterCalls++;
+    });
+    const activeFailed = assert.rejects(active, {
+      code: "VENUE_READ_DEADLINE",
+    });
+    const queuedFailed = assert.rejects(queued, {
+      code: "VENUE_COST_PLAN_UNAVAILABLE",
+    });
+    await f.time.advance(11999);
+    assert.equal(laterCalls, 0);
+    assert.equal(f.budget.snapshot().used, unknown ? 184 : 86);
+    await f.time.advance(1);
+    await Promise.all([activeFailed, queuedFailed]);
+    assert.equal(f.time.at - started, 12000);
+    assert.equal(laterCalls, 0);
+    assert.equal(f.budget.snapshot().used, unknown ? 184 : 86);
+    assert.equal(f.budget.snapshot().quarantine_ms, unknown ? 60000 : 0);
+    await assert.rejects(window.read(f.audit), {
+      code: "VENUE_COST_PLAN_UNAVAILABLE",
+    });
+    await window.close();
+    await f.reads.drainAccounts();
+    assert.equal(f.bank().held, 0);
+    assert.equal(f.budget.snapshot().used, unknown ? 184 : 86);
+    assert.equal(f.time.events.size, 0);
+  }
+});
+
+it("serial source work cannot relabel old wire evidence when the unchanged5s SourceFeed guard rejects it", async () => {
+  const f = fixture(),
+    window = await f.prepare(),
+    expiry = window.expires_at;
+  await f.time.run(window.read(f.audit));
+  const originalWireTimes: number[] = [];
+  const feed = new SourceFeed(
+    async (id) => {
+      const evidence = await f.reads.readWithEvidence(
+        "https://api.hyperliquid.xyz/info",
+        { type: "clearinghouseState", user: id },
+        0,
+        "source",
+      );
+      originalWireTimes.push(evidence.observed_at);
+      await new Promise<void>((resolve) =>
+        f.time.timers.setTimeout(resolve, 6000),
+      );
+      return {
+        observed_at: evidence.observed_at,
+        revision: id,
+        account_value_usdc: "1",
+        positions: [],
+        complete: true,
+      };
+    },
+    {
+      clock: f.time.clock,
+      timers: { setInterval: () => 1, clearInterval: () => {} },
+    },
+  );
+  const traders = ["one", "two", "three"].map((id) => ({ id })) as Candidate[];
+  const adapter = {
+    source: (trader: Candidate) =>
+      feed.read(trader.id, (work) => window.supplement(work)),
+  } as VenueAdapter;
+  const observations = await f.time.run(
+    observeSources(adapter, traders).finish(),
+  );
+  assert.equal(originalWireTimes.length, 3);
+  assert.ok(f.time.at - originalWireTimes[0] > 5000);
+  for (const observation of observations.values()) {
+    assert.equal(observation.ok, false);
+    if (!observation.ok)
+      assert.equal((observation.error as AgentError).code, "SOURCE_STALE");
+  }
+  assert.equal(window.expires_at, expiry);
+  assert.ok(f.time.at < expiry);
+  assert.equal(f.bank().paid, 622);
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.time.events.size, 0);
 });
