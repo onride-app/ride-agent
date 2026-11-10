@@ -82,7 +82,12 @@ class Time {
 }
 async function fixture(
   t: TestContext,
-  options: { cold?: boolean; failedCas?: boolean; unified?: boolean } = {},
+  options: {
+    cold?: boolean;
+    failedCas?: boolean;
+    unified?: boolean;
+    threeSources?: boolean;
+  } = {},
 ) {
   const time = new Time();
   t.mock.method(Date, "now", time.clock);
@@ -107,16 +112,21 @@ async function fixture(
   const p = fromPlan(
     recommend(
       {
-        budget_usdc: "20",
+        budget_usdc: options.threeSources ? "60" : "20",
         market: "perps",
         assets: [],
         allow_altcoins: true,
         loss_trigger_pct: 10,
         risk_tolerance: "medium",
-        portfolio_kind: "single",
-        basket_size: 1,
+        portfolio_kind: options.threeSources ? "basket" : "single",
+        basket_size: options.threeSources ? 3 : 1,
       },
-      [candidate(1)],
+      options.threeSources
+        ? ["BTC", "ETH", "SOL"].map((asset, i) => ({
+            ...candidate(i + 1),
+            assets: [asset],
+          }))
+        : [candidate(1)],
     ),
   );
   p.account_id = "22222222-2222-4222-8222-222222222222";
@@ -125,9 +135,11 @@ async function fixture(
   p.initial_equity = "1000";
   p.ledger_started_at = time.at - 10000;
   p.reconciliation = "complete";
-  p.sleeves[0].state = "active";
-  p.sleeves[0].initialized = true;
-  p.sleeves[0].reviewed_at = time.at;
+  for (const sleeve of p.sleeves) {
+    sleeve.state = "active";
+    sleeve.initialized = true;
+    sleeve.reviewed_at = time.at;
+  }
   const identity = {
     account_id: p.account_id,
     network: 2,
@@ -138,6 +150,12 @@ async function fixture(
     policy_revision: 1,
   };
   const source = "0x" + "3".repeat(40),
+    sourceRows = p.sleeves.map((sleeve, i) => ({
+      trader: sleeve.trader.id,
+      address: "0x" + String(i + 3).repeat(40),
+      asset: sleeve.trader.assets[0],
+    })),
+    sourceByAddress = new Map(sourceRows.map((row) => [row.address, row])),
     outboxes = new Map<string, any>(),
     reads: any[] = [],
     events: string[] = [],
@@ -207,7 +225,13 @@ async function fixture(
       const req = JSON.parse(String(init.body)),
         cost = readCost(req);
       const reserve = req.type === "userFunding" ? 120 : cost.reserve;
-      reads.push({ type: req.type, at: time.at, context });
+      const observedRead: any = {
+        type: req.type,
+        user: req.user,
+        at: time.at,
+        context,
+      };
+      reads.push(observedRead);
       if (context?.frame_id) {
         assert.equal(context.frame_id, frameId);
         assert.equal(context.frame_owner, frameOwner);
@@ -243,20 +267,19 @@ async function fixture(
           data = {
             marginSummary: { accountValue: "1000" },
             withdrawable: "1000",
-            assetPositions:
-              req.user === source
-                ? [
-                    {
-                      position: {
-                        coin: "BTC",
-                        szi: "5",
-                        entryPx: "100",
-                        positionValue: "500",
-                        leverage: { type: "cross", value: 5 },
-                      },
+            assetPositions: sourceByAddress.has(req.user)
+              ? [
+                  {
+                    position: {
+                      coin: sourceByAddress.get(req.user)!.asset,
+                      szi: "5",
+                      entryPx: "100",
+                      positionValue: "500",
+                      leverage: { type: "cross", value: 5 },
                     },
-                  ]
-                : [],
+                  },
+                ]
+              : [],
           };
           break;
         case "frontendOpenOrders":
@@ -266,20 +289,45 @@ async function fixture(
           data = [];
           break;
         case "allMids":
-          data = { BTC: "100" };
+          data = options.threeSources
+            ? { BTC: "100", ETH: "100", SOL: "100" }
+            : { BTC: "100" };
           break;
         case "meta":
           data = {
             collateralToken: 0,
-            universe: [{ name: "BTC", maxLeverage: 8, szDecimals: 3 }],
+            universe: (options.threeSources
+              ? ["BTC", "ETH", "SOL"]
+              : ["BTC"]
+            ).map((name) => ({ name, maxLeverage: 8, szDecimals: 3 })),
           };
           break;
         default:
           assert.fail("unexpected local provider graph method " + req.type);
       }
       const actual = responseCost(cost, data);
+      observedRead.actual = actual;
       paid += actual - reserve;
       if (context?.frame_id) held += reserve - actual;
+      if (
+        options.threeSources &&
+        context?.frame_id &&
+        req.type === "clearinghouseState" &&
+        sourceByAddress.has(req.user) &&
+        reads.filter(
+          (read) =>
+            read.type === "clearinghouseState" &&
+            read.context?.frame_id === context.frame_id &&
+            sourceByAddress.has(read.user),
+        ).length === 3
+      ) {
+        assert.ok(
+          held >= 184,
+          "three real sources cannot borrow the second W184 scope",
+        );
+        assert.equal(paid + held, 900);
+        events.push("three-source-second-scope-protected");
+      }
       events.push("wire:" + req.type);
       const response = Response.json(data);
       recordCoordinatedEvidence(response, time.at);
@@ -345,7 +393,15 @@ async function fixture(
     if (financialBarrier) await financialBarrier;
     return { task_id: "original-fixture-task" };
   };
-  b.resolve = async () => ({ address: source, tags: [] });
+  b.resolve = async (id: string) => {
+    if (!options.threeSources) return { address: source, tags: [] };
+    const selected = sourceRows.find((row) => row.trader === id);
+    assert.ok(
+      selected,
+      "the real CoreBridge source route must select a known distinct trader",
+    );
+    return { address: selected.address, tags: [] };
+  };
   if (options.unified)
     b.orderSnapshots = {
       readAccount: async () => ({
@@ -767,204 +823,251 @@ it("testnet and unmanaged read routes return unsupported without invoking paired
   assert.equal(f.bank().posts, 0);
 });
 
-it(
-  "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, both fresh scopes and one original outbox",
-  { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
-  async (t) => {
-    const f = await fixture(t, { unified: true }),
-      url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
-    assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
-    const admin = new pg.Pool({ connectionString: url.toString(), max: 2 }),
-      schema = "prepared_graph_" + randomUUID().replaceAll("-", "");
-    await admin.query("CREATE SCHEMA " + schema);
-    url.searchParams.set("options", "-c search_path=" + schema);
-    let closeRunner = async () => {};
-    const repository = new PgRepository(url.toString());
-    await repository.migrate();
-    t.after(async () => {
-      await closeRunner();
-      await repository.close();
-      await admin.query("DROP SCHEMA " + schema + " CASCADE");
-      await admin.end();
-    });
-    const fixtureEnv: Record<string, string> = {
-      RIDE_AGENT_EXECUTOR_TOKEN: "e".repeat(48),
-      RIDE_AGENT_CORE_URL: "https://core.fixture",
-      RIDE_AGENT_CORE_SERVICE_TOKEN: "fixture-token",
-      RIDE_AGENT_DATABASE_URL: "postgresql://127.0.0.1:1/unused",
-      RIDE_AGENT_TRADER_ID_SALT: "s".repeat(32),
-      RIDE_AGENT_NETWORK: "mainnet",
-      RIDE_AGENT_INFO_READ_ROUTE: "core",
-    };
-    for (const [key, value] of Object.entries(fixtureEnv)) {
-      const old = process.env[key];
-      process.env[key] = value;
-      t.after(() => {
-        if (old === undefined) delete process.env[key];
-        else process.env[key] = old;
+for (const threeSources of [false, true])
+  it(
+    "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, both fresh scopes and one original outbox (" +
+      (threeSources ? "three distinct sources" : "one source") +
+      ")",
+    { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
+    async (t) => {
+      const f = await fixture(t, { unified: true, threeSources }),
+        url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
+      assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
+      const admin = new pg.Pool({ connectionString: url.toString(), max: 2 }),
+        schema = "prepared_graph_" + randomUUID().replaceAll("-", "");
+      await admin.query("CREATE SCHEMA " + schema);
+      url.searchParams.set("options", "-c search_path=" + schema);
+      let closeRunner = async () => {};
+      const repository = new PgRepository(url.toString());
+      await repository.migrate();
+      t.after(async () => {
+        await closeRunner();
+        await repository.close();
+        await admin.query("DROP SCHEMA " + schema + " CASCADE");
+        await admin.end();
       });
-    }
-    // Only startup dependencies are fixture transports; the actual authenticated
-    // Express route, operation dispatcher and all financial read functions run.
-    t.mock.method(
-      CoreBridge.prototype,
-      "migrate",
-      async function (this: CoreBridge) {
-        await (this as any).pool.end();
-        Object.assign(this, f.b);
-      },
-    );
-    const managed = await startManagedCoreBridge({
-      host: "127.0.0.1",
-      port: 0,
-    });
-    t.after(async () => managed.close());
-    const adapter = new BridgeAdapter(
-      "http://127.0.0.1:" + (managed.listener.address() as AddressInfo).port,
-      fixtureEnv.RIDE_AGENT_EXECUTOR_TOKEN,
-    );
-    adapter.notify = async () => {};
-    const originalHistory = Array.from({ length: 5 }, (_, i) => {
-      const frozen = {
-        id: "paired_old_retired_" + i,
-        key: "perps:BTC",
-        target_quantity: "0.1",
-        allocations: { [f.p.sleeves[0].copy_id]: "0.1" },
-        revision: f.p.revision,
-        created_at: f.time.at - 180000 - i,
-        expires_at: f.time.at - 120000 - i,
+      const fixtureEnv: Record<string, string> = {
+        RIDE_AGENT_EXECUTOR_TOKEN: "e".repeat(48),
+        RIDE_AGENT_CORE_URL: "https://core.fixture",
+        RIDE_AGENT_CORE_SERVICE_TOKEN: "fixture-token",
+        RIDE_AGENT_DATABASE_URL: "postgresql://127.0.0.1:1/unused",
+        RIDE_AGENT_TRADER_ID_SALT: "s".repeat(32),
+        RIDE_AGENT_NETWORK: "mainnet",
+        RIDE_AGENT_INFO_READ_ROUTE: "core",
       };
-      const e: Execution = {
-        ...frozen,
-        fingerprint: fingerprint(frozen),
-        status: "failed",
-        task_id: null,
-        observed_quantity: null,
-        reserve_usdc: "2",
-        error: null,
-      };
-      const request = perpsRecoveryRequest(graphUser, f.p.account_id, e)!;
-      assert.ok(request);
-      e.retirement = {
-        protocol_version: 1,
-        retirement: "original_absence_retired",
-        reason_code: "ORIGINAL_ABSENCE_PERMANENTLY_RETIRED",
-        proof: {
-          ...request,
-          network: "mainnet",
-          observed_at: f.time.at - 1,
-          current_execution_epoch: "33333333-3333-4333-8333-333333333333",
-          retirement_epoch: "44444444-4444-4444-8444-444444444444",
-          tombstone_id: "55555555-5555-4555-8555-555555555555",
-          retired_at: f.time.at - 2,
-          serialized_absence_check: true,
-          permanent_original_id_fence: true,
-          historical_bindings_checked: true,
-        },
-      };
-      return e;
-    });
-    f.p.executions.push(...originalHistory);
-    await repository.transact(graphUser, async (state) => {
-      state.portfolios.push(f.p);
-    });
-    const runner = new AgentRunner(
-      new AgentService(
-        repository,
-        adapter,
-        "https://fixture.invalid",
-        new Cursor("s".repeat(32)),
-      ),
-    );
-    closeRunner = () => runner.closeNotifications();
-    async function drive<T>(work: Promise<T>) {
-      let done = false,
-        value!: T,
-        error: unknown;
-      void work.then(
-        (v) => {
-          done = true;
-          value = v;
-        },
-        (e) => {
-          done = true;
-          error = e;
-        },
-      );
-      for (let n = 0; !done && n < 25000; n++) {
-        await f.time.advance(1);
-        await new Promise<void>((r) => setTimeout(r, 1));
+      for (const [key, value] of Object.entries(fixtureEnv)) {
+        const old = process.env[key];
+        process.env[key] = value;
+        t.after(() => {
+          if (old === undefined) delete process.env[key];
+          else process.env[key] = old;
+        });
       }
-      assert.equal(
-        done,
-        true,
-        "real loopback pipeline must settle inside the original window",
+      // Only startup dependencies are fixture transports; the actual authenticated
+      // Express route, operation dispatcher and all financial read functions run.
+      t.mock.method(
+        CoreBridge.prototype,
+        "migrate",
+        async function (this: CoreBridge) {
+          await (this as any).pool.end();
+          Object.assign(this, f.b);
+        },
       );
-      if (error) throw error;
-      return value;
-    }
-    await drive(runner.tick(graphUser));
-    let state = await repository.read(graphUser);
-    assert.equal(
-      state.portfolios[0].executions.length,
-      originalHistory.length,
-      "discovery cannot materialize a financial identifier",
-    );
-    assert.equal(f.bank().posts, 0);
-    await flush();
-    assert.equal(f.bank().held, 0);
-    await f.time.advance(60001);
-    // The preceding charges have really aged out of the local ledger. This
-    // finite external-ledger fixture offers just enough room for the warm pair.
-    f.resetBank(900 - 2 * f.planDemand());
-    const before = f.reads.length;
-    await drive(runner.tick(graphUser));
-    state = await repository.read(graphUser);
-    const executions = state.portfolios[0].executions.filter(
-      (e) => !originalHistory.some((old) => old.id === e.id),
-    );
-    assert.deepEqual(
-      state.portfolios[0].executions.filter((e) =>
-        originalHistory.some((old) => old.id === e.id),
-      ),
-      originalHistory,
-    );
-    assert.equal(
-      executions.length,
-      1,
-      "only one new original target is materialized in the paired window",
-    );
-    assert.equal(executions[0].status, "submitted");
-    assert.equal(executions[0].first_submission_failure, undefined);
-    assert.equal(f.outboxes.size, 1);
-    assert.equal(f.bank().posts, 1);
-    for (const type of [
-      "userFillsByTime",
-      "userFunding",
-      "userNonFundingLedgerUpdates",
-      "spotClearinghouseState",
-    ])
-      assert.equal(
-        f.reads.slice(before).filter((r) => r.type === type).length,
-        2,
-        "each fresh financial scope preserves " + type,
+      const managed = await startManagedCoreBridge({
+        host: "127.0.0.1",
+        port: 0,
+      });
+      t.after(async () => managed.close());
+      const adapter = new BridgeAdapter(
+        "http://127.0.0.1:" + (managed.listener.address() as AddressInfo).port,
+        fixtureEnv.RIDE_AGENT_EXECUTOR_TOKEN,
       );
-    const captured = f.outboxes.get(executions[0].id);
-    assert.equal(captured.fingerprint, executions[0].fingerprint);
-    assert.equal(captured.payload.execution_id, executions[0].id);
-    assert.equal(captured.response.task_id, executions[0].task_id);
-    assert.equal(f.bank().held, 0);
-    assert.equal(f.bank().dirty, false);
-    const head = await repository.pool.query(
-      "SELECT version::text FROM ride_agent_history_heads WHERE user_id=$1 AND portfolio_id=$2",
-      [graphUser, f.p.id],
-    );
-    assert.ok(
-      Number(head.rows[0]?.version) >= 1,
-      "the actual decision history crossed a real PG commit",
-    );
-  },
-);
+      adapter.notify = async () => {};
+      const originalHistory = Array.from({ length: 5 }, (_, i) => {
+        const frozen = {
+          id: "paired_old_retired_" + i,
+          key: "perps:BTC",
+          target_quantity: "0.1",
+          allocations: { [f.p.sleeves[0].copy_id]: "0.1" },
+          revision: f.p.revision,
+          created_at: f.time.at - 180000 - i,
+          expires_at: f.time.at - 120000 - i,
+        };
+        const e: Execution = {
+          ...frozen,
+          fingerprint: fingerprint(frozen),
+          status: "failed",
+          task_id: null,
+          observed_quantity: null,
+          reserve_usdc: "2",
+          error: null,
+        };
+        const request = perpsRecoveryRequest(graphUser, f.p.account_id, e)!;
+        assert.ok(request);
+        e.retirement = {
+          protocol_version: 1,
+          retirement: "original_absence_retired",
+          reason_code: "ORIGINAL_ABSENCE_PERMANENTLY_RETIRED",
+          proof: {
+            ...request,
+            network: "mainnet",
+            observed_at: f.time.at - 1,
+            current_execution_epoch: "33333333-3333-4333-8333-333333333333",
+            retirement_epoch: "44444444-4444-4444-8444-444444444444",
+            tombstone_id: "55555555-5555-4555-8555-555555555555",
+            retired_at: f.time.at - 2,
+            serialized_absence_check: true,
+            permanent_original_id_fence: true,
+            historical_bindings_checked: true,
+          },
+        };
+        return e;
+      });
+      f.p.executions.push(...originalHistory);
+      await repository.transact(graphUser, async (state) => {
+        state.portfolios.push(f.p);
+      });
+      const runner = new AgentRunner(
+        new AgentService(
+          repository,
+          adapter,
+          "https://fixture.invalid",
+          new Cursor("s".repeat(32)),
+        ),
+      );
+      closeRunner = () => runner.closeNotifications();
+      async function drive<T>(work: Promise<T>) {
+        let done = false,
+          value!: T,
+          error: unknown;
+        void work.then(
+          (v) => {
+            done = true;
+            value = v;
+          },
+          (e) => {
+            done = true;
+            error = e;
+          },
+        );
+        for (let n = 0; !done && n < 25000; n++) {
+          await f.time.advance(1);
+          await new Promise<void>((r) => setTimeout(r, 1));
+        }
+        assert.equal(
+          done,
+          true,
+          "real loopback pipeline must settle inside the original window",
+        );
+        if (error) throw error;
+        return value;
+      }
+      await drive(runner.tick(graphUser));
+      let state = await repository.read(graphUser);
+      assert.equal(
+        state.portfolios[0].executions.length,
+        originalHistory.length,
+        "discovery cannot materialize a financial identifier",
+      );
+      assert.equal(f.bank().posts, 0);
+      await flush();
+      assert.equal(f.bank().held, 0);
+      await f.time.advance(60001);
+      // The preceding charges have really aged out of the local ledger. This
+      // finite external-ledger fixture offers just enough room for the warm pair.
+      f.resetBank(900 - 2 * f.planDemand());
+      const before = f.reads.length;
+      await drive(runner.tick(graphUser));
+      state = await repository.read(graphUser);
+      const executions = state.portfolios[0].executions.filter(
+        (e) => !originalHistory.some((old) => old.id === e.id),
+      );
+      assert.deepEqual(
+        state.portfolios[0].executions.filter((e) =>
+          originalHistory.some((old) => old.id === e.id),
+        ),
+        originalHistory,
+      );
+      assert.equal(
+        executions.length,
+        1,
+        "only one new original target is materialized in the paired window",
+      );
+      assert.equal(executions[0].status, "submitted");
+      assert.equal(executions[0].first_submission_failure, undefined);
+      assert.equal(f.outboxes.size, 1);
+      assert.equal(f.bank().posts, 1);
+      for (const type of [
+        "userFillsByTime",
+        "userFunding",
+        "userNonFundingLedgerUpdates",
+        "spotClearinghouseState",
+      ])
+        assert.equal(
+          f.reads.slice(before).filter((r) => r.type === type).length,
+          2,
+          "each fresh financial scope preserves " + type,
+        );
+      const captured = f.outboxes.get(executions[0].id);
+      assert.equal(captured.fingerprint, executions[0].fingerprint);
+      assert.equal(captured.payload.execution_id, executions[0].id);
+      assert.equal(captured.response.task_id, executions[0].task_id);
+      assert.equal(f.bank().held, 0);
+      assert.equal(f.bank().dirty, false);
+      if (threeSources) {
+        const sourceReads = f.reads
+          .slice(before)
+          .filter(
+            (read) =>
+              read.type === "clearinghouseState" &&
+              read.user !== f.identity.master,
+          );
+        assert.equal(sourceReads.length, 3);
+        assert.equal(
+          new Set(sourceReads.map((read) => read.user)).size,
+          3,
+          "distinct provider addresses prevent SourceFeed singleflight from hiding concurrency",
+        );
+        assert.ok(sourceReads.every((read) => f.time.at - read.at <= 5000));
+        assert.equal(
+          sourceReads.reduce((sum, read) => sum + read.actual, 0),
+          6,
+        );
+        const firstSource = f.reads.slice(before).indexOf(sourceReads[0]);
+        const lastSource = f.reads.slice(before).indexOf(sourceReads.at(-1)!);
+        // The full managed graph retains its real metadata charges: A144,
+        // three distinct native source reads S6, and a fresh second B102.
+        // Both children still book W184; S may only spend A's unused credit.
+        assert.equal(
+          f.reads
+            .slice(before, before + firstSource)
+            .reduce((sum, read) => sum + read.actual, 0),
+          144,
+          "the first real account scope includes all A144 metadata costs",
+        );
+        assert.equal(
+          f.reads
+            .slice(before + lastSource + 1)
+            .reduce((sum, read) => sum + read.actual, 0),
+          102,
+          "the second real account scope retains its distinct B102 costs",
+        );
+        assert.equal(f.begins.at(-1).weight, 2 * 184);
+        assert.equal(f.planDemand(), 184);
+        assert.ok(f.events.includes("three-source-second-scope-protected"));
+        assert.equal(f.budget.snapshot().used, 144 + 6 + 102);
+        assert.equal(f.bank().paid, 900 - 2 * 184 + 144 + 6 + 102);
+      }
+      const head = await repository.pool.query(
+        "SELECT version::text FROM ride_agent_history_heads WHERE user_id=$1 AND portfolio_id=$2",
+        [graphUser, f.p.id],
+      );
+      assert.ok(
+        Number(head.rows[0]?.version) >= 1,
+        "the actual decision history crossed a real PG commit",
+      );
+    },
+  );
 it("fixed copying preserves its ordinary full source-fill path without booking a paired window", async (t) => {
   const f = await fixture(t);
   f.p.sleeves[0].copy_mode = "fixed";

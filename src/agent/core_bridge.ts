@@ -65,6 +65,7 @@ import {
   type PerpsRetirementReceipt,
 } from "./execution-retirement.js";
 import { sourceEvidenceReady } from "./source-observations.js";
+import { sourcePositionGuardFailure } from "./source-position-guard.js";
 import {
   inObservedPerpsScope,
   scopedSourceFills,
@@ -2733,29 +2734,21 @@ export class CoreBridge {
             raw_source_quantity?: string;
           }
         ).raw_source_quantity;
-        if (
-          !sourceEvidenceReady(source) ||
-          !currentSource ||
-          !fresh(currentSource.observed_at) ||
-          currentSource.source_revision !== intent.source_revision ||
-          source.revision !== intent.source_revision ||
-          currentSource.asset !== intent.asset ||
-          currentSource.market !== intent.market ||
-          D(currentSource.quantity).isZero() ||
-          !Number.isInteger(currentSource.source_leverage) ||
-          currentSource.source_leverage < 1 ||
-          Math.min(
-            currentSource.source_leverage,
-            s.leverage_cap ?? Number.POSITIVE_INFINITY,
-            snap.max_leverages[e.key] ?? 1,
-          ) !== intent.source_leverage ||
-          (s.leverage_mode != null &&
-            currentSource.source_leverage_verified === false) ||
-          (rawQuantity != null && !D(rawQuantity).eq(currentSource.quantity))
-        )
+        const guardFailure = sourcePositionGuardFailure(
+          source,
+          currentSource,
+          intent,
+          s,
+          () => snap.max_leverages[e.key],
+          rawQuantity,
+        );
+        if (guardFailure)
           throw new AgentError(
             "EXECUTION_REJECTED",
             "Fresh equivalent source-position evidence is required before increasing exposure.",
+            false,
+            409,
+            { reason_code: guardFailure },
           );
         if (D(price).minus(intent.price).abs().div(intent.price).gt(".002"))
           throw new AgentError(

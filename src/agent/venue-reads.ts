@@ -400,14 +400,18 @@ export class VenueReads {
       reading = false,
       reads = 0,
       failed = false;
-    const supplement = async <T>(
+    let supplementTail = Promise.resolve(),
+      supplementQueued = 0,
+      supplementReading = false;
+    const runSupplement = async <T>(
       work: () => Promise<T>,
-      limits: AccountObservationLimits = {},
+      limits: AccountObservationLimits,
+      monotonicUntil: number,
     ) => {
       if (closed || reading || reads < 1 || scope.admission.signal.aborted)
         throw costPlanUnavailable();
-      reading = true;
       const ticket = parent.beginSupplement();
+      reading = true;
       const sourceScope: AccountReadScope = {
         ...scope,
         id: ++this.accountSequence,
@@ -424,7 +428,7 @@ export class VenueReads {
       sourceScope.until = Math.min(scope.until, limits.deadlineMs ?? Infinity);
       sourceScope.monotonicUntil = Math.min(
         scope.monotonicUntil,
-        this.monotonicClock() + Math.max(0, sourceScope.until - this.clock()),
+        monotonicUntil,
       );
       const stop = () =>
         sourceScope.admission.abort(scope.admission.signal.reason);
@@ -457,6 +461,90 @@ export class VenueReads {
         reading = false;
       }
     };
+    const supplement = async <T>(
+      work: () => Promise<T>,
+      limits: AccountObservationLimits = {},
+    ): Promise<T> => {
+      // Source collection has two workers. Serialize only these supplemental
+      // children, not account observations, inside this same original lease.
+      // Each child still spends only the proved unused first-child capacity.
+      if (
+        closed ||
+        failed ||
+        reads < 1 ||
+        (reading && !supplementReading) ||
+        scope.admission.signal.aborted ||
+        supplementQueued >= 64
+      )
+        throw costPlanUnavailable();
+      if (
+        limits.deadlineMs !== undefined &&
+        !Number.isSafeInteger(limits.deadlineMs)
+      )
+        throw this.accountDeadline();
+      const until = Math.min(scope.until, limits.deadlineMs ?? Infinity),
+        monotonicUntil = Math.min(
+          scope.monotonicUntil,
+          this.monotonicClock() + Math.max(0, until - this.clock()),
+        ),
+        admission = new AbortController(),
+        stop = () => admission.abort(scope.admission.signal.reason),
+        callerStop = () => admission.abort(limits.signal!.reason);
+      scope.admission.signal.addEventListener("abort", stop, { once: true });
+      limits.signal?.addEventListener("abort", callerStop, { once: true });
+      if (limits.signal?.aborted) callerStop();
+      if (scope.admission.signal.aborted) stop();
+      const timer = this.timers.setTimeout(
+        () => admission.abort(this.accountDeadline()),
+        Math.max(
+          0,
+          Math.min(
+            until - this.clock(),
+            monotonicUntil - this.monotonicClock(),
+          ),
+        ),
+      );
+      const earlier = supplementTail;
+      let release!: () => void;
+      const settled = new Promise<void>((resolve) => (release = resolve));
+      // An aborted queued caller may finish early, but cannot release a later
+      // caller past a still-running earlier child.
+      supplementTail = earlier.then(() => settled);
+      supplementQueued++;
+      let active = false;
+      try {
+        await this.abortable(earlier, admission.signal);
+        if (admission.signal.aborted) throw admission.signal.reason;
+        if (
+          closed ||
+          failed ||
+          reads < 1 ||
+          reading ||
+          this.clock() >= until ||
+          this.monotonicClock() >= monotonicUntil
+        )
+          throw costPlanUnavailable();
+        active = true;
+        supplementReading = true;
+        const value = await runSupplement(
+          work,
+          { ...limits, signal: admission.signal, deadlineMs: until },
+          monotonicUntil,
+        );
+        if (admission.signal.aborted) throw admission.signal.reason;
+        return value;
+      } catch (error) {
+        failed = true;
+        throw error;
+      } finally {
+        if (active) supplementReading = false;
+        supplementQueued--;
+        release();
+        this.timers.clearTimeout(timer);
+        scope.admission.signal.removeEventListener("abort", stop);
+        limits.signal?.removeEventListener("abort", callerStop);
+      }
+    };
     const window: PreparedAccountWindow = {
       mode: parent.childCount === 1 ? "cold" : "warm",
       expires_at: scope.until,
@@ -464,8 +552,9 @@ export class VenueReads {
       assertNextChildReady: () => {
         if (
           closed ||
-          reading ||
           failed ||
+          reading ||
+          supplementQueued > 0 ||
           reads !== 1 ||
           parent.childCount !== 2 ||
           scope.admission.signal.aborted ||
@@ -487,7 +576,9 @@ export class VenueReads {
       ) => {
         if (
           closed ||
+          failed ||
           reading ||
+          supplementQueued > 0 ||
           scope.admission.signal.aborted ||
           reads >= parent.childCount
         )
@@ -553,7 +644,9 @@ export class VenueReads {
         this.timers.clearTimeout(timer);
         scope.admission.signal.removeEventListener("abort", expired);
         scope.admission.abort(costPlanUnavailable());
-        parent.close(reads > 0 && !failed && !reading);
+        parent.close(
+          reads > 0 && !failed && !reading && supplementQueued === 0,
+        );
         if (scope.localInterest)
           this.budget.endObservationInterest(scope.localInterest);
         this.releaseFrame(scope);
