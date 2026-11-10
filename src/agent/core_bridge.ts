@@ -3845,7 +3845,7 @@ export async function startManagedCoreBridge(
     } catch (e) {
       res
         .status(e instanceof AgentError ? e.httpStatus : 503)
-        .json({ error: failure(e).error });
+        .json({ error: failure(e, { internalReadDiagnostics: true }).error });
     } finally {
       cancellation?.close();
       submitObservation?.close();

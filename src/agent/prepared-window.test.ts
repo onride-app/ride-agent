@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { VenueReads, type PreparedReadWindowOptions } from "./venue-reads.js";
+import {
+  VenueReads,
+  isPreparedBundleUnsupported,
+  type PreparedReadWindowOptions,
+} from "./venue-reads.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 import {
   coreFrameCoordinator,
@@ -70,7 +74,9 @@ class Time {
     return value;
   }
 }
-function fixture(options: { paid?: number } = {}) {
+function fixture(
+  options: { paid?: number; cold?: boolean; demand?: number } = {},
+) {
   const time = new Time(),
     owner = "a".repeat(64),
     frameOwner = "b".repeat(64),
@@ -83,7 +89,12 @@ function fixture(options: { paid?: number } = {}) {
     grant = true,
     generation = 1,
     dirty = false,
-    plan = { demand: 184, peaks: [164] },
+    plan: { demand: number; peaks: number[] } | null = options.cold
+      ? null
+      : {
+          demand: options.demand ?? 184,
+          peaks: [(options.demand ?? 184) - 20],
+        },
     cleanBarrier: Promise<void> | undefined;
   const coordinator = coreFrameCoordinator(
     "http://127.0.0.1:9999",
@@ -324,21 +335,76 @@ it("full900 bank allows audit84 then selected SourceFeed6 and preserves a fresh 
   assert.equal(f.budget.snapshot().used, 174);
 });
 
-it("a warm readonly single184 window keeps its learned mode and has only A plus its actual unused source credit, never B", async () => {
-  const f = fixture({ paid: 716 });
+it("cold readonly subtracts S120/H240 from the physical900 while keeping full hint1000 and one complete A trial540", async () => {
+  const f = fixture({ cold: true, paid: 0 });
+  const window = await f.prepare(undefined, f.time.at + 100000, {
+    purpose: "audit_source",
+    historySources: ["fixed"],
+  });
+  assert.equal(window.mode, "cold");
+  assert.equal(f.begins[0].weight, 900);
+  assert.equal(f.begins[0].mode, "cold_trial");
+  assert.equal(f.budget.snapshot().observation_reserved, 900);
+  await f.time.run(window.read(f.audit));
+  const { feed } = nativeSourceFeed(f);
+  await f.time.run(feed.read("one", (work) => window.supplement(work)));
+  await f.time.run(
+    window.history(
+      "fixed",
+      () =>
+        f.reads.read(
+          "https://api.hyperliquid.xyz/info",
+          { type: "userFillsByTime", user: "fixed" },
+          0,
+          "source",
+        ),
+      () => {},
+    ),
+  );
+  assert.equal(f.budget.snapshot().used, 106);
+  assert.equal(f.bank().dirty, false);
+  assert.throws(() => window.assertNextChildReady());
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+it("known A cannot be truncated to fit S/H and a cold residual under120 is unsupported before any booking", async () => {
+  for (const options of [
+    { demand: 600, historySources: ["fixed"] },
+    { cold: true, historySources: ["one", "two", "three"] },
+  ]) {
+    const f = fixture({ paid: 0, ...options });
+    await assert.rejects(
+      f.prepare(undefined, f.time.at + 100000, {
+        purpose: "audit_source",
+        historySources: options.historySources,
+      }),
+      (error) => isPreparedBundleUnsupported(error),
+    );
+    assert.equal(f.begins.length, 0);
+    assert.equal(f.contexts.length, 0);
+    assert.equal(f.bank().dirty, false);
+    await f.reads.drainAccounts();
+    assert.equal(f.time.events.size, 0);
+  }
+});
+
+it("a warm readonly A184/S120 window keeps its learned mode and has independent source credit, never B", async () => {
+  const f = fixture({ paid: 596 });
   const window = await f.prepare(undefined, f.time.at + 100000, {
     purpose: "audit_source",
   });
   assert.equal(window.mode, "warm");
   assert.equal(window.purpose, "audit_source");
-  assert.equal(f.begins[0].weight, 184);
+  assert.equal(f.begins[0].weight, 304);
   assert.equal(f.bank().used, 900);
   await f.time.run(window.read(f.audit));
   const { feed } = nativeSourceFeed(f);
   for (const id of ["one", "two", "three"])
     await f.time.run(feed.read(id, (work) => window.supplement(work)));
-  assert.equal(f.bank().paid, 806);
-  assert.equal(f.bank().held, 94);
+  assert.equal(f.bank().paid, 686);
+  assert.equal(f.bank().held, 214);
   assert.equal(f.bank().dirty, false);
   assert.throws(() => window.assertNextChildReady());
   await assert.rejects(window.read(f.audit));
@@ -350,19 +416,23 @@ it("a warm readonly single184 window keeps its learned mode and has only A plus 
   assert.equal(f.time.events.size, 0);
 });
 
-it("a full900 readonly304 window isolates H120 from A184 and source surplus, and rejects a second history page before dispatch", async () => {
-  const f = fixture({ paid: 596 });
+it("a full900 readonly544 window isolates S120 and H240 from A184 and rejects history beyond its own remaining credit", async () => {
+  const f = fixture({ paid: 356 });
   const window = await f.prepare(undefined, f.time.at + 100000, {
     purpose: "audit_source",
     historySources: ["fixed"],
   });
   assert.equal(window.mode, "warm");
-  assert.equal(f.begins[0].weight, 304);
+  assert.equal(f.begins[0].weight, 544);
   await f.time.run(window.read(f.audit));
   const { feed } = nativeSourceFeed(f);
   for (const id of ["one", "two", "three"])
     await f.time.run(feed.read(id, (work) => window.supplement(work)));
-  assert.equal(f.bank().held, 214, "A's remaining94 plus untouched H120");
+  assert.equal(
+    f.bank().held,
+    454,
+    "unused A100, remaining S114 and untouched H240",
+  );
   const payload = {
     type: "userFillsByTime",
     user: "fixed",
@@ -379,8 +449,22 @@ it("a full900 readonly304 window isolates H120 from A184 and source surplus, and
       guard,
     ),
   );
-  assert.equal(f.bank().paid, 706);
-  assert.equal(f.bank().held, 194);
+  assert.equal(f.bank().paid, 466);
+  assert.equal(f.bank().held, 434);
+  for (let page = 1; page < 7; page++)
+    await f.time.run(
+      window.history(
+        "fixed",
+        () =>
+          f.reads.read(
+            "https://api.hyperliquid.xyz/info",
+            payload,
+            0,
+            "source",
+          ),
+        guard,
+      ),
+    );
   const before = f.contexts.length;
   await assert.rejects(
     f.time.run(
@@ -400,9 +484,9 @@ it("a full900 readonly304 window isolates H120 from A184 and source surplus, and
   assert.equal(
     f.contexts.length,
     before,
-    "remaining H100 cannot dispatch conservative120",
+    "remaining H100 cannot dispatch conservative120 or borrow S",
   );
-  assert.equal(f.budget.snapshot().used, 110);
+  assert.equal(f.budget.snapshot().used, 230);
   assert.equal(
     f.bank().dirty,
     false,
@@ -417,7 +501,7 @@ it("a full900 readonly304 window isolates H120 from A184 and source surplus, and
 
 it("history credit rejects other methods, accounts and undeclared sources without spending A or H", async () => {
   for (const wrong of ["method", "account", "source"]) {
-    const f = fixture({ paid: 596 });
+    const f = fixture({ paid: 356 });
     const window = await f.prepare(undefined, f.time.at + 100000, {
       purpose: "audit_source",
       historySources: ["fixed"],
@@ -456,7 +540,7 @@ it("history credit rejects other methods, accounts and undeclared sources withou
 });
 
 it("readonly history and source share the same serialized queue, with H refunds excluded from source credit", async () => {
-  const f = fixture({ paid: 596 }),
+  const f = fixture({ paid: 356 }),
     window = await f.prepare(undefined, f.time.at + 100000, {
       purpose: "audit_source",
       historySources: ["fixed"],
@@ -494,7 +578,7 @@ it("readonly history and source share the same serialized queue, with H refunds 
   await f.time.run(Promise.all([history, source]));
   assert.equal(sourceStarted, true);
   assert.equal(f.budget.snapshot().used, 106);
-  // Source may spend its original remaining98, but not the H100 refund.
+  // Source has its independent remaining118, but cannot borrow the H220 refund.
   await assert.rejects(
     f.time.run(
       window.supplement(() =>
@@ -515,7 +599,7 @@ it("readonly history and source share the same serialized queue, with H refunds 
 });
 
 it("readonly H keeps the parent's original20s expiry, real sent120 and completed A plan through a timeout", async () => {
-  const f = fixture({ paid: 596 }),
+  const f = fixture({ paid: 356 }),
     window = await f.prepare(undefined, f.time.at + 100000, {
       purpose: "audit_source",
       historySources: ["fixed"],

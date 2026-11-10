@@ -286,14 +286,22 @@ it("readonly clearing of a blocker cannot create an increase until a later compl
 });
 
 for (const route of ["pending", "unsupported"] as const)
-  it(`readonly ${route} fallback clears a fresh blocker without materializing an increase`, async (t) => {
+  it(`readonly ${route} keeps the source barrier appropriate without materializing an increase`, async (t) => {
     const f = await fixture(t);
     await f.tick();
+    const before = await f.read(),
+      sourceReadsBefore = f.adapter.sources;
     f.adapter.changed = false;
     if (route === "pending") f.adapter.pending = true;
     else f.adapter.unsupportedReadonly = true;
     await f.tick();
-    assert.equal((await f.read()).target_blocker, undefined);
+    if (route === "pending") {
+      assert.deepEqual((await f.read()).target_blocker, before.target_blocker);
+      assert.equal(f.adapter.sources, sourceReadsBefore);
+    } else {
+      assert.equal((await f.read()).target_blocker, undefined);
+      assert.ok(f.adapter.sources > sourceReadsBefore);
+    }
     assert.equal((await f.read()).executions.length, 0);
     assert.equal(f.adapter.prepares, 0);
     assert.equal(f.adapter.submitted.length, 0);
@@ -505,10 +513,21 @@ it("an unacknowledged readonly release stays read-only on the next Fixed callbac
 it("a failed readonly pending cancellation is confirmed on a later callback before normal paired execution resumes", async (t) => {
   const f = await fixture(t);
   await f.tick();
+  const pendingRevision = (await f.read()).revision;
+  // A metadata edit invalidates the original pending scope and requires its
+  // exact cancellation. An unchanged pending scope now defers source planning.
+  await f.repository.transact(USER, async (state) => {
+    state.portfolios[0].revision++;
+  });
   f.adapter.pending = true;
   f.adapter.cleanupFails = true;
   f.adapter.changed = false;
   await f.tick();
+  assert.ok(
+    f.adapter.cancelled.some(
+      (p) => p.purpose === "audit_source" && p.revision === pendingRevision,
+    ),
+  );
   assert.equal((await f.read()).target_blocker, undefined);
   assert.equal((await f.read()).executions.length, 0);
   f.adapter.pending = false;

@@ -1,5 +1,7 @@
 # Prepared Perps read windows
 
+> R51 historical design and release evidence: its readonly A-unused S and H120 descriptions are superseded in the R52 candidate by [independent readonly A/S/H resource pools](readonly-resource-progress-20261110.md). The default financial `audit_submit` A-unused behavior remains unchanged. Read the new document for current candidate limits; neither document proves a particular runtime or financial acceptance.
+
 This change is a local implementation and test result. It does not establish a deployed revision or successful natural trading.
 
 The ordinary Runner previously completed its financial audit, created new execution IDs, and then queued a separate complete account read for each new execution. A valid account audit does not guarantee that the next read can enter the same full sliding window within its original 20 seconds. Read admission failures could therefore create new uncertain execution IDs without reaching the financial Core outbox.

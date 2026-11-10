@@ -428,6 +428,8 @@ for (const cleanupFails of [false, true])
     assert.equal(f.adapter.cancelled.length, 1);
     assert.equal((await f.read()).target_blocker?.code, "ASSET_CONCENTRATION");
     assert.equal(f.adapter.cancelled[0].id, (await f.read()).id);
+    const sourceReadsBefore = f.adapter.sources;
+    const blockerBefore = (await f.read()).target_blocker;
     await f.tick();
     assert.equal(
       f.adapter.pairedWindows,
@@ -441,6 +443,9 @@ for (const cleanupFails of [false, true])
     );
     assert.equal(f.adapter.cancelled.length, cleanupFails ? 2 : 1);
     assert.equal(f.adapter.accounts, 3);
-    assert.equal(f.adapter.sources, 9);
+    assert.equal(f.adapter.sources, cleanupFails ? 9 : 6);
+    assert.equal(f.adapter.sources - sourceReadsBefore, cleanupFails ? 3 : 0);
+    if (!cleanupFails)
+      assert.deepEqual((await f.read()).target_blocker, blockerBefore);
     assert.equal((await f.read()).executions.length, 0);
   });

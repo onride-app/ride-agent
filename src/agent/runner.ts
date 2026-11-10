@@ -108,6 +108,42 @@ function ownedReductionAllocations(
   return total.eq(delta) ? allocations : null;
 }
 
+// A same-callback capability for a freshly audited owned-only reduction while
+// source planning waits. Any authority, risk, diagnostic or execution change
+// invalidates the attention exception; it is never restored from durable state.
+function pendingReductionBinding(p: Portfolio, e: Execution): string {
+  return fingerprint({
+    request: e,
+    portfolio: p.id,
+    revision: p.revision,
+    control: p.control_id,
+    account: p.venue_accounts?.perps ?? p.account_id,
+    state: p.state,
+    loss_latched: p.loss_latched,
+    reconciliation: p.reconciliation,
+    preferences: p.preferences,
+    last_error: p.last_error,
+    source_read_error: p.source_read_error,
+    target_blocker: p.target_blocker,
+    handoffs: p.manual_ledger?.transfers.map((t) => t.handoff) ?? [],
+    snapshot: {
+      account: p.snapshot?.account_id,
+      observed_at: p.snapshot?.observed_at,
+      position: p.snapshot?.positions[e.key] ?? "0",
+      eligible: p.snapshot?.eligible,
+      dedicated: p.snapshot?.dedicated,
+      coverage_complete: p.snapshot?.coverage_complete,
+    },
+    ownership: p.sleeves.map((s) => ({
+      copy: s.copy_id,
+      state: s.state,
+      lot: s.lots[e.key],
+      intent: s.intents[e.key],
+    })),
+    matchingExecutionCount: p.executions.filter((x) => x.id === e.id).length,
+  });
+}
+
 function preparationCandidate(state: State): PreparedPortfolioInput | null {
   const active = state.portfolios.filter((p) => p.state !== "closed");
   if (active.length !== 1) return null;
@@ -157,6 +193,7 @@ type TickAdmission =
       expected?: PreparedPortfolioInput;
       releaseUnconfirmed?: true;
       releaseError?: unknown;
+      deferSourcePlanning?: true;
     }
   | {
       kind: "prepared";
@@ -259,6 +296,7 @@ export class AgentRunner {
         this.pendingPreparations.delete(user);
     };
     let entered = false;
+    let deferSourcePlanning = false;
     try {
       const result = await adapter.withPreparedPortfolio(
         user,
@@ -328,6 +366,8 @@ export class AgentRunner {
           ? this.tickBody(user, { kind: "discover", expected: candidate })
           : this.tickBody(user);
       }
+      deferSourcePlanning =
+        result.state === "pending" && candidate.purpose === "audit_source";
     } catch (error) {
       // Never rerun a callback that may already have committed its one ID or
       // entered the original financial path. Only the first-state gate can
@@ -336,7 +376,11 @@ export class AgentRunner {
     }
     // Pending preparation must still run existing audits, controls, recovery
     // and notifications, while eligible new targets remain unmaterialized.
-    await this.tickBody(user, { kind: "discover", expected: candidate });
+    await this.tickBody(user, {
+      kind: "discover",
+      expected: candidate,
+      ...(deferSourcePlanning ? { deferSourcePlanning: true as const } : {}),
+    });
   }
   private async tickBody(
     user: string,
@@ -344,6 +388,8 @@ export class AgentRunner {
   ): Promise<void> {
     const { repository, adapter } = this.service;
     const createdPreparedIds = new Set<string>();
+    const createdPendingReductions = new Map<string, string>();
+    const deferredSourcePortfolios = new Set<string>();
     let attemptedPendingCancellation = false;
     let preparedInterrupted =
       admission.kind === "discover" && admission.releaseUnconfirmed === true;
@@ -440,6 +486,15 @@ export class AgentRunner {
           const selected = preparationCandidate(state);
           if (selected?.purpose === "audit_source")
             auditSourceOnly.set(selected.id, selected);
+          if (
+            admission.kind === "discover" &&
+            admission.deferSourcePlanning &&
+            selected?.purpose === "audit_source" &&
+            admission.expected?.purpose === "audit_source" &&
+            preparedOperationalBinding(selected) ===
+              preparedOperationalBinding(admission.expected)
+          )
+            deferredSourcePortfolios.add(selected.id);
         }
         if (phase === "audit_control" && admission.kind === "prepared") {
           const current = preparationCandidate(state);
@@ -537,7 +592,11 @@ export class AgentRunner {
         // This uses persisted error data, so a runner restart cannot bypass
         // the delay. Durable submission reconciliation below still runs.
         if (venueReadRetryPending(p)) continue;
-        if (admission.kind !== "prepared" && !sourceReadRetryPending(p))
+        if (
+          admission.kind !== "prepared" &&
+          !deferredSourcePortfolios.has(p.id) &&
+          !sourceReadRetryPending(p)
+        )
           prefetches.set(p.id, startSources(p));
         let auditComplete = false;
         try {
@@ -869,6 +928,7 @@ export class AgentRunner {
           ReturnType<typeof adapter.source>
         >();
         const plannedSources: SourceSnapshot[] = [];
+        const sourcePlanningDeferred = deferredSourcePortfolios.has(p.id);
         const getSources = () => (sources ??= startSources(p));
         const publicFailures = new Set<unknown>();
         let replayedSourceError: MonitorError | undefined;
@@ -943,10 +1003,11 @@ export class AgentRunner {
               "Account evidence expired before source planning.",
               true,
             );
-          if (!sourceReadRetryPending(p)) p.source_read_error = undefined;
+          if (!sourcePlanningDeferred && !sourceReadRetryPending(p))
+            p.source_read_error = undefined;
           const profit = pnl(p);
           const plannedChanges = new Map<string, Sleeve>();
-          for (const s of p.sleeves) {
+          for (const s of sourcePlanningDeferred ? [] : p.sleeves) {
             if (["closed", "closing", "loss_triggered"].includes(s.state))
               continue;
             const reviewRetryAt = s.review_retry_at;
@@ -1466,10 +1527,12 @@ export class AgentRunner {
             plannedChanges.set(s.copy_id, t);
           }
           assertReadonlyPlanFresh(plannedSources);
-          p.last_error = undefined;
-          if (p.state === "attention")
-            p.state = p.loss_latched ? "loss_triggered" : "active";
-          let sourceUpdateBlocked = false;
+          if (!sourcePlanningDeferred) {
+            p.last_error = undefined;
+            if (p.state === "attention")
+              p.state = p.loss_latched ? "loss_triggered" : "active";
+          }
+          let sourceUpdateBlocked = sourcePlanningDeferred;
           if (plannedChanges.size) {
             const basket = structuredClone(p);
             for (const sleeve of basket.sleeves) {
@@ -1491,7 +1554,7 @@ export class AgentRunner {
                 eventOnce(state, error.code, p.id, error.message);
               } else throw error;
             }
-          } else {
+          } else if (!sourcePlanningDeferred) {
             // No proposed source update remains blocked in this planning pass.
             p.target_blocker = undefined;
           }
@@ -1733,6 +1796,17 @@ export class AgentRunner {
             preparation?.bind(execution);
             p.executions.push(execution);
             if (prepared) createdPreparedIds.add(id);
+            if (
+              sourcePlanningDeferred &&
+              reduction &&
+              !preparedReleaseFailed &&
+              p.state === "attention" &&
+              !p.loss_latched
+            )
+              createdPendingReductions.set(
+                id,
+                pendingReductionBinding(p, execution),
+              );
           }
           for (const s of p.sleeves.filter((s) =>
             ["wind_down", "risk_off", "closing", "loss_triggered"].includes(
@@ -1786,7 +1860,10 @@ export class AgentRunner {
             )
               proposal.status = "completed";
           }
-          if (p.state === "closed" || !sourceReadRetryPending(p))
+          if (
+            p.state === "closed" ||
+            (!sourcePlanningDeferred && !sourceReadRetryPending(p))
+          )
             p.source_read_error = undefined;
         } catch (e) {
           if (readonlyStale && readonlyBefore) {
@@ -1904,9 +1981,32 @@ export class AgentRunner {
                 }
                 continue;
               }
+              const pendingReduction = createdPendingReductions.get(e.id);
+              const verifiedPendingReduction =
+                pendingReduction !== undefined &&
+                pendingReduction === pendingReductionBinding(p, e) &&
+                e.status === "queued" &&
+                e.task_id === null &&
+                !!p.snapshot &&
+                fresh(p.snapshot.observed_at) &&
+                state.portfolios.every((portfolio) =>
+                  portfolio.executions.every(
+                    (other) =>
+                      ["completed", "failed", "superseded"].includes(
+                        other.status,
+                      ) ||
+                      (other.status === "queued" &&
+                        other.task_id === null &&
+                        createdPendingReductions.get(other.id) ===
+                          pendingReductionBinding(portfolio, other)),
+                  ),
+                );
               if (
                 e.status === "queued" &&
-                (e.revision !== p.revision || p.state === "attention")
+                (e.revision !== p.revision ||
+                  (pendingReduction !== undefined &&
+                    !verifiedPendingReduction) ||
+                  (p.state === "attention" && !verifiedPendingReduction))
               ) {
                 e.status = "superseded";
                 continue;
