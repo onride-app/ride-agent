@@ -29,6 +29,11 @@ export interface ObservationPlanStore {
     plan: ObservationCostPlan,
     signal: AbortSignal,
   ): Promise<boolean>;
+  /** Internal owned-lease cleanup only; never a completeness publication. */
+  returnUnsent?(
+    lease: ObservationPlanLease,
+    signal: AbortSignal,
+  ): Promise<boolean>;
 }
 
 export function validObservationCostPlan(
@@ -72,6 +77,19 @@ export function costPlanUnavailable() {
 
 /** Operational admission metadata only. Never financial evidence or fee credit. */
 export class AccountObservationPlans implements ObservationPlanStore {
+  private readonly unsentLeases = new WeakMap<
+    ObservationPlanLease,
+    {
+      owner: string;
+      generation: string;
+      plan: ObservationCostPlan;
+      remainingTtlMs: number;
+      learnedStamp: string;
+      leaseStamp: string;
+      monotonicUntil: number;
+      used: boolean;
+    }
+  >();
   constructor(private readonly pool: Pick<pg.Pool, "connect">) {}
 
   private async transaction<T>(
@@ -161,11 +179,20 @@ export class AccountObservationPlans implements ObservationPlanStore {
   private async locked(
     client: pg.PoolClient,
     owner: string,
-  ): Promise<ObservationPlanHint & { busy: boolean; currentMs: number }> {
+  ): Promise<
+    ObservationPlanHint & {
+      busy: boolean;
+      currentMs: number;
+      learnedStamp?: string;
+      leaseStamp?: string;
+    }
+  > {
     const result = await client.query(
       `WITH locked AS MATERIALIZED (SELECT contract,generation::text,dirty,demand,peaks,
       floor(extract(epoch FROM learned_at)*1000)::text AS learned_ms,
-      floor(extract(epoch FROM lease_until)*1000)::text AS lease_ms
+      floor(extract(epoch FROM lease_until)*1000)::text AS lease_ms,
+      to_char(learned_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS learned_stamp,
+      to_char(lease_until AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS lease_stamp
       FROM ride_agent_account_cost_plans WHERE owner_key=$1 FOR UPDATE)
       SELECT locked.*,floor(extract(epoch FROM clock_timestamp())*1000)::text AS current_ms FROM locked`,
       [owner],
@@ -217,6 +244,8 @@ export class AccountObservationPlans implements ObservationPlanStore {
       remainingTtlMs: plan ? ACCOUNT_OBSERVATION_PLAN_TTL_MS - age : 0,
       busy: row.dirty === true && millis(row.lease_ms) > current,
       currentMs: current,
+      learnedStamp: row.learned_stamp,
+      leaseStamp: row.lease_stamp,
     };
   }
 
@@ -226,6 +255,8 @@ export class AccountObservationPlans implements ObservationPlanStore {
       const {
         busy,
         currentMs: _current,
+        learnedStamp: _learned,
+        leaseStamp: _lease,
         ...hint
       } = await this.locked(client, owner);
       if (busy) throw costPlanUnavailable();
@@ -248,7 +279,15 @@ export class AccountObservationPlans implements ObservationPlanStore {
     )
       throw costPlanUnavailable();
     const started = performance.now();
-    return this.transaction(signal, async (client) => {
+    let prior:
+      | {
+          plan: ObservationCostPlan;
+          learnedStamp: string;
+          leaseStamp: string;
+          monotonicUntil: number;
+        }
+      | undefined;
+    const lease = await this.transaction(signal, async (client) => {
       if (typeof expected?.generation !== "string")
         await client.query(
           `INSERT INTO ride_agent_account_cost_plans (owner_key,contract) VALUES($1,$2) ON CONFLICT DO NOTHING`,
@@ -270,18 +309,101 @@ export class AccountObservationPlans implements ObservationPlanStore {
       if (leaseMs <= 0) throw costPlanUnavailable();
       const dirty = await client.query(
         `UPDATE ride_agent_account_cost_plans SET contract=$2,generation=generation+1,dirty=true,
-        lease_until=to_timestamp($3::double precision/1000) WHERE owner_key=$1 RETURNING generation::text`,
+        lease_until=to_timestamp($3::double precision/1000) WHERE owner_key=$1
+        RETURNING generation::text,
+        to_char(lease_until AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS lease_stamp`,
         [owner, ACCOUNT_OBSERVATION_COST_CONTRACT, current.currentMs + leaseMs],
       );
       const generation = dirty.rows[0]?.generation;
       if (typeof generation !== "string" || !/^[1-9][0-9]*$/.test(generation))
         throw costPlanUnavailable();
+      const stamp = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/;
+      if (
+        current.plan &&
+        typeof current.learnedStamp === "string" &&
+        stamp.test(current.learnedStamp) &&
+        typeof dirty.rows[0]?.lease_stamp === "string" &&
+        stamp.test(dirty.rows[0].lease_stamp)
+      )
+        prior = {
+          plan: structuredClone(current.plan),
+          learnedStamp: current.learnedStamp,
+          leaseStamp: dirty.rows[0].lease_stamp,
+          monotonicUntil:
+            started + Math.min(maximumLeaseMs, current.remainingTtlMs),
+        };
       return {
         owner,
         generation,
         plan: current.plan,
         remainingTtlMs: current.remainingTtlMs,
       };
+    });
+    // No capability exists when COMMIT fails or its result is ambiguous.
+    if (prior)
+      this.unsentLeases.set(lease, {
+        owner: lease.owner,
+        generation: lease.generation,
+        plan: prior.plan,
+        remainingTtlMs: lease.remainingTtlMs,
+        learnedStamp: prior.learnedStamp,
+        leaseStamp: prior.leaseStamp,
+        used: false,
+        monotonicUntil: prior.monotonicUntil,
+      });
+    return lease;
+  }
+
+  async returnUnsent(
+    lease: ObservationPlanLease,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const original = this.unsentLeases.get(lease);
+    if (!original || original.used) return false;
+    original.used = true;
+    const remaining = Math.floor(original.monotonicUntil - performance.now());
+    if (
+      remaining <= 0 ||
+      signal.aborted ||
+      lease.owner !== original.owner ||
+      lease.generation !== original.generation ||
+      lease.remainingTtlMs !== original.remainingTtlMs ||
+      JSON.stringify(lease.plan) !== JSON.stringify(original.plan)
+    )
+      return false;
+    const bounded = AbortSignal.any([signal, AbortSignal.timeout(remaining)]);
+    return this.transaction(bounded, async (client) => {
+      const current = await this.locked(client, original.owner);
+      if (
+        bounded.aborted ||
+        performance.now() >= original.monotonicUntil ||
+        !current.busy ||
+        current.generation !== original.generation ||
+        current.learnedStamp !== original.learnedStamp ||
+        current.leaseStamp !== original.leaseStamp
+      )
+        return false;
+      const result = await client.query(
+        `UPDATE ride_agent_account_cost_plans
+        SET dirty=false,lease_until=NULL
+        WHERE owner_key=$1 AND contract=$2 AND generation=$3::bigint AND dirty=true
+        AND demand=$4 AND peaks=$5::jsonb
+        AND to_char(learned_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')=$6
+        AND to_char(lease_until AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"')=$7
+        AND learned_at<=clock_timestamp()
+        AND learned_at>clock_timestamp()-INTERVAL '600 seconds'
+        AND lease_until>clock_timestamp() RETURNING owner_key`,
+        [
+          original.owner,
+          ACCOUNT_OBSERVATION_COST_CONTRACT,
+          original.generation,
+          original.plan.demand,
+          JSON.stringify(original.plan.peaks),
+          original.learnedStamp,
+          original.leaseStamp,
+        ],
+      );
+      return result.rows.length === 1;
     });
   }
 
