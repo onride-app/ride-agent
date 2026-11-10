@@ -81,6 +81,45 @@ class Time {
     return value;
   }
 }
+
+// Real loopback HTTP keeps its real20s cancellation. A timer yield may take
+// more than1ms on a loaded host; keep the fixture's elapsed clock on that same
+// timeline instead of counting yields as milliseconds.
+function elapsedIoClock(time: Time, clock = () => performance.now()) {
+  const started = clock(),
+    initial = time.at;
+  return () =>
+    time.advance(
+      Math.max(0, Math.floor(clock() - started) - (time.at - initial)),
+    );
+}
+
+it("4ms I/O wakes preserve the original5s backoff before real20s HTTP cancellation without counting wakes as milliseconds", async () => {
+  for (const aligned of [false, true]) {
+    const time = new Time();
+    let realElapsed = 0,
+      fresh = false,
+      cancelled = false;
+    const sync = elapsedIoClock(time, () => realElapsed);
+    time.timers.setTimeout(() => {
+      fresh = true;
+    }, 5000);
+    // Deterministic scheduler model: Linux may deliver a requested1ms yield
+    // every4ms. The unchanged real HTTP timer wins at20s if backoff is not due.
+    while (!fresh) {
+      realElapsed += 4;
+      if (realElapsed >= 20000) {
+        cancelled = true;
+        break;
+      }
+      await (aligned ? sync() : time.advance(1));
+    }
+    assert.equal(cancelled, !aligned);
+    assert.equal(fresh, aligned);
+    assert.equal(time.at - 1793200000000, aligned ? 5000 : 4999);
+    assert.equal(realElapsed, aligned ? 5000 : 20000);
+  }
+});
 async function fixture(
   t: TestContext,
   options: {
@@ -1015,6 +1054,7 @@ for (const { threeSources, existingSourceBackoff } of [
       );
       closeRunner = () => runner.closeNotifications();
       async function drive<T>(work: Promise<T>) {
+        const sync = elapsedIoClock(f.time);
         let done = false,
           value!: T,
           error: unknown;
@@ -1029,7 +1069,7 @@ for (const { threeSources, existingSourceBackoff } of [
           },
         );
         for (let n = 0; !done && n < 25000; n++) {
-          await f.time.advance(1);
+          await sync();
           await new Promise<void>((r) => setTimeout(r, 1));
         }
         assert.equal(
