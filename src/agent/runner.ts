@@ -115,6 +115,10 @@ function preparationCandidate(state: State): PreparedPortfolioInput | null {
     !(p.venue_accounts?.perps ?? p.account_id) ||
     !p.ledger_started_at ||
     p.loss_latched ||
+    // A rejected source proposal needs ordinary audit/source/risk progress,
+    // not paired capacity for a new increase. This is only a routing hint;
+    // the next complete planning pass still revalidates and clears blockers.
+    p.target_blocker != null ||
     !["active", "attention"].includes(p.state) ||
     p.sleeves.length === 0 ||
     p.sleeves.some(

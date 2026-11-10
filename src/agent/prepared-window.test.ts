@@ -598,6 +598,112 @@ function nativeSourceFeed(f: ReturnType<typeof fixture>) {
   return { feed, identities };
 }
 
+it("registered retry groups keep the actual parent signal after registration returns, and close or drain synchronously removes every capability", async () => {
+  for (const drain of [false, true]) {
+    const f = fixture(),
+      window = await f.prepare();
+    await f.time.run(window.read(f.audit));
+    const { feed, identities } = nativeSourceFeed(f);
+    await assert.rejects(f.time.run(feed.read("one")), {
+      code: "VENUE_READ_BUDGET_EXHAUSTED",
+    });
+    const limits = window.sourceRetryLimits();
+    const selected = {
+      id: "one",
+      validate: () => {
+        window.sourceRetryLimits();
+      },
+      onDemand: (work: () => Promise<any>) => window.supplement(work),
+    };
+    const dispose = feed.registerPreparedSources([selected], limits);
+    assert.equal((feed as any).preparedRetryCount, 1);
+    // This local call has returned; the group's signal is still parent owned.
+    await window.readSource(async () => "registered");
+    const work = window.readSource((caller) =>
+      feed.readPrepared("one", selected.onDemand, caller, selected.validate),
+    );
+    const rejected = assert.rejects(work);
+    await flush();
+    assert.equal(identities.length, 1);
+    const closing = drain ? f.reads.drainAccounts() : window.close();
+    assert.equal(limits.signal.aborted, true);
+    assert.equal((feed as any).preparedRetryCount, 0);
+    await closing;
+    await rejected;
+    await f.time.advance(5001);
+    await f.time.run(feed.pollOnce());
+    assert.equal(
+      f.contexts.at(-1)?.frame_id,
+      undefined,
+      "later background work cannot retain a dead parent's S wrapper",
+    );
+    assert.equal(f.budget.snapshot().used, 86);
+    dispose();
+    feed.close();
+    await f.reads.drainAccounts();
+    assert.equal(f.time.events.size, 0);
+  }
+});
+
+it("aborting a prepared source waiter after dispatch preserves true unknown debt and never transfers its supplemental credit", async () => {
+  const f = fixture(),
+    window = await f.prepare();
+  await f.time.run(window.read(f.audit));
+  const feed = new SourceFeed(
+    async () => {
+      const evidence = await f.reads.readWithEvidence(
+        "https://api.hyperliquid.xyz/info",
+        { type: "userFunding", user: "source" },
+        0,
+        "source",
+      );
+      return {
+        observed_at: evidence.observed_at,
+        revision: "same",
+        account_value_usdc: "1",
+        positions: [],
+        complete: true,
+      };
+    },
+    {
+      clock: f.time.clock,
+      timers: { setInterval: () => 1, clearInterval: () => {} },
+    },
+  );
+  const caller = new AbortController();
+  f.hang(true);
+  const work = window.readSource(
+    (limits) =>
+      feed.readPrepared(
+        "one",
+        (read) => window.supplement(read),
+        limits,
+        () => {
+          window.sourceRetryLimits();
+        },
+      ),
+    { signal: caller.signal },
+  );
+  const rejected = assert.rejects(work, /caller ended/);
+  await flush();
+  assert.equal(f.budget.snapshot().used, 184);
+  const sentContext = f.contexts.at(-1);
+  caller.abort(new Error("caller ended"));
+  await rejected;
+  assert.equal(f.budget.snapshot().used, 184);
+  assert.equal(f.contexts.at(-1), sentContext);
+  // The already-sent read retains its original12s settlement window. Cancelling
+  // only this caller neither refunds unknown cost nor sends another read.
+  await f.time.advance(12000);
+  assert.equal(f.budget.snapshot().used, 184);
+  assert.equal(f.budget.snapshot().quarantine_ms, 60000);
+  await assert.rejects(window.read(f.audit));
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+
 it("serializes the actual Runner source worker pool through SourceFeed at full900 without borrowing the second scope", async () => {
   const f = fixture(),
     window = await f.prepare();

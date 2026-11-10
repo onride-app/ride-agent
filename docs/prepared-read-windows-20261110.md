@@ -4,7 +4,7 @@ This change is a local implementation and test result. It does not establish a d
 
 The ordinary Runner previously completed its financial audit, created new execution IDs, and then queued a separate complete account read for each new execution. A valid account audit does not guarantee that the next read can enter the same full sliding window within its original 20 seconds. Read admission failures could therefore create new uncertain execution IDs without reaching the financial Core outbox.
 
-The optional prepared path applies only to one initialized, active Perps portfolio with no prior nonterminal executions. Other portfolios, mixed markets, fixed-copy source-fill pipelines, old queued/uncertain/outboxed work, managed risk exits, and unsupported transports retain their existing paths. A known single-scope hint above 450 and at most 900 is not eligible for a paired booking; the paired optimization returns unsupported before booking and the normal complete-read path remains available. A larger single-scope demand is never clamped into the existing fleet capacity.
+The optional prepared path applies only to one initialized, active Perps portfolio with no prior nonterminal executions or saved target-blocker hint. A saved blocker selects the ordinary complete audit, source and risk path. It provides no financial authority: a successful fresh plan clears it and a later normal tick may prepare a pair again. Other portfolios, mixed markets, fixed-copy source-fill pipelines, old queued/uncertain/outboxed work, managed risk exits, and unsupported transports retain their existing paths. A known single-scope hint above 450 and at most 900 is not eligible for a paired booking; the paired optimization returns unsupported before booking and the normal complete-read path remains available. A larger single-scope demand is never clamped into the existing fleet capacity.
 
 ## Sequence and authority
 
@@ -28,11 +28,19 @@ The registry is bounded to 64 entries. Pending creation is serialized before the
 
 SourceFeed retains its existing freshness, cache, single-flight, cooldown and background cadence. The supplemental context wraps only a newly started on-demand fetch. It does not wrap timer creation or adopt an already queued/background flight. A failure still respects ordinary backoff; it is not force-refreshed to obtain credit.
 
+A trusted prepared source read may wait for this feed's existing, verified unsent-budget backoff to end, within its original parent lifetime. After the first successful audit, the verified source selection may also register short-lived priority for already interested sources with such a failure. Registration creates no interest or provider request. At the existing retry time, a live reader or selection may supply its supplemental wrapper for the next normal new fetch, including a selected source not yet consumed by the two-worker collector. This prevents a background timer from repeatedly starting an unframed request ahead of already reserved source credit. Existing flights keep their original context; provider cooldowns, sent or unknown failures, source timestamps and fee accounting retain their original meaning. Each failure generation can select a wrapper once. Cancelled or expired readers release their waiting interest, and one call permits at most one normal retry after the existing backoff.
+
+The selection is bound to the actual saved failure record, selected trader and scope, and original parent signal and wall/monotonic deadlines. It is limited to64 live registrations; identical selected trader/scope entries are deduplicated and conflicting scopes fail closed. Parent close or drain removes its registrations synchronously. Another caller's cancellation cannot adopt or cancel a selected peer flight. An expired ordinary interest is not recreated by this registration. A source which cannot become genuinely fresh inside the existing window still rejects planning; this mechanism does not guarantee availability under arbitrary load or slow responses.
+
 ## Rejected source updates
 
 A proposed changed-source basket must pass the existing risk checks before replacing durable intents. If those checks reject it, retained old intents cannot authorize a new increase or an internal ownership transfer. Existing original-ID recovery and allowed owned reductions continue through their existing paths. The rejected proposal does not refresh the old source revision, frozen reference price or execution identity.
 
 The private first-submission diagnostic may classify the first failed source-position predicate with a fixed reason code. It retains the same five-field shape and no source values, account identifiers or response bodies. The predicate order, rejection message and risk limits remain unchanged; an already recorded diagnostic is never rewritten. These codes identify a rejection path and provide no acceptance, absence or retry authority.
+
+## Fairness wake boundary
+
+The shared local budget gives dependent reads a two-millisecond owner grace period. A candidate blocked by that grace records its original wake deadline. If the clock crosses the boundary before the scheduler installs its timer, the next pump still runs promptly and rechecks admission; it must not postpone that candidate until the full account/source turn expires. This changes scheduling only. Quota, protected capacity, cooldown, exclusive unknown-response holds, fees and caller deadlines remain authoritative.
 
 ## Validation scope
 
