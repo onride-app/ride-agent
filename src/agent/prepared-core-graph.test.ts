@@ -20,6 +20,7 @@ import {
 } from "./venue-read-transport.js";
 import { recommend, fingerprint, type Execution } from "./domain.js";
 import { candidate } from "./fixtures.js";
+import { AccountObservationPlans } from "./account-observation-plans.js";
 import { fromPlan } from "./service.js";
 import {
   preparedPortfolioInput,
@@ -1896,6 +1897,188 @@ for (const {
       );
     },
   );
+it(
+  "actual CoreBridge keeps a readonly pending544 episode across a fresh real-PG184 to164 generation and audits in local524",
+  {
+    skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL,
+    timeout: 30000,
+  },
+  async (t) => {
+    const f = await fixture(t, { unified: true, threeSources: true });
+    const fixed = f.p.sleeves[2];
+    fixed.copy_mode = "fixed";
+    fixed.fixed_last_fill_at = f.time.at - 10000;
+    f.resetBank(356);
+    const url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
+    assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
+    const admin = new pg.Pool({ connectionString: url.toString(), max: 2 });
+    const schema = "monotone_graph_" + randomUUID().replaceAll("-", "");
+    await admin.query("CREATE SCHEMA " + schema);
+    url.searchParams.set("options", "-c search_path=" + schema);
+    const pool = new pg.Pool({ connectionString: url.toString(), max: 2 });
+    t.after(async () => {
+      await pool.end();
+      await admin.query("DROP SCHEMA " + schema + " CASCADE");
+      await admin.end();
+    });
+    const plans = new AccountObservationPlans(pool);
+    await plans.migrate();
+    const compact = preparedPortfolioInput(f.p, "audit_source");
+    const owner = await f.b.preparedIdentity(graphUser, compact);
+    const signal = new AbortController().signal;
+    let lease = await plans.begin(owner, signal);
+    assert.equal(
+      await plans.complete(lease, { demand: 184, peaks: [164] }, signal),
+      true,
+    );
+    // The fixture keeps its real CoreBridge, VenueReads, Budget and factory;
+    // this replaces only its in-memory plan-store transport with actual PG.
+    f.b.venueReads.observationPlans = plans;
+    const prepare = () =>
+      f.bridge.operation("prepare_portfolio", {
+        user_id: graphUser,
+        portfolio: compact,
+      }) as Promise<any>;
+    f.pendingFrames(true);
+    assert.equal((await prepare()).state, "pending");
+    const original = structuredClone(f.begins[0]);
+    const entry = [...f.b.preparedEntries.values()][0] as any;
+    const originalHandle = entry.handle;
+    const before = await plans.read(owner, signal);
+    assert.equal(before.plan!.demand, 184);
+    assert.equal(f.reads.length, 0);
+    lease = await plans.begin(owner, signal, before);
+    assert.equal(
+      await plans.complete(
+        lease,
+        { demand: 164, peaks: [144, 144, 144] },
+        signal,
+      ),
+      true,
+    );
+    const current = await plans.read(owner, signal);
+    assert.notEqual(current.generation, before.generation);
+    assert.equal(current.plan!.demand, 164);
+    await f.time.advance(1000);
+    assert.equal((await prepare()).state, "pending");
+    assert.equal(f.b.preparedEntries.get(entry.key), entry);
+    assert.equal(entry.handle, originalHandle);
+    assert.deepEqual(f.begins[1], original);
+    assert.equal(f.events.includes("end"), false);
+    assert.equal(f.reads.length, 0);
+    const pendingRow = await pool.query(
+      "SELECT dirty,generation::text,demand FROM ride_agent_account_cost_plans WHERE owner_key=$1",
+      [owner],
+    );
+    assert.equal(pendingRow.rows[0].dirty, false);
+    assert.equal(pendingRow.rows[0].generation, current.generation);
+    f.pendingFrames(false);
+    const ready = await prepare();
+    assert.equal(ready.state, "ready");
+    assert.equal(ready.handle, originalHandle);
+    assert.equal(ready.purpose, "audit_source");
+    assert.equal(ready.execution_eligible, false);
+    assert.deepEqual(f.begins[2], original);
+    assert.equal(f.budget.snapshot().observation_reserved, 524);
+    assert.equal(f.bank().held, 544);
+    assert.equal(f.bank().held + f.bank().paid, 900);
+    const snapshot = (await f.bridge.operation(
+      "account",
+      {
+        user_id: graphUser,
+        portfolio: f.p,
+      },
+      undefined,
+      undefined,
+      ready.handle,
+    )) as any;
+    assert.equal(snapshot.coverage_complete, true);
+    assert.equal(snapshot.observed_at, f.time.at);
+    assert.equal(
+      f.reads.filter((row) =>
+        [
+          "userFillsByTime",
+          "userFunding",
+          "userNonFundingLedgerUpdates",
+        ].includes(row.type),
+      ).length,
+      3,
+    );
+    const after = await pool.query(
+      "SELECT dirty,generation::text FROM ride_agent_account_cost_plans WHERE owner_key=$1",
+      [owner],
+    );
+    assert.equal(after.rows[0].dirty, false);
+    assert.ok(Number(after.rows[0].generation) > Number(current.generation));
+    let fixedSource: any;
+    for (const sleeve of f.p.sleeves) {
+      const beforeSource = f.time.at;
+      const source = (await f.time.run(
+        f.bridge.operation(
+          "source",
+          {
+            trader_id: sleeve.trader.id,
+          },
+          undefined,
+          undefined,
+          ready.handle,
+        ),
+      )) as any;
+      assert.ok(
+        source.observed_at >= beforeSource && source.observed_at <= f.time.at,
+      );
+      assert.ok(f.time.at - source.observed_at <= 5000);
+      if (sleeve === fixed) fixedSource = source;
+    }
+    const history = (await f.time.run(
+      f.bridge.operation(
+        "source_fills",
+        {
+          trader_id: fixed.trader.id,
+          market: "perps",
+          start_at: fixed.fixed_last_fill_at,
+          end_at: fixedSource.observed_at,
+        },
+        undefined,
+        undefined,
+        ready.handle,
+      ),
+    )) as any;
+    assert.equal(history.complete, true);
+    assert.deepEqual(history.fills, []);
+    assert.equal(
+      f.bank().held - f.budget.snapshot().observation_reserved,
+      20,
+      "the extra original Core20 remains outside every current local pool",
+    );
+    await assert.rejects(
+      f.bridge.operation(
+        "prepare_execution",
+        {
+          user_id: graphUser,
+          portfolio: preparedProposalInput(f.p),
+          proposal: {},
+        },
+        undefined,
+        undefined,
+        ready.handle,
+      ),
+    );
+    assert.equal(f.p.executions.length, 0);
+    assert.equal(f.outboxes.size, 0);
+    assert.equal(f.bank().posts, 0);
+    await f.bridge.operation(
+      "finish_portfolio",
+      { user_id: graphUser },
+      undefined,
+      undefined,
+      ready.handle,
+    );
+    assert.equal(f.bank().held, 0);
+    assert.equal(f.events.filter((event) => event === "end").length, 1);
+  },
+);
+
 it("fixed copying preserves its ordinary full source-fill path without booking a paired window", async (t) => {
   const f = await fixture(t);
   f.p.sleeves[0].copy_mode = "fixed";

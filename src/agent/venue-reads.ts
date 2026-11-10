@@ -27,6 +27,23 @@ import {
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
+type ObservationFleetPlan = Readonly<{
+  fullDemand: number;
+  reservedWeight: number;
+  cold: boolean;
+  childLimit: number;
+  childCount: 1 | 2;
+  historySources: readonly string[];
+  supplements?: PreparedSupplementPlan;
+}>;
+type PendingPreparedBooking = {
+  readonly owner: string;
+  readonly frameOwner: string;
+  readonly purpose: "audit_submit" | "audit_source";
+  readonly firstDeadline: number;
+  readonly booked: ObservationFleetPlan;
+  latest: ObservationFleetPlan;
+};
 const unsupportedPreparedBundles = new WeakSet<AgentError>();
 export const isPreparedBundleUnsupported = (error: unknown): boolean =>
   error instanceof AgentError && unsupportedPreparedBundles.has(error);
@@ -207,6 +224,11 @@ export interface VenueReadOptions {
 export class VenueReads {
   private readonly preparedWindows = new Set<PreparedAccountWindow>();
   private readonly preparedOwners = new Set<string>();
+  private readonly preparingFrameOwners = new Set<string>();
+  private readonly pendingPreparedBookings = new WeakMap<
+    object,
+    PendingPreparedBooking
+  >();
   private flights = new Map<string, Promise<VenueReadEvidence>>();
   private cache = new Map<string, Entry>();
   private readonly budget: VenueReadBudget;
@@ -347,7 +369,40 @@ export class VenueReads {
   }
   async cancelPreparedPending(continuation: object): Promise<void> {
     if (!this.frameCoordinator?.cancelPending) throw costPlanUnavailable();
+    const booking = this.pendingPreparedBookings.get(continuation);
     await this.frameCoordinator.cancelPending(continuation);
+    if (this.pendingPreparedBookings.get(continuation) === booking)
+      this.pendingPreparedBookings.delete(continuation);
+  }
+  private pendingPlanFits(
+    current: ObservationFleetPlan,
+    prior: ObservationFleetPlan,
+  ): boolean {
+    if (
+      current.cold !== prior.cold ||
+      current.childCount !== prior.childCount ||
+      current.historySources.length !== prior.historySources.length ||
+      current.historySources.some(
+        (source, i) => source !== prior.historySources[i],
+      ) ||
+      current.supplements?.key !== prior.supplements?.key ||
+      !!current.supplements !== !!prior.supplements
+    )
+      return false;
+    const weights = (plan: ObservationFleetPlan) => [
+      plan.fullDemand,
+      plan.childLimit,
+      plan.supplements?.sourceWeight ?? 0,
+      ...plan.historySources.map(
+        (source) => plan.supplements?.historyWeights[source] ?? 120,
+      ),
+    ];
+    const before = weights(prior);
+    // Cold trials keep their exact existing identity. Only a valid learned
+    // demand may shrink, independently in each already-bound resource pool.
+    return weights(current).every((weight, i) =>
+      current.cold ? weight === before[i] : weight <= before[i],
+    );
   }
   async prepareAccountWindow(
     owner: string,
@@ -361,6 +416,7 @@ export class VenueReads {
       !this.frameCoordinator ||
       this.draining ||
       this.preparedWindows.size >= 64 ||
+      this.preparingFrameOwners.has(frameOwner) ||
       this.accountScope.getStore() ||
       !/^[0-9a-f]{64}$/.test(owner) ||
       !/^[0-9a-f]{64}$/.test(frameOwner) ||
@@ -372,6 +428,7 @@ export class VenueReads {
         options.purpose !== "audit_source")
     )
       throw costPlanUnavailable();
+    this.preparingFrameOwners.add(frameOwner);
     const scope: AccountReadScope = {
       id: ++this.accountSequence,
       owner,
@@ -410,6 +467,7 @@ export class VenueReads {
       )) as AccountReadBundle;
       if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
     } catch (error) {
+      this.preparingFrameOwners.delete(frameOwner);
       this.timers.clearTimeout(timer);
       callerSignal?.removeEventListener("abort", cancelled);
       scope.reservation?.close(false);
@@ -418,6 +476,7 @@ export class VenueReads {
       this.releaseFrame(scope);
       throw error;
     }
+    this.preparingFrameOwners.delete(frameOwner);
     callerSignal?.removeEventListener("abort", cancelled);
     this.preparedOwners.add(owner);
     let closed = false,
@@ -1221,17 +1280,7 @@ export class VenueReads {
         throw costPlanUnavailable();
       }
     }
-    let fleetPlan:
-      | {
-          fullDemand: number;
-          reservedWeight: number;
-          cold: boolean;
-          childLimit: number;
-          childCount: 1 | 2;
-          historySources: readonly string[];
-          supplements?: PreparedSupplementPlan;
-        }
-      | undefined;
+    let fleetPlan: ObservationFleetPlan | undefined;
     if (this.frameCoordinator) {
       // A busy local source ledger must not prevent polling or expiring an
       // already queued fleet reservation. This peek claims no local capacity
@@ -1314,23 +1363,76 @@ export class VenueReads {
           { retry_after_ms: 60000, reason_code: "READ_FRAME_CAPACITY" },
         );
       }
-      fleetPlan = {
+      fleetPlan = Object.freeze({
         ...hint,
         reservedWeight,
         childLimit,
         childCount,
-        historySources,
+        historySources: Object.freeze([...historySources]),
         supplements,
-      };
-      await this.reserveFrame(
-        scope,
-        {
-          weight: fleetPlan.reservedWeight,
-          mode: fleetPlan.cold ? "cold_trial" : "learned",
-        },
-        signal,
-        bundle?.continuation,
-      );
+      });
+      const continuation = bundle?.continuation;
+      const pending = continuation
+        ? this.pendingPreparedBookings.get(continuation)
+        : undefined;
+      if (continuation) {
+        if (
+          !pending ||
+          pending.owner !== scope.owner ||
+          pending.frameOwner !== scope.frameOwner ||
+          pending.purpose !== (bundle?.purpose ?? "audit_submit") ||
+          pending.firstDeadline !== scope.queueUntil ||
+          !this.pendingPlanFits(fleetPlan, pending.latest) ||
+          !this.pendingPlanFits(fleetPlan, pending.booked)
+        )
+          throw costPlanUnavailable();
+        pending.latest = fleetPlan;
+      }
+      // Core retains its original conservative booking/UUID/FIRST. The local
+      // ticket below still uses the CURRENT fresh, smaller per-pool demand.
+      // Any excess Core hold is unused credit until normal end, never a pool.
+      const booked = pending?.booked ?? fleetPlan;
+      try {
+        await this.reserveFrame(
+          scope,
+          {
+            weight: booked.reservedWeight,
+            mode: booked.cold ? "cold_trial" : "learned",
+          },
+          signal,
+          continuation,
+        );
+      } catch (error) {
+        const pin = bundle && framePendingContinuation(error);
+        if (pin) {
+          if (continuation) {
+            if (
+              pin !== continuation ||
+              this.pendingPreparedBookings.get(pin) !== pending
+            )
+              throw costPlanUnavailable();
+          } else {
+            // Only this call's verified HTTP pending receipt can establish a
+            // booking. A peer's local POLLING pin conveys no ownership.
+            if (
+              (error as AgentError).details?.reason_code !==
+                "READ_FRAME_PENDING" ||
+              this.pendingPreparedBookings.has(pin)
+            )
+              throw costPlanUnavailable();
+            this.pendingPreparedBookings.set(pin, {
+              owner: scope.owner!,
+              frameOwner: scope.frameOwner!,
+              purpose: bundle!.purpose ?? "audit_submit",
+              firstDeadline: scope.queueUntil,
+              booked: fleetPlan,
+              latest: fleetPlan,
+            });
+          }
+        }
+        throw error;
+      }
+      if (continuation) this.pendingPreparedBookings.delete(continuation);
       scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
     }
     let deferred: unknown;
