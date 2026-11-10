@@ -1168,7 +1168,7 @@ it("spends zero upstream weight while a stable fleet reservation is pending, the
       return Response.json({
         state: granted ? "granted" : "pending",
         frame_id: body.frame_id,
-        expires_at: t.clock() + 20000,
+        expires_at: granted ? t.clock() + 20000 : body.deadline_ms,
         retry_after_ms: 1000,
         reserved_weight: granted ? body.weight : 250,
         guaranteed_complete: false,

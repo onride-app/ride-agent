@@ -11,6 +11,7 @@ import { candidate, snapshot } from "./fixtures.js";
 import { fromPlan } from "./service.js";
 import { recordFirstSubmissionFailure } from "./submission-failure-diagnostics.js";
 import { isObservationAdmissionDeferred } from "./venue-read-budget.js";
+import { framePendingContinuation } from "./core-frame-coordinator.js";
 import {
   CoordinatedReadError,
   isUnsentReadBudgetDenial,
@@ -118,6 +119,11 @@ it("private HTTP preserves bounded BEGIN diagnostics without turning remote reas
     "READ_LOCAL_QUARANTINE",
     "READ_LOCAL_TICKET_STALE",
     "READ_CORE_BUDGET_SENT",
+    "READ_FRAME_PENDING",
+    "READ_FRAME_POLLING",
+    "READ_FRAME_IN_USE",
+    "READ_FRAME_QUEUE_FULL",
+    "READ_FRAME_IDENTITY_CHANGED",
   ]) {
     const app = express();
     app.post("/internal/agent/source", (_req, res) =>
@@ -140,6 +146,7 @@ it("private HTTP preserves bounded BEGIN diagnostics without turning remote reas
         assert.ok(error instanceof AgentError);
         assert.equal(error.details?.reason_code, reason);
         assert.equal(isObservationAdmissionDeferred(error), false);
+        assert.equal(framePendingContinuation(error), undefined);
         assert.equal(isUnsentReadBudgetDenial(error), false);
         const execution: any = {};
         recordFirstSubmissionFailure(

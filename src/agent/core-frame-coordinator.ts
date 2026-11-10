@@ -7,24 +7,67 @@ import type {
 } from "./venue-reads.js";
 
 type Frame = {
-  id: string;
-  owner: string;
-  weight: number;
-  mode: "learned" | "cold_trial";
-  deadline: number;
+  readonly id: string;
+  readonly owner: string;
+  readonly weight: number;
+  readonly mode: "learned" | "cold_trial";
+  readonly deadline: number;
   expires?: number;
   polling: boolean;
 };
 
-function deferred(retry = 1000) {
-  return new AgentError(
+const pendingContinuations = new WeakMap<AgentError, object>();
+const framePins = new WeakMap<Frame, object>();
+const pinnedFrames = new WeakMap<
+  object,
+  {
+    frame: Frame;
+    id: string;
+    owner: string;
+    weight: number;
+    mode: Frame["mode"];
+    deadline: number;
+  }
+>();
+/** Local capability only; serialized error reasons cannot authorize polling. */
+export function framePendingContinuation(error: unknown): object | undefined {
+  return error instanceof AgentError &&
+    error.retryable === true &&
+    error.code === "VENUE_READ_BUDGET_EXHAUSTED" &&
+    ["READ_FRAME_PENDING", "READ_FRAME_POLLING"].includes(
+      error.details?.reason_code ?? "",
+    )
+    ? pendingContinuations.get(error)
+    : undefined;
+}
+function deferred(retry = 1000, frame?: Frame, reason = "READ_FRAME_PENDING") {
+  const error = new AgentError(
     "VENUE_READ_BUDGET_EXHAUSTED",
     "Complete account observation is queued before venue reads begin.",
     true,
     503,
-    { retry_after_ms: retry, reason_code: "READ_FRAME_PENDING" },
+    { retry_after_ms: retry, reason_code: reason },
   );
+  if (frame) {
+    let pin = framePins.get(frame);
+    if (!pin) {
+      pin = {};
+      framePins.set(frame, pin);
+      pinnedFrames.set(pin, {
+        frame,
+        id: frame.id,
+        owner: frame.owner,
+        weight: frame.weight,
+        mode: frame.mode,
+        deadline: frame.deadline,
+      });
+    }
+    pendingContinuations.set(error, pin);
+  }
+  return error;
 }
+const identityChanged = () =>
+  deferred(1000, undefined, "READ_FRAME_IDENTITY_CHANGED");
 
 /**
  * One bounded private poll per monitor attempt. Pending reservations survive an
@@ -53,6 +96,7 @@ export function coreFrameCoordinator(
     throw new Error("Core observation frames require a private HTTPS endpoint");
   const frames = new Map<string, Frame>();
   const releasing = new Set<Promise<void>>();
+  const releases = new WeakMap<Frame, Promise<void>>();
   const stop = new AbortController();
   let closing = false;
 
@@ -99,7 +143,10 @@ export function coreFrameCoordinator(
       throw costPlanUnavailable();
   }
   function trackRelease(frame: Frame) {
+    const previous = releases.get(frame);
+    if (previous) return previous;
     const work = release(frame);
+    releases.set(frame, work);
     releasing.add(work);
     void work.then(
       () => releasing.delete(work),
@@ -114,7 +161,7 @@ export function coreFrameCoordinator(
   }
   return {
     capacity: 900,
-    async begin(owner, weight, deadlineMs, signal, mode) {
+    async begin(owner, weight, deadlineMs, signal, mode, continuation) {
       if (closing || signal.aborted) throw costPlanUnavailable();
       const now = clock();
       if (
@@ -128,6 +175,19 @@ export function coreFrameCoordinator(
         !["learned", "cold_trial"].includes(mode)
       )
         throw costPlanUnavailable();
+      const pinned =
+        continuation === undefined ? undefined : pinnedFrames.get(continuation);
+      if (
+        continuation !== undefined &&
+        (!pinned ||
+          frames.get(owner) !== pinned.frame ||
+          pinned.owner !== owner ||
+          pinned.weight !== weight ||
+          pinned.mode !== mode ||
+          pinned.frame.id !== pinned.id ||
+          pinned.frame.deadline !== pinned.deadline)
+      )
+        throw identityChanged();
       const expired = frames.get(owner);
       if (expired && (expired.expires ?? expired.deadline) <= now) {
         void trackRelease(expired).catch(() => {});
@@ -140,14 +200,17 @@ export function coreFrameCoordinator(
       }
       prune();
       let frame = frames.get(owner);
-      if (frame && (frame.polling || frame.expires !== undefined))
-        throw deferred(250);
+      if (frame?.expires !== undefined)
+        throw deferred(250, undefined, "READ_FRAME_IN_USE");
+      if (frame?.polling) throw deferred(250, frame, "READ_FRAME_POLLING");
       if (frame && (frame.weight !== weight || frame.mode !== mode)) {
-        void trackRelease(frame).catch(() => {});
-        throw deferred();
+        if (continuation === undefined)
+          void trackRelease(frame).catch(() => {});
+        throw identityChanged();
       }
       if (!frame) {
-        if (frames.size >= 64) throw deferred();
+        if (frames.size >= 64)
+          throw deferred(1000, undefined, "READ_FRAME_QUEUE_FULL");
         frame = {
           id: randomUUID(),
           owner,
@@ -160,6 +223,24 @@ export function coreFrameCoordinator(
         frames.set(owner, frame);
       }
       const current = frame;
+      const firstId = current.id,
+        firstDeadline = current.deadline;
+      const unchanged = () => {
+        if (
+          frames.get(owner) !== current ||
+          current.owner !== owner ||
+          current.weight !== weight ||
+          current.mode !== mode ||
+          current.id !== firstId ||
+          current.deadline !== firstDeadline ||
+          (pinned !== undefined &&
+            (current !== pinned.frame ||
+              current.id !== pinned.id ||
+              current.deadline !== pinned.deadline))
+        )
+          throw identityChanged();
+      };
+      unchanged();
       current.polling = true;
       const boundedSignal = AbortSignal.any([
         signal,
@@ -186,17 +267,25 @@ export function coreFrameCoordinator(
           }),
           boundedSignal,
         );
+        try {
+          unchanged();
+        } catch (error) {
+          void response.body?.cancel().catch(() => {});
+          throw error;
+        }
         const body = (await bounded(response.json(), boundedSignal)) as any;
+        unchanged();
         if (!response.ok) {
           const retry = body?.error?.retry_after_ms;
           if (
             response.status === 503 &&
             body?.error?.code === "local_budget" &&
+            body.error.upstream_request_sent === false &&
             Number.isSafeInteger(retry) &&
             retry >= 1 &&
             retry <= 60000
           )
-            throw deferred(Math.max(250, Math.min(1000, retry)));
+            throw deferred(Math.max(250, Math.min(1000, retry)), current);
           throw costPlanUnavailable();
         }
         if (
@@ -235,12 +324,15 @@ export function coreFrameCoordinator(
         }
         if (body.state === "pending" || body.state === "busy") {
           if (
+            !Number.isSafeInteger(body.expires_at) ||
+            body.expires_at !== current.deadline ||
+            body.expires_at <= clock() ||
             !Number.isSafeInteger(body.retry_after_ms) ||
             body.retry_after_ms < 1 ||
             body.retry_after_ms > 1000
           )
             throw costPlanUnavailable();
-          throw deferred(Math.max(250, body.retry_after_ms));
+          throw deferred(Math.max(250, body.retry_after_ms), current);
         }
         if (
           body.reserved_weight !== current.weight ||

@@ -1,6 +1,7 @@
 import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
+import { framePendingContinuation } from "./core-frame-coordinator.js";
 import {
   costPlanUnavailable,
   type ObservationPlanLease,
@@ -48,6 +49,7 @@ type AccountReadScope = {
   localInterest?: object;
   releasedFrames?: Set<string>;
   queueUntil: number;
+  waitForFrameAdmission: boolean;
   activateEvidenceDeadline?(): void;
 };
 export type AccountReadFrameLease = {
@@ -58,6 +60,8 @@ export type AccountReadFrameLease = {
 export type AccountObservationLimits = {
   signal?: AbortSignal;
   deadlineMs?: number;
+  /** Internal NEW execution preflight only; never accepted from request JSON. */
+  waitForFrameAdmission?: true;
 };
 /** Authenticated fleet admission; it must use the existing shared ledger. */
 export interface AccountReadFrameCoordinator {
@@ -68,6 +72,7 @@ export interface AccountReadFrameCoordinator {
     deadlineMs: number,
     signal: AbortSignal,
     mode: "learned" | "cold_trial",
+    continuation?: object,
   ): Promise<AccountReadFrameLease>;
   end(frameId: string): Promise<void>;
   close?(): Promise<void>;
@@ -318,6 +323,7 @@ export class VenueReads {
       owner,
       monotonicUntil: this.monotonicClock() + remaining,
       queueUntil: this.clock() + 100000,
+      waitForFrameAdmission: limits.waitForFrameAdmission === true,
     };
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -468,6 +474,60 @@ export class VenueReads {
     signal: AbortSignal,
   ): Promise<void> {
     if (!this.frameCoordinator) return;
+    if (reservation.mode === "cold_trial") this.frames.capacity_trials++;
+    let continuation: object | undefined;
+    for (;;) {
+      this.accountReadTimeout();
+      if (signal.aborted) throw signal.reason;
+      if (scope.waitForFrameAdmission && this.budget.cooldownRemaining() > 0)
+        throw this.unavailable();
+      try {
+        await this.pollFrame(scope, reservation, signal, continuation);
+        return;
+      } catch (error) {
+        const next =
+          scope.waitForFrameAdmission && !scope.frameLease
+            ? framePendingContinuation(error)
+            : undefined;
+        if (!next || !(error instanceof AgentError)) throw error;
+        if (continuation !== undefined && next !== continuation)
+          throw costPlanUnavailable();
+        continuation = next;
+        const retry = error.details?.retry_after_ms;
+        const remaining = Math.min(
+          scope.until - this.clock(),
+          scope.monotonicUntil - this.monotonicClock(),
+        );
+        if (
+          !Number.isSafeInteger(retry) ||
+          retry! < 1 ||
+          retry! > 1000 ||
+          retry! >= remaining
+        )
+          throw error;
+        await new Promise<void>((resolve, reject) => {
+          const cancel = () => {
+            this.timers.clearTimeout(timer);
+            signal.removeEventListener("abort", cancel);
+            reject(signal.reason);
+          };
+          const timer = this.timers.setTimeout(() => {
+            signal.removeEventListener("abort", cancel);
+            resolve();
+          }, retry!);
+          signal.addEventListener("abort", cancel, { once: true });
+          if (signal.aborted) cancel();
+        });
+      }
+    }
+  }
+  private async pollFrame(
+    scope: AccountReadScope,
+    reservation: { weight: number; mode: "learned" | "cold_trial" },
+    signal: AbortSignal,
+    continuation?: object,
+  ): Promise<void> {
+    if (!this.frameCoordinator) return;
     const coordinator = this.frameCoordinator;
     // The cold local plan is a full-process-window placeholder (1000), not a
     // proven provider cost. An explicit capacity trial books only its verified
@@ -475,9 +535,15 @@ export class VenueReads {
     // If actual scope exceeds the booking, Core must reject the continuation;
     // no partial account evidence or reduced history can become a success.
     const weight = reservation.weight;
-    if (reservation.mode === "cold_trial") this.frames.capacity_trials++;
     const pending = coordinator
-      .begin(scope.owner!, weight, scope.queueUntil, signal, reservation.mode)
+      .begin(
+        scope.owner!,
+        weight,
+        scope.queueUntil,
+        signal,
+        reservation.mode,
+        continuation,
+      )
       .then((lease) => {
         if (
           !lease ||

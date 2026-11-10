@@ -2208,6 +2208,7 @@ export class CoreBridge {
       const snap = await this.perpsAccount(user, p, false, {
         signal: observation?.signal,
         deadlineMs: Math.min(e.expires_at, observation?.deadlineMs ?? Infinity),
+        waitForFrameAdmission: true,
       });
       if (
         snap.manual_markets?.some(
