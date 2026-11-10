@@ -37,6 +37,19 @@ import {
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
+type PreparedLocalBinding = {
+  owner: string;
+  frameOwner: string;
+  firstDeadline: number;
+  purpose?: "audit_submit" | "audit_source";
+  continuation?: object;
+  nativeSourcePlan?: NativeSourcePlan;
+  historySources?: readonly string[];
+};
+const preparedLocalDeferrals = new WeakMap<
+  object,
+  PreparedLocalBinding & { reader: VenueReads; retryAfterMs: number }
+>();
 type ObservationFleetPlan = Readonly<{
   fullDemand: number;
   reservedWeight: number;
@@ -492,6 +505,82 @@ export class VenueReads {
     if (this.pendingPreparedBookings.get(continuation) === booking)
       this.pendingPreparedBookings.delete(continuation);
   }
+  /** Only prepare_portfolio may turn this exact local scheduling result into metadata. */
+  preparedLocalRetry(
+    error: unknown,
+    binding: PreparedLocalBinding,
+  ): number | undefined {
+    if (!(error instanceof AgentError)) return;
+    const saved = preparedLocalDeferrals.get(error);
+    if (
+      !saved ||
+      saved.reader !== this ||
+      this.draining ||
+      saved.owner !== binding.owner ||
+      saved.frameOwner !== binding.frameOwner ||
+      saved.firstDeadline !== binding.firstDeadline ||
+      saved.firstDeadline <= this.clock() ||
+      (saved.purpose ?? "audit_submit") !==
+        (binding.purpose ?? "audit_submit") ||
+      saved.continuation !== binding.continuation ||
+      saved.nativeSourcePlan !== binding.nativeSourcePlan ||
+      saved.historySources!.length !== (binding.historySources?.length ?? 0) ||
+      saved.historySources!.some(
+        (source, i) => source !== binding.historySources?.[i],
+      )
+    )
+      return;
+    preparedLocalDeferrals.delete(error);
+    return saved.retryAfterMs;
+  }
+  private deferPreparedSchedule(
+    scope: AccountReadScope,
+    options: PreparedReadWindowOptions & { continuation?: object },
+    schedule: ReturnType<VenueReadBudget["preparedObservationSchedule"]>,
+  ): void {
+    if (
+      this.draining ||
+      scope.admission.signal.aborted ||
+      scope.queueUntil <= this.clock()
+    )
+      throw costPlanUnavailable();
+    if (schedule.ready) return;
+    const error = new AgentError(
+      "VENUE_READ_BUDGET_EXHAUSTED",
+      "Prepared account scheduling is pending before fleet admission.",
+      true,
+      503,
+      { reason_code: schedule.reason, retry_after_ms: schedule.retryAfterMs },
+    );
+    preparedLocalDeferrals.set(error, {
+      reader: this,
+      owner: scope.owner!,
+      frameOwner: scope.frameOwner!,
+      firstDeadline: scope.queueUntil,
+      purpose: options.purpose,
+      continuation: options.continuation,
+      nativeSourcePlan: options.nativeSourcePlan,
+      historySources: Object.freeze([...(options.historySources ?? [])]),
+      retryAfterMs: schedule.retryAfterMs,
+    });
+    throw error;
+  }
+  private pendingPreparedBinding(
+    scope: AccountReadScope,
+    options: PreparedReadWindowOptions & { continuation?: object },
+  ) {
+    if (!options.continuation) return;
+    const pending = this.pendingPreparedBookings.get(options.continuation);
+    if (
+      !pending ||
+      pending.owner !== scope.owner ||
+      pending.frameOwner !== scope.frameOwner ||
+      pending.purpose !== (options.purpose ?? "audit_submit") ||
+      pending.firstDeadline !== scope.queueUntil
+    )
+      throw costPlanUnavailable();
+    return pending;
+  }
   createNativeSourcePlan(
     issuer: object,
     context: Omit<NativeSourcePlanBinding, "issuer" | "reader" | "budget">,
@@ -648,6 +737,19 @@ export class VenueReads {
       );
       scope.nativeSourcePlan = options.nativeSourcePlan;
     }
+    if (callerSignal?.aborted) throw callerSignal.reason;
+    this.pendingPreparedBinding(scope, { ...options, continuation });
+    const earlySchedule = this.budget.preparedObservationSchedule(owner);
+    // An active A may have a dirty in-progress PG generation. Do not replace
+    // its attempt or read/invalidate that hint merely to wait for its local slot.
+    // This asserts no fresh plan compatibility; every later Core poll still
+    // requires the complete fresh PG/per-pool checks below.
+    if (!earlySchedule.ready && earlySchedule.reason === "READ_LOCAL_BUSY")
+      this.deferPreparedSchedule(
+        scope,
+        { ...options, continuation },
+        earlySchedule,
+      );
     this.preparingFrameOwners.add(frameOwner);
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -1685,6 +1787,14 @@ export class VenueReads {
       // ticket below still uses the CURRENT fresh, smaller per-pool demand.
       // Any excess Core hold is unused credit until normal end, never a pool.
       const booked = pending?.booked ?? fleetPlan;
+      if (bundle) {
+        this.accountReadTimeout();
+        this.deferPreparedSchedule(
+          scope,
+          bundle,
+          this.budget.preparedObservationSchedule(scope.owner!),
+        );
+      }
       try {
         await this.reserveFrame(
           scope,

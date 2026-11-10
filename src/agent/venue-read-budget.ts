@@ -266,6 +266,36 @@ export class VenueReadBudget {
       observations: { ...this.observations },
     };
   }
+  /** Scheduling hint only. No queue interest, reservation, sample or TTL claim. */
+  preparedObservationSchedule(owner: string):
+    | { ready: true }
+    | {
+        ready: false;
+        reason: "READ_LOCAL_BUSY" | "READ_LOCAL_FIFO" | "READ_LOCAL_PACING";
+        retryAfterMs: number;
+      } {
+    const now = this.clock();
+    if (this.observation)
+      return { ready: false, reason: "READ_LOCAL_BUSY", retryAfterMs: 1000 };
+    // Match prune's live-interest rules without mutating another owner's queue.
+    const first = [...this.observationQueue].find(
+      ([, entry]) =>
+        (entry.legacy && entry.legacySeen > now - 120000) ||
+        (entry.interests.size > 0 && entry.seen > now - 120000),
+    )?.[0];
+    if (first !== undefined && first !== owner)
+      return { ready: false, reason: "READ_LOCAL_FIFO", retryAfterMs: 1000 };
+    if (this.nextObservationAt > now)
+      return {
+        ready: false,
+        reason: "READ_LOCAL_PACING",
+        retryAfterMs: Math.min(
+          60000,
+          Math.max(1, Math.ceil(this.nextObservationAt - now)),
+        ),
+      };
+    return { ready: true };
+  }
   private observationPacingMs(weight: number) {
     const originalAllowance = this.limit * 0.8;
     const original = Math.ceil((weight * 60000) / originalAllowance);
