@@ -916,6 +916,91 @@ it("same-key concurrent preparation is gated before the first asynchronous ident
   assert.equal(f.begins.length, 1);
   assert.equal(f.b.preparedEntries.size, 1);
 });
+
+async function localPacing(f: Awaited<ReturnType<typeof fixture>>) {
+  const frame = f.budget.beginObservation("local-schedule-prior");
+  const ticket = await f.budget.acquire(
+    "account",
+    20,
+    "local-schedule-prior",
+    new AbortController().signal,
+    false,
+    frame,
+  );
+  ticket.sent();
+  ticket.settle(20);
+  ticket.release();
+  frame.close(true);
+}
+
+it("a readonly local-only pending entry can be cancelled exactly without ever owning a Core pin or grant", async (t) => {
+  const f = await fixture(t);
+  await localPacing(f);
+  const pending = await f.prepare("audit_source");
+  assert.equal(pending.state, "pending");
+  assert.equal(pending.purpose, "audit_source");
+  const entry = [...f.b.preparedEntries.values()][0] as any;
+  assert.equal(entry.pin, undefined);
+  assert.equal(entry.window, undefined);
+  assert.equal(f.begins.length, 0);
+  assert.equal(f.reads.length, 0);
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: preparedPortfolioInput(f.p, "audit_source"),
+    }),
+    { ok: true, pending_cancelled: true },
+  );
+  assert.equal(f.b.preparedEntries.size, 0);
+  assert.equal(f.events.includes("end"), false);
+  assert.equal(f.bank().dirty, false);
+});
+
+for (const change of ["control", "graph"] as const)
+  it(`a ${change} change rejects a local pending episode without rebooking its FIRST or borrowing a peer`, async (t) => {
+    const f = await fixture(t, { nativeSources: true });
+    await localPacing(f);
+    assert.equal((await f.prepare("audit_source", true)).state, "pending");
+    const entry = [...f.b.preparedEntries.values()][0] as any;
+    if (change === "control") f.p.control_id = "changed-control";
+    await assert.rejects(f.prepare("audit_source", change !== "graph"), {
+      code: "VENUE_COST_PLAN_UNAVAILABLE",
+    });
+    assert.equal(entry.expired, true);
+    assert.equal(f.begins.length, 0);
+    assert.equal(f.reads.length, 0);
+    assert.equal(f.p.executions.length, 0);
+  });
+
+it("cancellation while the prepared metadata read is awaiting cannot turn a late local brand into a pending ACK", async (t) => {
+  const f = await fixture(t);
+  await localPacing(f);
+  let release!: () => void,
+    loaded = false;
+  const old = f.b.venueReads.observationPlans.read.bind(
+    f.b.venueReads.observationPlans,
+  );
+  f.b.venueReads.observationPlans.read = async (...args: any[]) => {
+    loaded = true;
+    await new Promise<void>((r) => {
+      release = r;
+    });
+    return old(...args);
+  };
+  const work = f.prepare("audit_source");
+  await flush();
+  assert.equal(loaded, true);
+  const cancelled = await f.bridge.operation("cancel_prepared_portfolio", {
+    user_id: graphUser,
+    portfolio: preparedPortfolioInput(f.p, "audit_source"),
+  });
+  assert.deepEqual(cancelled, { ok: true, pending_cancelled: false });
+  release();
+  await assert.rejects(work, { code: "VENUE_COST_PLAN_UNAVAILABLE" });
+  assert.equal(f.begins.length, 0);
+  assert.equal(f.reads.length, 0);
+  assert.equal(f.b.preparedEntries.size, 0);
+});
 it("an already-outboxed original financial POST is not interrupted by parent expiry or replayed", async (t) => {
   const f = await fixture(t),
     ready = await f.prepare();

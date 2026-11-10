@@ -1690,6 +1690,39 @@ export class CoreBridge {
           expires_at: window.expires_at,
         });
       } catch (error) {
+        const localRetry = this.venueReads.preparedLocalRetry(error, {
+          owner: entry.costOwner,
+          frameOwner: entry.frameOwner,
+          firstDeadline: entry.deadline,
+          continuation: entry.pin,
+          purpose: p.purpose ?? "audit_submit",
+          nativeSourcePlan: entry.nativeSourcePlan,
+          historySources:
+            p.purpose === "audit_source"
+              ? [
+                  ...new Set(
+                    p.sleeves
+                      .filter((s) => s.copy_mode === "fixed")
+                      .map((s) => s.trader.id),
+                  ),
+                ]
+              : [],
+        });
+        if (localRetry !== undefined) {
+          if (
+            entry.expired ||
+            entry.deadline <= now() ||
+            this.preparedEntries.get(key) !== entry ||
+            this.preparedCreating.get(key)?.cancelled ||
+            limits?.signal?.aborted
+          ) {
+            await this.finishPrepared(entry).catch(() => {});
+            throw this.preparedFailure();
+          }
+          // This is private local scheduling metadata, never a Core receipt.
+          // Keep the exact entry, optional Core pin and original FIRST deadline.
+          return reply({ state: "pending", retry_after_ms: localRetry });
+        }
         if (isPreparedBundleUnsupported(error)) {
           await this.finishPrepared(entry).catch(() => {});
           if (this.preparedEntries.get(key) === entry)

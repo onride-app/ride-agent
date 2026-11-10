@@ -1,5 +1,22 @@
 # Local account admission after a Core grant
 
+Prepared portfolio windows first inspect local scheduling without claiming a
+ticket, registering a FIFO interest, sending a Core begin/poll, or touching
+financial evidence. Busy, FIFO and pacing delays return private branded local
+pending metadata. The bridge preserves the same portfolio entry and any real
+Core pending pin, UUID, conservative booking and original 100-second FIRST
+deadline. A local result is never a synthetic Core pending receipt. A busy
+active account is checked before reading or replacing its operational-plan
+attempt; fresh PG and exact pool/identity compatibility remain mandatory before
+any later Core poll. Ordinary account/recovery paths retain their prior routing.
+
+The probe is only a scheduling hint. After a real grant, the original local
+admission gates run again and reject any race that no longer fits. The original
+20-second active Core lease starts only at that actual grant; local deferral
+does not extend the FIRST deadline, caller lifetime, account scope or provider
+timeout. Cancel, expiry, foreign metadata and drain cannot convert a local
+pending result into ownership of another live frame.
+
 Core admission and the Node ledger remain separate gates. A granted frame may
 wait before its first provider request only for the typed local pacing delay,
 and only when quota, FIFO, exclusivity and quarantine are otherwise ready.
