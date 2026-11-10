@@ -2,6 +2,16 @@ import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import { framePendingContinuation } from "./core-frame-coordinator.js";
+import { reportVenueReadDiagnostics } from "./venue-read-diagnostics.js";
+import {
+  issueNativeSourcePlan,
+  nativeSourcePlanTerms,
+  assertNativeSourcePayload,
+  type NativeSourcePlan,
+  type NativeSourcePlanBinding,
+  type NativeSourcePlanFacts,
+  type NativeSourcePlanValidator,
+} from "./native-source-plan.js";
 import type { PreparedSourceRetryLimits } from "./source-feed.js";
 import {
   costPlanUnavailable,
@@ -92,16 +102,25 @@ type AccountReadScope = {
   preparedHint?: Awaited<ReturnType<ObservationPlanStore["read"]>>;
   preparedClaim?: Promise<void>;
   preparedHistoryGuard?: (payload: unknown) => void;
+  nativeSourcePlan?: NativeSourcePlan;
+  nativeSourceBinding?: NativeSourcePlanBinding;
   unsentGroup?: UnsentReadGroup;
 };
 export interface PreparedReadWindowOptions {
   purpose?: "audit_submit" | "audit_source";
   historySources?: readonly string[];
+  nativeSourcePlan?: NativeSourcePlan;
+  nativeSourceContext?: Omit<
+    NativeSourcePlanBinding,
+    "issuer" | "reader" | "budget"
+  >;
 }
 export interface PreparedAccountWindow {
   readonly mode: "cold" | "warm";
   readonly purpose: "audit_submit" | "audit_source";
   readonly expires_at: number;
+  /** Private runtime capability, never serialized by the bridge. */
+  readonly nativeSourcePlan?: NativeSourcePlan;
   read<T>(
     work: () => Promise<T>,
     limits?: AccountObservationLimits,
@@ -229,6 +248,7 @@ export interface VenueReadOptions {
   requireObservationPlanBinding?: boolean;
   monotonicClock?: () => number;
   frameCoordinator?: AccountReadFrameCoordinator;
+  nativeSourcePlanIssuer?: object;
 }
 
 // Completed account evidence is never reused. Metadata TTL and same-lane
@@ -257,6 +277,7 @@ export class VenueReads {
   private readonly requireObservationPlanBinding: boolean;
   private readonly monotonicClock: () => number;
   private readonly frameCoordinator?: AccountReadFrameCoordinator;
+  private readonly nativeSourcePlanIssuer?: object;
   private frames = {
     admitted: 0,
     denied: 0,
@@ -289,6 +310,7 @@ export class VenueReads {
     this.deadlineMs = options.deadlineMs ?? 12000;
     this.transport = options.transport ?? "official";
     this.callerSignal = options.signal;
+    this.nativeSourcePlanIssuer = options.nativeSourcePlanIssuer;
     this.observationPlans = options.observationPlans;
     this.requireObservationPlanBinding =
       options.requireObservationPlanBinding ?? false;
@@ -311,8 +333,7 @@ export class VenueReads {
       this.deadlineMs > 12000
     )
       throw new RangeError("Venue read deadline cannot exceed 12 seconds");
-    this.report =
-      options.report ?? ((record) => console.info(JSON.stringify(record)));
+    this.report = options.report ?? reportVenueReadDiagnostics;
     this.lastReport = this.clock();
   }
   private count(
@@ -471,6 +492,64 @@ export class VenueReads {
     if (this.pendingPreparedBookings.get(continuation) === booking)
       this.pendingPreparedBookings.delete(continuation);
   }
+  createNativeSourcePlan(
+    issuer: object,
+    context: Omit<NativeSourcePlanBinding, "issuer" | "reader" | "budget">,
+    facts: NativeSourcePlanFacts,
+    validate: NativeSourcePlanValidator,
+  ): NativeSourcePlan {
+    if (
+      !this.nativeSourcePlanIssuer ||
+      issuer !== this.nativeSourcePlanIssuer ||
+      this.transport !== "core_shared_info" ||
+      !this.frameCoordinator
+    )
+      throw costPlanUnavailable();
+    return issueNativeSourcePlan(
+      { ...context, issuer, reader: this, budget: this.budget },
+      facts,
+      validate,
+    );
+  }
+  async validateNativeSourcePlan(
+    issuer: object,
+    plan: NativeSourcePlan,
+    context: Omit<NativeSourcePlanBinding, "issuer" | "reader" | "budget">,
+    payload: unknown,
+  ): Promise<void> {
+    if (!this.nativeSourcePlanIssuer || issuer !== this.nativeSourcePlanIssuer)
+      throw costPlanUnavailable();
+    await assertNativeSourcePayload(
+      plan,
+      { ...context, issuer, reader: this, budget: this.budget },
+      payload,
+    );
+  }
+  nativeSourceReadActive(): boolean {
+    return !!this.accountScope.getStore()?.nativeSourcePlan;
+  }
+  private nativeWirePayload(payload: unknown): unknown {
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      Reflect.ownKeys(payload).length !== 2
+    )
+      throw costPlanUnavailable();
+    const descriptors = Object.getOwnPropertyDescriptors(payload);
+    if (
+      !descriptors.type ||
+      !("value" in descriptors.type) ||
+      !descriptors.user ||
+      !("value" in descriptors.user)
+    )
+      throw costPlanUnavailable();
+    return Object.freeze(
+      Object.assign(Object.create(null), {
+        type: descriptors.type.value,
+        user: descriptors.user.value,
+      }),
+    );
+  }
   private pendingPlanFits(
     current: ObservationFleetPlan,
     prior: ObservationFleetPlan,
@@ -483,6 +562,8 @@ export class VenueReads {
         (source, i) => source !== prior.historySources[i],
       ) ||
       current.supplements?.key !== prior.supplements?.key ||
+      current.supplements?.nativeContractKey !==
+        prior.supplements?.nativeContractKey ||
       !!current.supplements !== !!prior.supplements
     )
       return false;
@@ -525,7 +606,6 @@ export class VenueReads {
         options.purpose !== "audit_source")
     )
       throw costPlanUnavailable();
-    this.preparingFrameOwners.add(frameOwner);
     const scope: AccountReadScope = {
       id: ++this.accountSequence,
       owner,
@@ -539,6 +619,36 @@ export class VenueReads {
       preparingBundle: true,
       unsentGroup: { active: 0, revoked: false, candidates: new Set() },
     };
+    if (options.nativeSourcePlan || options.nativeSourceContext) {
+      if (
+        !options.nativeSourcePlan ||
+        !options.nativeSourceContext ||
+        !this.nativeSourcePlanIssuer ||
+        options.purpose !== "audit_source"
+      )
+        throw costPlanUnavailable();
+      const context = options.nativeSourceContext;
+      if (
+        context.costOwner !== owner ||
+        context.frameOwner !== frameOwner ||
+        context.firstDeadline !== firstDeadline ||
+        context.purpose !== "audit_source" ||
+        context.network !== "mainnet"
+      )
+        throw costPlanUnavailable();
+      scope.nativeSourceBinding = {
+        ...context,
+        issuer: this.nativeSourcePlanIssuer,
+        reader: this,
+        budget: this.budget,
+      };
+      nativeSourcePlanTerms(
+        options.nativeSourcePlan,
+        scope.nativeSourceBinding,
+      );
+      scope.nativeSourcePlan = options.nativeSourcePlan;
+    }
+    this.preparingFrameOwners.add(frameOwner);
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
       20000,
@@ -608,6 +718,8 @@ export class VenueReads {
         preparedHint: undefined,
         preparedClaim: undefined,
         preparedHistoryGuard: history?.guard,
+        nativeSourcePlan: history ? undefined : scope.nativeSourcePlan,
+        nativeSourceBinding: history ? undefined : scope.nativeSourceBinding,
         admission: new AbortController(),
       };
       sourceScope.until = Math.min(scope.until, limits.deadlineMs ?? Infinity);
@@ -736,6 +848,9 @@ export class VenueReads {
       mode: parent.capacityTrial ? "cold" : "warm",
       purpose: options.purpose ?? "audit_submit",
       expires_at: scope.until,
+      ...(scope.nativeSourcePlan
+        ? { nativeSourcePlan: scope.nativeSourcePlan }
+        : {}),
       supplement: (work, limits) =>
         this.trackReadActivity(scope, () => supplement(work, limits)),
       history: async <T>(
@@ -1445,13 +1560,43 @@ export class VenueReads {
         (historySources.length > 0 && bundle?.purpose !== "audit_source")
       )
         throw costPlanUnavailable();
-      const supplements =
+      const supplementKey = scope.frameOwner ?? scope.owner!;
+      const legacySupplements =
         bundle?.purpose === "audit_source"
-          ? this.budget.preparedSupplementPlan(
-              scope.frameOwner ?? scope.owner!,
-              historySources,
-            )
+          ? this.budget.preparedSupplementPlan(supplementKey, historySources)
           : undefined;
+      const legacyTrialCapacity = Math.min(
+        this.frameCoordinator.capacity - historyReservation,
+        this.frameCoordinator.capacity -
+          (legacySupplements
+            ? legacySupplements.sourceWeight +
+              Object.values(legacySupplements.historyWeights).reduce(
+                (a, b) => a + b,
+                0,
+              )
+            : historySources.length * historyReservation),
+      );
+      // A cold/unknown account or a changed resource graph retains the old
+      // conservative contract. Native proof changes no A trial or learned TTL.
+      const native =
+        scope.nativeSourcePlan &&
+        durableHint?.plan &&
+        legacyTrialCapacity >= 120 &&
+        !this.budget.peekObservationFramePlan(scope.owner!, legacyTrialCapacity)
+          .cold
+          ? scope.nativeSourcePlan
+          : undefined;
+      if (!native) {
+        scope.nativeSourcePlan = undefined;
+        scope.nativeSourceBinding = undefined;
+      }
+      const supplements = native
+        ? this.budget.preparedSupplementPlan(
+            supplementKey,
+            historySources,
+            native,
+          )
+        : legacySupplements;
       const supplementalWeight = supplements
         ? supplements.sourceWeight +
           Object.values(supplements.historyWeights).reduce(
@@ -1734,6 +1879,8 @@ export class VenueReads {
   ): Promise<VenueReadEvidence> {
     let method = "unsupported";
     try {
+      if (this.accountScope.getStore()?.nativeSourcePlan)
+        payload = this.nativeWirePayload(payload);
       const cost = readCost(payload);
       method = cost.method;
       this.count(method, lane, "calls");
@@ -1922,6 +2069,7 @@ export class VenueReads {
     let ticket: ReadTicket | undefined,
       sent = false,
       settled = false;
+    let wirePayload = payload;
     let wireTimer: unknown, admissionTimer: unknown;
     let wireSignal = signal;
     const user = (payload as { user?: unknown })?.user;
@@ -1977,6 +2125,39 @@ export class VenueReads {
       this.checkCooldown(cost.method, lane, false);
       if (admissionSignal.aborted) throw admissionSignal.reason;
       if (signal.aborted) throw signal.reason;
+      if (scope?.nativeSourcePlan) {
+        if (
+          !scope.nativeSourceBinding ||
+          url !== "https://api.hyperliquid.xyz/info" ||
+          lane !== "source" ||
+          cost.method !== "clearinghouseState" ||
+          cost.reserve !== 2 ||
+          cost.unknownSurcharge
+        )
+          throw costPlanUnavailable();
+        // Validate and serialize one immutable own-data object. A foreign
+        // prototype/toJSON or Proxy get trap must not change the sent method
+        // after a different descriptor view was admitted as native CHS2.
+        if (
+          !Object.isFrozen(payload) ||
+          Object.getPrototypeOf(payload) !== null
+        )
+          throw costPlanUnavailable();
+        wirePayload = payload;
+        await this.abortable(
+          this.trackReadActivity(scope, () =>
+            assertNativeSourcePayload(
+              scope.nativeSourcePlan!,
+              scope.nativeSourceBinding!,
+              wirePayload,
+            ),
+          ),
+          admissionSignal,
+        );
+        this.accountReadTimeout();
+        if (admissionSignal.aborted) throw admissionSignal.reason;
+        if (signal.aborted) throw signal.reason;
+      }
       // A cached metadata hit never claims/dirty-marks a financial cost plan.
       // Claim only this new dispatch, after its real local ticket is ready.
       if (scope?.preparedParent) await this.claimPreparedChild(scope);
@@ -2037,7 +2218,7 @@ export class VenueReads {
               {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
+                body: JSON.stringify(wirePayload),
                 signal: wireSignal,
                 redirect: "error",
               },

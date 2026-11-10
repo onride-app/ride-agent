@@ -290,6 +290,7 @@ async function withBridgeDeadline<T>(
 
 // Private, authenticated execution boundary. It holds Core S2S identity, never
 // signing secrets. Its responses are normalized; machine routes cannot confirm.
+const readonlyRunnerSourceGraph = "readonly-runner-native-v1" as const;
 export class BridgeAdapter implements VenueAdapter {
   private readonly readWindows = new AsyncLocalStorage<ReadWindowContext>();
   constructor(
@@ -321,9 +322,16 @@ export class BridgeAdapter implements VenueAdapter {
     input: unknown,
     signal?: AbortSignal,
     windowHandle?: string,
+    sourceReadGraph?: typeof readonlyRunnerSourceGraph,
   ): Promise<T> {
     return monitorOperation(operation, () =>
-      this.performCall<T>(operation, input, signal, windowHandle),
+      this.performCall<T>(
+        operation,
+        input,
+        signal,
+        windowHandle,
+        sourceReadGraph,
+      ),
     );
   }
   private async performCall<T>(
@@ -331,6 +339,7 @@ export class BridgeAdapter implements VenueAdapter {
     input: unknown,
     callerSignal?: AbortSignal,
     explicitWindowHandle?: string,
+    sourceReadGraph?: typeof readonlyRunnerSourceGraph,
   ): Promise<T> {
     // The complete account observation is bounded at 20s inside the bridge.
     // Leave transport margin for its typed failure and retry hint to arrive.
@@ -465,6 +474,21 @@ export class BridgeAdapter implements VenueAdapter {
       }
       windowHandle = context.handle;
     }
+    if (
+      sourceReadGraph !== undefined &&
+      (sourceReadGraph !== readonlyRunnerSourceGraph ||
+        windowHandle !== undefined ||
+        !["prepare_portfolio", "cancel_prepared_portfolio"].includes(
+          operation,
+        ) ||
+        scopedPortfolio?.purpose !== "audit_source")
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "Read graph does not match its private preparation scope.",
+        false,
+        409,
+      );
     let response: Response;
     try {
       response = await withBridgeDeadline(
@@ -474,6 +498,9 @@ export class BridgeAdapter implements VenueAdapter {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.token}`,
             ...(windowHandle ? { "x-ride-read-window": windowHandle } : {}),
+            ...(sourceReadGraph
+              ? { "x-ride-source-read-graph": sourceReadGraph }
+              : {}),
           },
           body: JSON.stringify(bridgeInput(input)),
           signal,
@@ -537,10 +564,16 @@ export class BridgeAdapter implements VenueAdapter {
       );
     let ready: any;
     try {
-      ready = await this.call<any>("prepare_portfolio", {
-        user_id: user,
-        portfolio,
-      });
+      ready = await this.call<any>(
+        "prepare_portfolio",
+        {
+          user_id: user,
+          portfolio,
+        },
+        undefined,
+        undefined,
+        purpose === "audit_source" ? readonlyRunnerSourceGraph : undefined,
+      );
     } catch (error) {
       // Explicit protocol negotiation with an older authenticated bridge.
       // Operational/provider failures must never claim unsupported readiness.
@@ -769,10 +802,18 @@ export class BridgeAdapter implements VenueAdapter {
     const value = await this.call<{
       ok?: unknown;
       pending_cancelled?: unknown;
-    }>("cancel_prepared_portfolio", {
-      user_id: user,
-      portfolio: previous,
-    });
+    }>(
+      "cancel_prepared_portfolio",
+      {
+        user_id: user,
+        portfolio: previous,
+      },
+      undefined,
+      undefined,
+      previous.purpose === "audit_source"
+        ? readonlyRunnerSourceGraph
+        : undefined,
+    );
     if (
       previous.purpose === "audit_source" &&
       (value?.ok !== true || value?.pending_cancelled !== true)
