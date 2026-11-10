@@ -13,6 +13,7 @@ import { VenueReads } from "./venue-reads.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 import { coreFrameCoordinator } from "./core-frame-coordinator.js";
 import { readCost, responseCost } from "./venue-read-cost.js";
+import { SourceFeed } from "./source-feed.js";
 import {
   CoordinatedReadError,
   recordCoordinatedEvidence,
@@ -87,6 +88,7 @@ async function fixture(
     failedCas?: boolean;
     unified?: boolean;
     threeSources?: boolean;
+    existingSourceBackoff?: boolean;
   } = {},
 ) {
   const time = new Time();
@@ -177,6 +179,9 @@ async function fixture(
     financialBarrier: Promise<void> | undefined,
     posts = 0,
     identityCalls = 0;
+  let denyOrdinarySources = false,
+    ordinarySourceDenials = 0,
+    sourcePoll: (() => void) | undefined;
   const budget = new VenueReadBudget({
     clock: time.clock,
     timers: time.timers,
@@ -232,6 +237,19 @@ async function fixture(
         context,
       };
       reads.push(observedRead);
+      if (
+        denyOrdinarySources &&
+        !context?.frame_id &&
+        req.type === "clearinghouseState" &&
+        sourceByAddress.has(req.user)
+      ) {
+        ordinarySourceDenials++;
+        throw new CoordinatedReadError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          false,
+          2000,
+        );
+      }
       if (context?.frame_id) {
         assert.equal(context.frame_id, frameId);
         assert.equal(context.frame_owner, frameOwner);
@@ -402,6 +420,23 @@ async function fixture(
     );
     return { address: selected.address, tags: [] };
   };
+  if (options.existingSourceBackoff) {
+    b.sourceFeed.close();
+    b.sourceFeed = new SourceFeed((id) => b.readSource(id), {
+      clock: time.clock,
+      // This integration drives the original interval callback explicitly;
+      // source-prepared-backoff.test.ts exercises actual same-tick ordering.
+      timers: {
+        setInterval: (run) => {
+          sourcePoll = run;
+          return 1;
+        },
+        clearInterval: () => {
+          sourcePoll = undefined;
+        },
+      },
+    });
+  }
   if (options.unified)
     b.orderSnapshots = {
       readAccount: async () => ({
@@ -538,6 +573,11 @@ async function fixture(
     audit,
     proposal,
     budget,
+    denyOrdinarySources: (value: boolean) => {
+      denyOrdinarySources = value;
+    },
+    ordinarySourceDenials: () => ordinarySourceDenials,
+    pollSources: () => sourcePoll?.(),
     bank: () => ({ paid, held, dirty, generation, posts, identityCalls }),
     setPlan: (value: any) => {
       plan = value;
@@ -823,14 +863,52 @@ it("testnet and unmanaged read routes return unsupported without invoking paired
   assert.equal(f.bank().posts, 0);
 });
 
-for (const threeSources of [false, true])
+it("successful audit registers a repeated selected trader and identical scope only once", async (t) => {
+  const f = await fixture(t);
+  f.p.sleeves.push(structuredClone(f.p.sleeves[0]));
+  let selectedIds: string[] = [];
+  const original = f.b.sourceFeed.registerPreparedSources.bind(f.b.sourceFeed);
+  t.mock.method(
+    f.b.sourceFeed,
+    "registerPreparedSources",
+    (selected: any[], limits: any) => {
+      selectedIds = selected.map((source) => source.id);
+      return original(selected, limits);
+    },
+  );
+  const ready = await f.prepare();
+  await f.audit(ready);
+  assert.deepEqual(selectedIds, [f.p.sleeves[0].trader.id]);
+  assert.equal(f.bank().dirty, false);
+  await f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    ready.handle,
+  );
+});
+
+for (const { threeSources, existingSourceBackoff } of [
+  { threeSources: false, existingSourceBackoff: false },
+  { threeSources: true, existingSourceBackoff: false },
+  { threeSources: true, existingSourceBackoff: true },
+])
   it(
     "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, both fresh scopes and one original outbox (" +
-      (threeSources ? "three distinct sources" : "one source") +
+      (existingSourceBackoff
+        ? "three distinct sources after existing UNSENT backoff"
+        : threeSources
+          ? "three distinct sources"
+          : "one source") +
       ")",
     { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
     async (t) => {
-      const f = await fixture(t, { unified: true, threeSources }),
+      const f = await fixture(t, {
+          unified: true,
+          threeSources,
+          existingSourceBackoff,
+        }),
         url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
       assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
       const admin = new pg.Pool({ connectionString: url.toString(), max: 2 }),
@@ -976,6 +1054,33 @@ for (const threeSources of [false, true])
       // The preceding charges have really aged out of the local ledger. This
       // finite external-ledger fixture offers just enough room for the warm pair.
       f.resetBank(900 - 2 * f.planDemand());
+      let originalRetryAt = 0;
+      const sourceRetryAt = new Map<string, number>();
+      if (existingSourceBackoff) {
+        f.denyOrdinarySources(true);
+        for (const sleeve of f.p.sleeves)
+          await assert.rejects(f.time.run(f.bridge.source(sleeve.trader.id)), {
+            code: "VENUE_READ_BUDGET_EXHAUSTED",
+          });
+        assert.equal(f.ordinarySourceDenials(), 3);
+        originalRetryAt = Math.max(
+          ...f.p.sleeves.map(
+            (s) => f.b.sourceFeed.interests.get(s.trader.id).failure.retryAt,
+          ),
+        );
+        for (const s of f.p.sleeves)
+          sourceRetryAt.set(
+            (await f.b.resolve(s.trader.id)).address,
+            f.b.sourceFeed.interests.get(s.trader.id).failure.retryAt,
+          );
+        f.denyOrdinarySources(false);
+        // The existing background callback wins the retryAt turn, including
+        // the third selected source not yet consumed by the two workers.
+        f.time.timers.setTimeout(
+          () => f.pollSources(),
+          originalRetryAt - f.time.at,
+        );
+      }
       const before = f.reads.length;
       await drive(runner.tick(graphUser));
       state = await repository.read(graphUser);
@@ -1023,6 +1128,20 @@ for (const threeSources of [false, true])
               read.user !== f.identity.master,
           );
         assert.equal(sourceReads.length, 3);
+        if (existingSourceBackoff) {
+          assert.ok(
+            sourceReads.every(
+              (read) => read.at >= sourceRetryAt.get(read.user)!,
+            ),
+          );
+          assert.ok(sourceReads.every((read) => !!read.context?.frame_id));
+          assert.equal(
+            f.ordinarySourceDenials(),
+            3,
+            "the existing failure is not renewed by another unframed background attempt",
+          );
+          assert.equal(f.b.sourceFeed.preparedRetryCount, 0);
+        }
         assert.equal(
           new Set(sourceReads.map((read) => read.user)).size,
           3,
@@ -1037,6 +1156,8 @@ for (const threeSources of [false, true])
         const lastSource = f.reads.slice(before).indexOf(sourceReads.at(-1)!);
         // The full managed graph retains its real metadata charges: A144,
         // three distinct native source reads S6, and a fresh second B102.
+        // The real five-second backoff expires allMids too, so that graph
+        // performs its normal extra2 read rather than reusing stale metadata.
         // Both children still book W184; S may only spend A's unused credit.
         assert.equal(
           f.reads
@@ -1049,14 +1170,20 @@ for (const threeSources of [false, true])
           f.reads
             .slice(before + lastSource + 1)
             .reduce((sum, read) => sum + read.actual, 0),
-          102,
-          "the second real account scope retains its distinct B102 costs",
+          existingSourceBackoff ? 104 : 102,
+          "the second real account scope retains all fresh metadata costs",
         );
         assert.equal(f.begins.at(-1).weight, 2 * 184);
         assert.equal(f.planDemand(), 184);
         assert.ok(f.events.includes("three-source-second-scope-protected"));
-        assert.equal(f.budget.snapshot().used, 144 + 6 + 102);
-        assert.equal(f.bank().paid, 900 - 2 * 184 + 144 + 6 + 102);
+        assert.equal(
+          f.budget.snapshot().used,
+          144 + 6 + (existingSourceBackoff ? 104 : 102),
+        );
+        assert.equal(
+          f.bank().paid,
+          900 - 2 * 184 + 144 + 6 + (existingSourceBackoff ? 104 : 102),
+        );
       }
       const head = await repository.pool.query(
         "SELECT version::text FROM ride_agent_history_heads WHERE user_id=$1 AND portfolio_id=$2",

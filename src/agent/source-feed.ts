@@ -1,5 +1,30 @@
 import type { SourceSnapshot } from "./adapter.js";
 import { AgentError } from "./contracts.js";
+import { isUnsentReadBudgetDenial } from "./venue-read-transport.js";
+
+export interface PreparedSourceRetryLimits {
+  readonly signal: AbortSignal;
+  remainingMs(): number;
+  wait(delayMs: number, signal: AbortSignal): Promise<void>;
+}
+export interface PreparedSourceSelection {
+  readonly id: string;
+  onDemand(work: () => Promise<SourceSnapshot>): Promise<SourceSnapshot>;
+  validate(): void;
+}
+type SourceWork = (
+  work: () => Promise<SourceSnapshot>,
+) => Promise<SourceSnapshot>;
+type SourceFailure = { error: unknown; retryAt: number };
+type PreparedRetry = {
+  failure: SourceFailure;
+  onDemand: SourceWork;
+  limits: PreparedSourceRetryLimits;
+  validate(): void;
+  signal: AbortSignal;
+  cancelled: AbortController;
+  used: boolean;
+};
 
 type TimerHandle = number | { unref?: () => unknown };
 export interface SourceFeedOptions {
@@ -16,7 +41,7 @@ export interface SourceFeedOptions {
 type Interest = {
   lastReadAt: number;
   snapshot?: SourceSnapshot;
-  failure?: { error: unknown; retryAt: number };
+  failure?: SourceFailure;
 };
 
 // Public source evidence only. No follower identity, account initialization,
@@ -30,6 +55,13 @@ export class SourceFeed {
   private readonly timers: NonNullable<SourceFeedOptions["timers"]>;
   private readonly interests = new Map<string, Interest>();
   private readonly flights = new Map<string, Promise<SourceSnapshot>>();
+  private readonly flightReceipts = new WeakMap<
+    Promise<SourceSnapshot>,
+    { failure?: SourceFailure }
+  >();
+  private readonly preparedRetries = new Map<string, Set<PreparedRetry>>();
+  private readonly closedSignal = new AbortController();
+  private preparedRetryCount = 0;
   private readonly waiters: {
     resolve: () => void;
     reject: (error: unknown) => void;
@@ -89,6 +121,202 @@ export class SourceFeed {
     return structuredClone(await this.refresh(id, onDemand));
   }
 
+  /** Server-owned prepared source only. No caller error or retry token is accepted. */
+  async readPrepared(
+    id: string,
+    onDemand: SourceWork,
+    limits: PreparedSourceRetryLimits,
+    validate: () => void,
+  ): Promise<SourceSnapshot> {
+    validate();
+    const signal = AbortSignal.any([limits.signal, this.closedSignal.signal]);
+    if (signal.aborted) throw signal.reason;
+    if (!Number.isFinite(limits.remainingMs()) || limits.remainingMs() <= 0)
+      throw this.preparedDeadline();
+    const knownFailure = this.interests.get(id)?.failure;
+    const attempt = this.read(id, onDemand);
+    const flight = this.flights.get(id);
+    try {
+      // Existing flights keep their original context and cost ownership.
+      const value = await this.untilCancelled(attempt, signal);
+      validate();
+      if (limits.remainingMs() <= 0) throw this.preparedDeadline();
+      return value;
+    } catch (error) {
+      if (signal.aborted) throw signal.reason;
+      const failure = flight
+        ? this.flightReceipts.get(flight)?.failure
+        : knownFailure;
+      if (
+        !isUnsentReadBudgetDenial(error) ||
+        !failure ||
+        this.interests.get(id)?.failure !== failure ||
+        failure.error !== error ||
+        !Number.isFinite(failure.retryAt) ||
+        this.preparedRetryCount >= 64
+      )
+        throw error;
+      validate();
+      const delay = Math.max(0, failure.retryAt - this.clock());
+      if (delay >= limits.remainingMs()) throw error;
+      const cancelled = new AbortController(),
+        retrySignal = AbortSignal.any([signal, cancelled.signal]),
+        entry: PreparedRetry = {
+          failure,
+          onDemand,
+          limits,
+          validate,
+          signal: retrySignal,
+          cancelled,
+          used: false,
+        };
+      const remove = () => this.removePreparedRetry(id, entry);
+      let entries = this.preparedRetries.get(id);
+      if (!entries) this.preparedRetries.set(id, (entries = new Set()));
+      entries.add(entry);
+      this.preparedRetryCount++;
+      retrySignal.addEventListener("abort", remove, { once: true });
+      if (retrySignal.aborted) remove();
+      try {
+        // Do not clear/renew failure or shorten its original backoff. The
+        // refresh gate also sees this live waiter if its timer wins this turn.
+        await limits.wait(delay, retrySignal);
+        if (retrySignal.aborted) throw retrySignal.reason;
+        validate();
+        if (limits.remainingMs() <= 0) throw this.preparedDeadline();
+        // Exactly one normal retry. Its cache/singleflight/backoff/5s checks
+        // stay authoritative; another failure is returned, never looped.
+        const value = await this.untilCancelled(
+          this.read(id, onDemand),
+          retrySignal,
+        );
+        validate();
+        if (limits.remainingMs() <= 0) throw this.preparedDeadline();
+        return value;
+      } finally {
+        remove();
+        retrySignal.removeEventListener("abort", remove);
+      }
+    }
+  }
+
+  /** Successful-audit selection only. Registration performs no source read. */
+  registerPreparedSources(
+    selected: readonly PreparedSourceSelection[],
+    limits: PreparedSourceRetryLimits,
+  ): () => void {
+    const entries: { id: string; entry: PreparedRetry; stop(): void }[] = [];
+    const dispose = () => {
+      for (const { id, entry, stop } of entries.splice(0)) {
+        this.removePreparedRetry(id, entry);
+        entry.signal.removeEventListener("abort", stop);
+      }
+    };
+    try {
+      if (this.closed) throw this.closedError();
+      if (limits.signal.aborted) throw limits.signal.reason;
+      if (limits.remainingMs() <= 0) throw this.preparedDeadline();
+      if (new Set(selected.map((source) => source.id)).size !== selected.length)
+        throw this.preparedDeadline();
+      for (const source of selected) {
+        source.validate();
+        const failure = this.interests.get(source.id)?.failure;
+        if (
+          !failure ||
+          !Number.isFinite(failure.retryAt) ||
+          !isUnsentReadBudgetDenial(failure.error)
+        )
+          continue;
+        if (this.preparedRetryCount >= 64) throw this.preparedDeadline();
+        const cancelled = new AbortController(),
+          signal = AbortSignal.any([
+            limits.signal,
+            this.closedSignal.signal,
+            cancelled.signal,
+          ]),
+          entry: PreparedRetry = {
+            failure,
+            onDemand: (work) => source.onDemand(work),
+            validate: () => source.validate(),
+            limits,
+            signal,
+            cancelled,
+            used: false,
+          },
+          stop = () => this.removePreparedRetry(source.id, entry);
+        let group = this.preparedRetries.get(source.id);
+        if (!group) this.preparedRetries.set(source.id, (group = new Set()));
+        group.add(entry);
+        this.preparedRetryCount++;
+        signal.addEventListener("abort", stop, { once: true });
+        entries.push({ id: source.id, entry, stop });
+        if (signal.aborted) stop();
+      }
+      return dispose;
+    } catch (error) {
+      dispose();
+      throw error;
+    }
+  }
+
+  private preparedDeadline() {
+    return new AgentError(
+      "VENUE_READ_DEADLINE",
+      "Prepared source wait expired.",
+      true,
+      503,
+    );
+  }
+  private removePreparedRetry(id: string, entry: PreparedRetry) {
+    const entries = this.preparedRetries.get(id);
+    if (!entries?.delete(entry)) return;
+    this.preparedRetryCount--;
+    if (!entries.size) this.preparedRetries.delete(id);
+  }
+  private preparedSourceWork(id: string): SourceWork | undefined {
+    for (const entry of this.preparedRetries.get(id) ?? []) {
+      if (entry.used) continue;
+      try {
+        if (entry.signal.aborted) throw entry.signal.reason;
+        const current = this.interests.get(id)?.failure;
+        if (current !== entry.failure)
+          throw current?.error ?? this.preparedDeadline();
+        if (entry.limits.remainingMs() <= 0) throw this.preparedDeadline();
+        entry.validate();
+      } catch (error) {
+        this.removePreparedRetry(id, entry);
+        entry.cancelled.abort(error);
+        continue;
+      }
+      entry.used = true;
+      return async (work) => {
+        if (entry.signal.aborted) throw entry.signal.reason;
+        entry.validate();
+        if (entry.limits.remainingMs() <= 0) throw this.preparedDeadline();
+        return entry.onDemand(work);
+      };
+    }
+  }
+  private async untilCancelled<T>(
+    work: Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T> {
+    if (signal.aborted) {
+      void work.catch(() => {});
+      throw signal.reason;
+    }
+    let stop!: () => void;
+    const cancelled = new Promise<never>((_, reject) => {
+      stop = () => reject(signal.reason);
+      signal.addEventListener("abort", stop, { once: true });
+    });
+    try {
+      return await Promise.race([work, cancelled]);
+    } finally {
+      signal.removeEventListener("abort", stop);
+    }
+  }
+
   pollOnce(): Promise<void> {
     if (this.closed) return Promise.resolve();
     if (this.polling) return this.polling;
@@ -109,6 +337,9 @@ export class SourceFeed {
     if (this.closed) return;
     this.closed = true;
     this.stopTimer();
+    this.preparedRetries.clear();
+    this.preparedRetryCount = 0;
+    this.closedSignal.abort(this.closedError());
     this.interests.clear();
     this.flights.clear();
     this.polling = undefined;
@@ -159,8 +390,20 @@ export class SourceFeed {
   private async pollInterests(): Promise<void> {
     const at = this.clock();
     for (const [id, interest] of this.interests)
-      if (at - interest.lastReadAt >= this.interestTtlMs)
+      if (at - interest.lastReadAt >= this.interestTtlMs) {
         this.interests.delete(id);
+        for (const entry of this.preparedRetries.get(id) ?? []) {
+          this.removePreparedRetry(id, entry);
+          entry.cancelled.abort(
+            new AgentError(
+              "SOURCE_INTEREST_EXPIRED",
+              "Public source sampling interest expired.",
+              true,
+              503,
+            ),
+          );
+        }
+      }
     if (!this.interests.size) {
       this.stopTimer();
       return;
@@ -189,7 +432,16 @@ export class SourceFeed {
       // renew interest, or spend another public REST read while it is fresh.
       return Promise.resolve(interest.snapshot);
     }
-    const work = this.perform(id, onDemand);
+    // Select synchronously before creating a new flight. A same-turn ordinary
+    // timer can join this real prepared fetch, never race it with a new
+    // unframed request. An already existing flight returned above is unchanged.
+    const receipt: { failure?: SourceFailure } = {};
+    const work = this.perform(
+      id,
+      this.preparedSourceWork(id) ?? onDemand,
+      receipt,
+    );
+    this.flightReceipts.set(work, receipt);
     this.flights.set(id, work);
     const cleanup = () => {
       if (this.flights.get(id) === work) this.flights.delete(id);
@@ -230,6 +482,7 @@ export class SourceFeed {
   private async perform(
     id: string,
     onDemand?: (work: () => Promise<SourceSnapshot>) => Promise<SourceSnapshot>,
+    receipt: { failure?: SourceFailure } = {},
   ): Promise<SourceSnapshot> {
     await this.acquire();
     try {
@@ -263,11 +516,14 @@ export class SourceFeed {
       return snapshot;
     } catch (error) {
       const current = this.interests.get(id);
-      if (!this.closed && current)
-        current.failure = {
+      if (!this.closed && current) {
+        const failure = {
           error,
           retryAt: this.clock() + this.retryDelay(error),
         };
+        current.failure = failure;
+        receipt.failure = failure;
+      }
       throw error;
     } finally {
       this.release();

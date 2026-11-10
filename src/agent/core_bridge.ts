@@ -47,6 +47,7 @@ import {
   type ForeignAccountRead,
 } from "./venue-order-snapshots.js";
 import { SourceFeed } from "./source-feed.js";
+import type { SourceSnapshot } from "./adapter.js";
 import {
   PerpsSourceIdentities,
   sourceRequiresRwa,
@@ -180,6 +181,7 @@ type PreparedEntry = {
   timer: ReturnType<typeof setTimeout>;
   expired: boolean;
   auditHash?: string;
+  disposeSourceRetries?: () => void;
   proposal?: string;
   writeBinding?: string;
   attempted?: { id: string; fingerprint: string };
@@ -482,14 +484,36 @@ export class CoreBridge {
         "This dedicated RWA flow requires Standard mode; unified or portfolio-margin balances cannot be counted as separate DEX collateral.",
       );
   }
-  async source(id: string, minimumRequiresRwa = false) {
+  async source(
+    id: string,
+    minimumRequiresRwa = false,
+    observation?: AccountObservationLimits,
+  ) {
     const prepared = this.preparedSource?.getStore();
-    if (prepared) this.checkPreparedSource(prepared, id, minimumRequiresRwa);
+    const validate = () => {
+      if (!prepared) return;
+      this.checkPreparedSource(prepared, id, minimumRequiresRwa);
+      this.assertPrepared(prepared).sourceRetryLimits();
+    };
+    if (prepared) validate();
     if (minimumRequiresRwa) await this.sourceIdentities.resolve(id, true);
-    const snapshot = await this.sourceFeed.read(
-      id,
-      prepared ? (work) => prepared.window!.supplement(work) : undefined,
-    );
+    const snapshot = prepared
+      ? await this.assertPrepared(prepared).readSource(
+          (limits) =>
+            this.sourceFeed.readPrepared(
+              id,
+              async (work) => {
+                validate();
+                return this.assertPrepared(prepared).supplement(work, {
+                  signal: limits.signal,
+                });
+              },
+              limits,
+              validate,
+            ),
+          observation,
+        )
+      : await this.sourceFeed.read(id);
     if (
       snapshot.observation_scope_requires_rwa !== undefined ||
       minimumRequiresRwa
@@ -524,6 +548,7 @@ export class CoreBridge {
           503,
         );
     }
+    if (prepared) validate();
     return snapshot;
   }
   private async readSource(id: string) {
@@ -1281,6 +1306,8 @@ export class CoreBridge {
   private async finishPrepared(entry: PreparedEntry): Promise<void> {
     entry.expired = true;
     clearTimeout(entry.timer);
+    entry.disposeSourceRetries?.();
+    entry.disposeSourceRetries = undefined;
     if (entry.window) await entry.window.close();
     else if (entry.pin) await this.venueReads.cancelPreparedPending(entry.pin);
   }
@@ -1511,6 +1538,35 @@ export class CoreBridge {
     const snap = await window.read(() => this.account(user, p), limits);
     this.assertPrepared(entry);
     entry.auditHash = fingerprint(snap);
+    const selectedSources = new Map<string, { requiresRwa: boolean }>();
+    for (const s of entry.portfolio.sleeves.filter(
+      (s) => s.state !== "closed",
+    )) {
+      const requiresRwa = sourceRequiresRwa(s.trader as Candidate),
+        prior = selectedSources.get(s.trader.id);
+      if (prior && prior.requiresRwa !== requiresRwa)
+        throw this.preparedFailure();
+      selectedSources.set(s.trader.id, { requiresRwa });
+    }
+    // Only existing verified-unsent interests participate. This synchronous
+    // selection neither creates interest nor starts a read or changes backoff.
+    entry.disposeSourceRetries = this.sourceFeed.registerPreparedSources(
+      [...selectedSources].map(([id, { requiresRwa }]) => {
+        const validate = () => {
+          this.checkPreparedSource(entry, id, requiresRwa);
+          this.assertPrepared(entry).sourceRetryLimits();
+        };
+        return {
+          id,
+          validate,
+          onDemand: async (work: () => Promise<SourceSnapshot>) => {
+            validate();
+            return this.assertPrepared(entry).supplement(work);
+          },
+        };
+      }),
+      window.sourceRetryLimits(),
+    );
     return snap;
   }
   private prepareExecution(entry: PreparedEntry, value: any, proposal: any) {
@@ -3270,7 +3326,11 @@ export class CoreBridge {
             input.minimum_requires_rwa === true,
           );
           return this.preparedSource.run(entry, () =>
-            this.source(input.trader_id, input.minimum_requires_rwa === true),
+            this.source(
+              input.trader_id,
+              input.minimum_requires_rwa === true,
+              submitObservation,
+            ),
           );
         case "read_plan_evidence":
           if (!Array.isArray(input.traders) || !input.traders.length)
@@ -3610,7 +3670,8 @@ export async function startManagedCoreBridge(
     const submitObservation =
       req.params.operation === "submit" ||
       req.params.operation === "prepare_portfolio" ||
-      (req.params.operation === "account" && !!req.get("x-ride-read-window"))
+      (["account", "source"].includes(req.params.operation) &&
+        !!req.get("x-ride-read-window"))
         ? submitObservationCancellation(req, res)
         : undefined;
     try {

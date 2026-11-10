@@ -2,6 +2,7 @@ import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import { framePendingContinuation } from "./core-frame-coordinator.js";
+import type { PreparedSourceRetryLimits } from "./source-feed.js";
 import {
   costPlanUnavailable,
   type ObservationPlanLease,
@@ -73,6 +74,11 @@ export interface PreparedAccountWindow {
     work: () => Promise<T>,
     limits?: AccountObservationLimits,
   ): Promise<T>;
+  readSource<T>(
+    work: (limits: PreparedSourceRetryLimits) => Promise<T>,
+    limits?: AccountObservationLimits,
+  ): Promise<T>;
+  sourceRetryLimits(): PreparedSourceRetryLimits;
   close(): Promise<void>;
   assertNextChildReady(): void;
 }
@@ -549,6 +555,70 @@ export class VenueReads {
       mode: parent.childCount === 1 ? "cold" : "warm",
       expires_at: scope.until,
       supplement,
+      sourceRetryLimits: () => {
+        if (closed || failed || reads < 1 || scope.admission.signal.aborted)
+          throw costPlanUnavailable();
+        return this.sourceRetryWindow(scope.admission.signal, () =>
+          Math.min(
+            scope.until - this.clock(),
+            scope.monotonicUntil - this.monotonicClock(),
+          ),
+        );
+      },
+      readSource: async <T>(
+        work: (limits: PreparedSourceRetryLimits) => Promise<T>,
+        limits: AccountObservationLimits = {},
+      ): Promise<T> => {
+        if (
+          closed ||
+          failed ||
+          reads < 1 ||
+          (reading && !supplementReading) ||
+          scope.admission.signal.aborted
+        )
+          throw costPlanUnavailable();
+        if (
+          limits.deadlineMs !== undefined &&
+          !Number.isSafeInteger(limits.deadlineMs)
+        )
+          throw this.accountDeadline();
+        const until = Math.min(scope.until, limits.deadlineMs ?? Infinity),
+          monotonicUntil = Math.min(
+            scope.monotonicUntil,
+            this.monotonicClock() + Math.max(0, until - this.clock()),
+          ),
+          admission = new AbortController(),
+          stop = () => admission.abort(scope.admission.signal.reason),
+          callerStop = () => admission.abort(limits.signal!.reason),
+          remainingMs = () =>
+            Math.min(
+              until - this.clock(),
+              monotonicUntil - this.monotonicClock(),
+            );
+        scope.admission.signal.addEventListener("abort", stop, { once: true });
+        limits.signal?.addEventListener("abort", callerStop, { once: true });
+        if (scope.admission.signal.aborted) stop();
+        if (limits.signal?.aborted) callerStop();
+        const timer = this.timers.setTimeout(
+          () => admission.abort(this.accountDeadline()),
+          Math.max(0, remainingMs()),
+        );
+        try {
+          if (admission.signal.aborted) throw admission.signal.reason;
+          if (remainingMs() <= 0) throw this.accountDeadline();
+          const value = await this.abortable(
+            work(this.sourceRetryWindow(admission.signal, remainingMs)),
+            admission.signal,
+          );
+          if (admission.signal.aborted) throw admission.signal.reason;
+          if (remainingMs() <= 0) throw this.accountDeadline();
+          return value;
+        } finally {
+          this.timers.clearTimeout(timer);
+          scope.admission.signal.removeEventListener("abort", stop);
+          limits.signal?.removeEventListener("abort", callerStop);
+        }
+      },
       assertNextChildReady: () => {
         if (
           closed ||
@@ -1439,6 +1509,40 @@ export class VenueReads {
     } finally {
       this.maybeReport();
     }
+  }
+  private sourceRetryWindow(
+    admission: AbortSignal,
+    remainingMs: () => number,
+  ): PreparedSourceRetryLimits {
+    return {
+      signal: admission,
+      remainingMs,
+      wait: async (delayMs, cancelled) => {
+        if (
+          !Number.isSafeInteger(delayMs) ||
+          delayMs < 0 ||
+          delayMs >= remainingMs()
+        )
+          throw this.accountDeadline();
+        const signal = AbortSignal.any([admission, cancelled]);
+        if (signal.aborted) throw signal.reason;
+        await new Promise<void>((resolve, reject) => {
+          const stop = () => {
+            this.timers.clearTimeout(waiting);
+            signal.removeEventListener("abort", stop);
+            reject(signal.reason);
+          };
+          const waiting = this.timers.setTimeout(() => {
+            signal.removeEventListener("abort", stop);
+            if (signal.aborted) reject(signal.reason);
+            else if (remainingMs() <= 0) reject(this.accountDeadline());
+            else resolve();
+          }, delayMs);
+          signal.addEventListener("abort", stop, { once: true });
+          if (signal.aborted) stop();
+        });
+      },
+    };
   }
   private async abortable<T>(
     work: Promise<T>,
