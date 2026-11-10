@@ -35,7 +35,7 @@ function fixture() {
       mutate({
         state: grant ? "granted" : "pending",
         frame_id: body.frame_id,
-        expires_at: time.at + 20000,
+        expires_at: grant ? time.at + 20000 : body.deadline_ms,
         retry_after_ms: 1000,
         reserved_weight: grant ? body.weight : Math.min(250, body.weight),
         guaranteed_complete: body.mode !== "cold_trial",
@@ -67,11 +67,15 @@ function fixture() {
   };
 }
 
-async function pending(work: Promise<unknown>, retry = 1000) {
+async function pending(
+  work: Promise<unknown>,
+  retry = 1000,
+  reason = "READ_FRAME_PENDING",
+) {
   await assert.rejects(work, (error) => {
     assert.ok(error instanceof AgentError);
     assert.equal(error.code, "VENUE_READ_BUDGET_EXHAUSTED");
-    assert.equal(error.details?.reason_code, "READ_FRAME_PENDING");
+    assert.equal(error.details?.reason_code, reason);
     assert.equal(error.details?.retry_after_ms, retry);
     return true;
   });
@@ -157,6 +161,7 @@ it("does not share an active lease with a concurrent account frame", async () =>
     await pending(
       f.coordinator.begin(owner, 200, 101000, signal(), "learned"),
       250,
+      "READ_FRAME_IN_USE",
     );
     assert.equal(f.calls.length, 1);
     await f.coordinator.end(lease.frame_id);
@@ -310,6 +315,8 @@ it("bounds queued owners and drains pending reservations without retaining user 
       );
     await pending(
       f.coordinator.begin("f".repeat(64), 900, 101000, signal(), "cold_trial"),
+      1000,
+      "READ_FRAME_QUEUE_FULL",
     );
     assert.equal(f.calls.length, 64);
     await f.coordinator.close?.();

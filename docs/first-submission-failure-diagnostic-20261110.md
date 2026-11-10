@@ -42,3 +42,21 @@ legacy FIFO expiry. Uncoordinated reads keep their original one-second wait.
 fail-only read diagnostics. Neither can authorize a BEGIN wait, retry a sent
 read or establish acceptance or absence of a financial action. Completed
 account evidence is never reused by this scheduling change.
+
+Only a new Perps execution without a frozen outbox opts into bounded Core-frame
+pending polling. This is an internal submit-preflight option, not request JSON.
+Normal monitoring still performs one poll and preserves its original pending
+episode. Private preflight can continue a verified pending receipt only with
+an opaque capability bound to the same factory frame, UUID, owner, weight,
+mode and first queue deadline. Removal, replacement or changed identity fails
+closed without allocating another frame. Each await revalidates that binding.
+
+Pending polling consumes the existing 20-second caller/execution/monotonic
+window; a grant does not renew it or the 12-second provider wire limit. No
+local ticket, venue request or financial submission exists before a grant.
+Authenticated 503 local-budget receipts must explicitly say the upstream read
+was not sent. Remote errors cannot forge the local capability. A peer-owned
+grant reports `READ_FRAME_IN_USE`; local polling, queue capacity and changed
+identity have distinct fixed reasons. Cancelling one waiter never releases
+another caller's grant. These are read-capacity diagnostics, never financial
+acceptance, absence or retry authorization.

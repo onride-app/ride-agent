@@ -204,12 +204,34 @@ it("bounds fresh pre-outbox account evidence by execution expiry and the trusted
     assert.equal(bind, false);
     assert.equal(limits.signal, stop.signal);
     assert.equal(limits.deadlineMs, until);
+    assert.equal(limits.waitForFrameAdmission, true);
     return f.snap;
   };
   try {
     await f.bridge.submit("alice", f.p, f.e, {
       signal: stop.signal,
       deadlineMs: until,
+    });
+  } finally {
+    await f.bridge.close();
+  }
+});
+
+it("request body options cannot opt ordinary account monitoring into private frame polling", async () => {
+  const f = bridgeFixture();
+  f.stub.account = async (...args: any[]) => {
+    assert.deepEqual(args, ["alice", f.p]);
+    return f.snap;
+  };
+  try {
+    await f.bridge.operation("account", {
+      user_id: "alice",
+      portfolio: f.p,
+      waitForFrameAdmission: true,
+      observation: {
+        waitForFrameAdmission: true,
+        deadlineMs: Number.MAX_SAFE_INTEGER,
+      },
     });
   } finally {
     await f.bridge.close();
