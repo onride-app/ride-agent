@@ -8,6 +8,9 @@ import { AgentService } from "./service.js";
 import { PgRepository, Cursor } from "./repository.js";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { submitObservationCancellation } from "./submit-observation-cancellation.js";
+import { issueNativeSourcePlan } from "./native-source-plan.js";
 import type { AddressInfo } from "node:net";
 import { VenueReads } from "./venue-reads.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
@@ -515,6 +518,7 @@ async function fixture(
       monotonicClock: time.clock,
       frameCoordinator: coordinator,
       report: () => {},
+      freshSubmitReadIssuer: bridge,
       observationPlans: {
         read: async (owner) => {
           if (dirty) throw new Error("fixture dirty lease busy");
@@ -787,6 +791,540 @@ async function fixture(
     },
   };
 }
+async function primeFixed286(f: Awaited<ReturnType<typeof fixture>>) {
+  const owner = "f".repeat(64),
+    frameOwner = "e".repeat(64);
+  f.budget.refreshObservationPlan(owner, { demand: 184, peaks: [164] }, 600000);
+  const sources = [1, 2, 3].map((n) => ({
+    id: "trader_" + String(n).repeat(32),
+    address: "0x" + String(n).repeat(40),
+    requires_rwa: false as const,
+  }));
+  const token = issueNativeSourcePlan(
+    {
+      issuer: {},
+      reader: {},
+      budget: f.budget,
+      costOwner: owner,
+      frameOwner,
+      firstDeadline: f.time.at + 100000,
+      operationalBinding: "c".repeat(64),
+      purpose: "audit_source",
+      network: "mainnet",
+    },
+    { sources, nonClosedSleeves: 3, fixedSourceIds: [sources[0].id] },
+    async () => {},
+  );
+  const supplements = f.budget.preparedSupplementPlan(
+      frameOwner,
+      [sources[0].id],
+      token,
+    ),
+    interest = f.budget.beginObservationInterest(owner),
+    parent = f.budget.beginObservationBundle(
+      owner,
+      184,
+      1,
+      interest,
+      false,
+      [sources[0].id],
+      supplements,
+    );
+  const pay = async (
+    ticket: any,
+    reserve: number,
+    actual = reserve,
+    lane: "account" | "source" = "account",
+  ) => {
+    const wire = await f.time.run(
+      f.budget.acquire(
+        lane,
+        reserve,
+        "fixture-source",
+        new AbortController().signal,
+        false,
+        ticket,
+      ),
+    );
+    wire.sent();
+    wire.settle(actual);
+    wire.release();
+  };
+  const a = parent.beginChild();
+  for (let i = 0; i < 7; i++) await pay(a, 20);
+  for (let i = 0; i < 2; i++) await pay(a, 2);
+  a.close(true);
+  const s = parent.beginSupplement();
+  for (let i = 0; i < 3; i++) await pay(s, 2, 2, "source");
+  s.close(true);
+  const h = parent.beginHistorySupplement(sources[0].id);
+  await pay(h, 120, 100, "source");
+  await pay(h, 120, 36, "source");
+  h.close(true);
+  parent.close(true);
+  f.budget.endObservationInterest(interest);
+  assert.equal((f.budget as any).recentObservationWeights.at(-1), 286);
+}
+function freshOriginal(f: Awaited<ReturnType<typeof fixture>>) {
+  const frozen = {
+    id: "fresh-original-" + randomUUID(),
+    key: "perps:BTC",
+    target_quantity: "0",
+    allocations: { [f.p.sleeves[0].copy_id]: "0" },
+    revision: f.p.revision,
+    created_at: f.time.at,
+    expires_at: f.time.at + 60000,
+  };
+  const e: Execution = {
+    ...frozen,
+    fingerprint: fingerprint(frozen),
+    status: "queued",
+    task_id: null,
+    observed_quantity: null,
+    reserve_usdc: "0.000000",
+    error: null,
+  };
+  f.p.executions.push(e);
+  return e;
+}
+function graphCaller(f: Awaited<ReturnType<typeof fixture>>, t: TestContext) {
+  const req = Object.assign(new EventEmitter(), { aborted: false }),
+    res = Object.assign(new EventEmitter(), { writableEnded: false });
+  const caller = submitObservationCancellation(
+    req as any,
+    res as any,
+    f.time.clock,
+    f.time.timers,
+    f.time.clock,
+  );
+  t.after(() => caller.close());
+  return caller;
+}
+
+for (const unified of [false, true])
+  it(
+    "actual fresh CoreBridge submit after Fixed286 reads complete " +
+      (unified ? "Unified3UA no-WS" : "Standard2UA") +
+      " evidence before any real-PG outbox and keeps original financial wire",
+    {
+      skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL,
+      timeout: 30000,
+    },
+    async (t) => {
+      const f = await fixture(t, { unified });
+      f.resetBank(0);
+      f.setPlan({ demand: 244, peaks: [224] });
+      if (unified)
+        f.b.orderSnapshots = {
+          readAccount: async () => {
+            throw Error("fixture WS unavailable, retain full REST");
+          },
+          readAbstraction: async () => {
+            throw Error("fixture WS abstraction unavailable");
+          },
+        };
+      await primeFixed286(f);
+      const url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
+      assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
+      const admin = new pg.Pool({ connectionString: url.toString(), max: 2 }),
+        schema = "fresh_submit_" + randomUUID().replaceAll("-", "");
+      await admin.query("CREATE SCHEMA " + schema);
+      url.searchParams.set("options", "-c search_path=" + schema);
+      const pool = new pg.Pool({ connectionString: url.toString(), max: 3 });
+      t.after(async () => {
+        await pool.end();
+        await admin.query("DROP SCHEMA " + schema + " CASCADE");
+        await admin.end();
+      });
+      await pool.query(
+        "CREATE TABLE ride_agent_core_outbox(execution_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,portfolio_id TEXT NOT NULL,fingerprint TEXT NOT NULL,payload JSONB NOT NULL,response JSONB)",
+      );
+      const plans = new AccountObservationPlans(pool);
+      await plans.migrate();
+      const owner = f.b.perpsCostOwner(
+          graphUser,
+          f.p,
+          false,
+          f.identity,
+          f.p.account_id,
+          [],
+        ),
+        signal = new AbortController().signal;
+      const lease = await plans.begin(owner, signal);
+      assert.equal(
+        await plans.complete(lease, { demand: 244, peaks: [224] }, signal),
+        true,
+      );
+      f.b.venueReads.observationPlans = plans;
+      let selects = 0,
+        inserts = 0;
+      f.b.pool = {
+        query: async (sql: string, args: any[]) => {
+          if (sql.startsWith("SELECT fingerprint,payload,response")) selects++;
+          if (sql.startsWith("INSERT INTO ride_agent_core_outbox")) {
+            inserts++;
+            assert.ok(f.reads.some((read) => read.type === "userFillsByTime"));
+            assert.ok(f.reads.some((read) => read.type === "userFunding"));
+          }
+          return pool.query(sql, args);
+        },
+        end: async () => {},
+      };
+      const env: Record<string, string> = {
+        RIDE_AGENT_EXECUTOR_TOKEN: "e".repeat(48),
+        RIDE_AGENT_CORE_URL: "https://core.fixture",
+        RIDE_AGENT_CORE_SERVICE_TOKEN: "fixture-token",
+        RIDE_AGENT_DATABASE_URL: "postgresql://127.0.0.1:1/unused",
+        RIDE_AGENT_TRADER_ID_SALT: "s".repeat(32),
+        RIDE_AGENT_NETWORK: "mainnet",
+        RIDE_AGENT_INFO_READ_ROUTE: "core",
+      };
+      for (const [key, value] of Object.entries(env)) {
+        const previous = process.env[key];
+        process.env[key] = value;
+        t.after(() => {
+          if (previous === undefined) delete process.env[key];
+          else process.env[key] = previous;
+        });
+      }
+      // Startup dependencies are fixture I/O, but the actual authenticated HTTP
+      // route issues the original caller and calls the real operation/submit code.
+      t.mock.method(
+        CoreBridge.prototype,
+        "migrate",
+        async function (this: CoreBridge) {
+          await (this as any).pool.end();
+          Object.assign(this, f.b);
+          const previous = f.b.venueReads;
+          const reads = new VenueReads(previous.fetcher, f.time.clock, 2, {
+            transport: "core_shared_info",
+            budget: f.budget,
+            timers: f.time.timers,
+            monotonicClock: f.time.clock,
+            frameCoordinator: previous.frameCoordinator,
+            observationPlans: plans,
+            requireObservationPlanBinding: true,
+            freshSubmitReadIssuer: this,
+            report: () => {},
+          });
+          (this as any).venueReads = reads;
+          f.b.venueReads = reads;
+        },
+      );
+      const managed = await startManagedCoreBridge({
+        host: "127.0.0.1",
+        port: 0,
+      });
+      t.after(() => managed.close());
+      const e = freshOriginal(f),
+        frozen = structuredClone(e),
+        started = f.time.at;
+      let resume!: () => void;
+      f.identityBarrier(
+        new Promise<void>((resolve) => {
+          resume = resolve;
+        }),
+      );
+      const work = fetch(
+        "http://127.0.0.1:" +
+          (managed.listener.address() as AddressInfo).port +
+          "/internal/agent/submit",
+        {
+          method: "POST",
+          headers: {
+            authorization: "Bearer " + env.RIDE_AGENT_EXECUTOR_TOKEN,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            user_id: graphUser,
+            portfolio: f.p,
+            execution: e,
+          }),
+        },
+      ).then(async (response) => {
+        const value = await response.json();
+        assert.equal(response.status, 200, JSON.stringify(value));
+        return value;
+      });
+      // Let the real PG SELECT complete without advancing the synthetic caller.
+      for (let n = 0; n < 50 && f.bank().identityCalls === 0; n++)
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      assert.equal(selects, 1);
+      assert.equal(inserts, 0);
+      assert.equal(
+        (
+          await pool.query(
+            "SELECT count(*)::int AS n FROM ride_agent_core_outbox",
+          )
+        ).rows[0].n,
+        0,
+      );
+      assert.equal(f.reads.length, 0);
+      f.identityBarrier(undefined);
+      resume();
+      // Real PG I/O is yielded, while elapsed monotonic time consumes the fake
+      // scope. This is not the old1ms-per-yield fixture clock.
+      let done = false,
+        result: any,
+        failure: any;
+      void work.then(
+        (v) => {
+          done = true;
+          result = v;
+        },
+        (error) => {
+          done = true;
+          failure = error;
+        },
+      );
+      let previous = performance.now();
+      for (let n = 0; !done && n < 1000; n++) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        const now = performance.now();
+        await f.time.advance(Math.max(1, Math.floor(now - previous)));
+        previous = now;
+      }
+      assert.equal(done, true);
+      if (failure) throw failure;
+      assert.deepEqual(result, { task_id: "original-fixture-task" });
+      assert.deepEqual(e, frozen);
+      assert.ok(f.time.at - started < 20000);
+      assert.equal(inserts, 1);
+      assert.equal(f.bank().posts, 1);
+      const row = (await pool.query("SELECT * FROM ride_agent_core_outbox"))
+        .rows[0];
+      assert.equal(row.execution_id, e.id);
+      assert.equal(row.fingerprint, e.fingerprint);
+      assert.equal(row.payload.created_at, e.created_at);
+      assert.equal(row.payload.expires_at, e.expires_at);
+      assert.equal(row.payload.target_quantity, "0");
+      assert.equal(row.payload.entry_reference_price, null);
+      assert.deepEqual(
+        f.reads
+          .filter((read) => read.type === "userAbstraction")
+          .map((read) => read.user)
+          .sort(),
+        Array(unified ? 3 : 2).fill(f.identity.master),
+      );
+      for (const type of [
+        "clearinghouseState",
+        "frontendOpenOrders",
+        "userFillsByTime",
+        "userFunding",
+        "userNonFundingLedgerUpdates",
+      ])
+        assert.ok(f.reads.some((read) => read.type === type));
+      if (unified)
+        for (const type of ["spotClearinghouseState", "perpDexs"])
+          assert.ok(f.reads.some((read) => read.type === type));
+      for (
+        let n = 0;
+        n < 50 && !f.b.venueReads.diagnostics().cost_plans.persisted;
+        n++
+      )
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      assert.equal(f.b.venueReads.diagnostics().cost_plans.persisted, 1);
+      assert.ok(f.budget.snapshot().observation_pacing_ms > 0);
+      assert.equal(f.begins[0].weight, 244);
+      assert.ok(f.begins[0].deadline_ms <= started + 100000);
+      // A saved accepted action returns unchanged even after its caller closes.
+      const caller = graphCaller(f, t);
+      caller.close();
+      e.status = "uncertain";
+      const before = f.reads.length;
+      assert.deepEqual(
+        await f.bridge.submit(graphUser, f.p, e, caller),
+        result,
+      );
+      assert.equal(f.reads.length, before);
+      assert.equal(inserts, 1);
+      assert.equal(f.bank().posts, 1);
+    },
+  );
+
+for (const kind of [
+  "unknown",
+  "task",
+  "first-failure",
+  "different-frozen-record",
+  "unregistered",
+] as const)
+  it(`actual CoreBridge ${kind} caller retains old pacing and cannot mint the new purpose`, async (t) => {
+    const f = await fixture(t, { unified: true });
+    f.resetBank(0);
+    await primeFixed286(f);
+    const e = freshOriginal(f),
+      caller = graphCaller(f, t);
+    if (kind === "unknown") e.status = "uncertain";
+    if (kind === "task") e.task_id = "old-task";
+    if (kind === "first-failure")
+      e.first_submission_failure = { producer: "old" } as any;
+    if (kind === "different-frozen-record") {
+      const prior = structuredClone(e);
+      prior.target_quantity = "1";
+      f.p.executions[0] = prior;
+    }
+    let issued = 0;
+    const issue = f.b.venueReads.freshSubmitReadPurpose.bind(f.b.venueReads);
+    f.b.venueReads.freshSubmitReadPurpose = (...args: any[]) => {
+      issued++;
+      return issue(...args);
+    };
+    await assert.rejects(
+      f.time.run(
+        f.bridge.submit(
+          graphUser,
+          f.p,
+          e,
+          kind === "unregistered" ? { ...caller } : caller,
+        ),
+      ),
+      (error: any) => error.details?.reason_code === "READ_LOCAL_PACING",
+    );
+    assert.equal(issued, kind === "unregistered" ? 1 : 0);
+    assert.equal(f.reads.length, 0);
+    assert.equal(f.outboxes.size, 0);
+    assert.equal(f.bank().posts, 0);
+  });
+for (const kind of [
+  "control",
+  "revision",
+  "account",
+  "state",
+  "loss",
+  "reconciliation",
+  "asset-filter",
+  "preferences",
+  "sleeve",
+  "intent",
+  "frozen",
+] as const)
+  it(`fresh CoreBridge capability rejects changed ${kind} across its identity await before any venue wire`, async (t) => {
+    const f = await fixture(t, { unified: true });
+    f.resetBank(0);
+    await primeFixed286(f);
+    const e = freshOriginal(f),
+      caller = graphCaller(f, t);
+    let resume!: () => void;
+    f.identityBarrier(
+      new Promise<void>((resolve) => {
+        resume = resolve;
+      }),
+    );
+    const work = f.bridge.submit(graphUser, f.p, e, caller),
+      failed = assert.rejects(work, { code: "VENUE_COST_PLAN_UNAVAILABLE" });
+    await flush();
+    assert.equal(f.bank().identityCalls, 1);
+    switch (kind) {
+      case "control":
+        f.p.control_id = "changed";
+        break;
+      case "revision":
+        f.p.revision++;
+        break;
+      case "account":
+        f.p.venue_accounts!.perps = "foreign";
+        break;
+      case "state":
+        f.p.state = "closing";
+        break;
+      case "loss":
+        f.p.loss_latched = true;
+        break;
+      case "reconciliation":
+        f.p.reconciliation = "incomplete";
+        break;
+      case "asset-filter":
+        f.p.asset_filter_version = undefined;
+        break;
+      case "preferences":
+        f.p.preferences.loss_trigger_pct++;
+        break;
+      case "sleeve":
+        f.p.sleeves[0].stop_loss_pct++;
+        break;
+      case "intent":
+        f.p.sleeves[0].intents[e.key] = { key: e.key, price: "100" } as any;
+        break;
+      case "frozen":
+        e.target_quantity = "1";
+        break;
+    }
+    f.identityBarrier(undefined);
+    resume();
+    await failed;
+    assert.equal(f.reads.length, 0);
+    assert.equal(f.outboxes.size, 0);
+    assert.equal(f.bank().posts, 0);
+  });
+it("fresh scheduling never hashes unrelated historical JSON or treats it as current financial evidence", async (t) => {
+  const f = await fixture(t, { unified: true });
+  f.resetBank(0);
+  await primeFixed286(f);
+  const e = freshOriginal(f),
+    caller = graphCaller(f, t);
+  for (const field of ["decisions", "receipts", "snapshot", "seen_fills"])
+    Object.defineProperty(f.p, field, {
+      configurable: true,
+      get() {
+        assert.fail("irrelevant history getter: " + field);
+      },
+    });
+  for (let n = 0; n < 1500; n++)
+    f.p.executions.push({
+      id: "old-" + n,
+      status: "failed",
+      toJSON() {
+        assert.fail(
+          "historical payload must not be serialized by live capability checks",
+        );
+      },
+    } as any);
+  assert.deepEqual(
+    await f.time.run(f.bridge.submit(graphUser, f.p, e, caller)),
+    { task_id: "original-fixture-task" },
+  );
+  assert.equal(f.outboxes.size, 1);
+  assert.ok(f.reads.length > 0);
+});
+for (const changedAt of [2, 3])
+  it(`trusted fresh Unified preflight retains mode guard${changedAt} and never writes an outbox after a real enum change`, async (t) => {
+    const f = await fixture(t, { unified: true });
+    f.resetBank(0);
+    await primeFixed286(f);
+    f.setPlan({ demand: 244, peaks: [224] });
+    f.b.orderSnapshots = {
+      readAccount: async () => {
+        throw Error("unavailable");
+      },
+      readAbstraction: async () => {
+        throw Error("unavailable");
+      },
+    };
+    const read = f.b.venueReads.fetcher;
+    let uas = 0;
+    f.b.venueReads.fetcher = async (...args: any[]) => {
+      const response = await read(...args);
+      if (
+        JSON.parse(String(args[1].body)).type === "userAbstraction" &&
+        ++uas === changedAt
+      ) {
+        const changed = Response.json("disabled");
+        recordCoordinatedEvidence(changed, f.time.at);
+        return changed;
+      }
+      return response;
+    };
+    const e = freshOriginal(f);
+    await assert.rejects(
+      f.time.run(f.bridge.submit(graphUser, f.p, e, graphCaller(f, t))),
+      { code: "ACCOUNT_STALE" },
+    );
+    assert.equal(uas, changedAt);
+    assert.equal(f.outboxes.size, 0);
+    assert.equal(f.bank().posts, 0);
+    assert.ok(f.budget.snapshot().used > 286);
+  });
 it("actual private account graph completes two fresh histories, binds one proposal and ends credit before one original financial POST", async (t) => {
   const f = await fixture(t),
     ready = await f.prepare();

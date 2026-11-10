@@ -38,3 +38,32 @@ the existing six-second pacing interval and then read again within the original
 deadlines. Completed account data is not reused. History completeness, source
 and account freshness, financial checks, quotas and sent-unknown accounting are
 unchanged. These scheduling tests are local fixtures, not real-trade acceptance.
+
+## Fresh submission scheduling purpose
+
+Only the existing fresh Perps submit branch, after its original outbox SELECT,
+may issue a private single-observation pacing purpose. The original execution
+must still be queued, taskless, unretired, unexpired and match the unique frozen
+record in that portfolio. An absent outbox is routing metadata, not exchange
+absence, trading authority or permission to replay an unknown action. Existing
+outboxes, recovery, unknown executions, Prediction and prepared children keep
+their existing paths.
+
+The runtime capability binds the configured bridge issuer, reader, budget,
+original server HTTP caller and its original wall/monotonic cutoff, compact
+portfolio control facts and original execution fingerprint. It cannot be made
+from JSON, a boolean, a copied caller or an existing ALS/prepared scope. After
+Core verifies the current account identity, it binds that exact cost owner,
+scope and live FIFO interest and is consumed by one local reservation.
+
+This purpose skips only the soft `nextObservationAt` predicate. Busy work and
+the true FIFO head wait before PG-plan attempts and Core polls within the same
+original lifetime. Core admission, local hard quota, fees, unknown debt,
+exclusivity, quarantine and provider cooldown remain authoritative. Completion
+still records the entire real cost and advances ordinary pacing; the old
+schedule is never reset or refunded. FIRST100, Core20, caller20, provider12,
+source/position5, account30, risk and frozen financial/outbox checks are
+unchanged. A preceding Fixed286 observation creates21.45s soft spacing, which
+cannot fit a fresh caller20 by waiting alone; this narrowly scoped scheduling
+exception can read again only when all hard gates permit. It promises neither
+continuous account freshness nor successful trading under a full Core ledger.

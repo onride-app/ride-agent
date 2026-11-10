@@ -1,5 +1,9 @@
 import { AgentError } from "./contracts.js";
 import {
+  assertFreshSubmitPacingPermit,
+  type FreshSubmitPacingPermit,
+} from "./fresh-submit-read-purpose.js";
+import {
   nativeSourceBudgetTerms,
   type NativeSourcePlan,
 } from "./native-source-plan.js";
@@ -645,6 +649,7 @@ export class VenueReadBudget {
       historySources?: readonly string[];
       supplements?: PreparedSupplementPlan;
     },
+    freshSubmitPermit?: FreshSubmitPacingPermit,
   ): AccountReadReservation {
     this.prune();
     const now = this.clock();
@@ -657,6 +662,15 @@ export class VenueReadBudget {
       : undefined;
     if (interestToken && (!interest?.waiting || interest.owner !== owner))
       throw costPlanUnavailable();
+    if (freshSubmitPermit) {
+      if (bundle || !interestToken) throw costPlanUnavailable();
+      assertFreshSubmitPacingPermit(
+        freshSubmitPermit,
+        this,
+        owner,
+        interestToken,
+      );
+    }
     const entry = this.observationEntry(owner, interestToken === undefined);
     if (interestToken) entry.interests.add(interestToken);
     if (
@@ -727,7 +741,7 @@ export class VenueReadBudget {
             ),
       );
     }
-    if (now < this.nextObservationAt) {
+    if (now < this.nextObservationAt && !freshSubmitPermit) {
       this.observations.deferred++;
       const retry = Math.min(
         60000,
@@ -773,6 +787,14 @@ export class VenueReadBudget {
         error.details!.retry_after_ms!,
       );
     }
+    if (freshSubmitPermit)
+      assertFreshSubmitPacingPermit(
+        freshSubmitPermit,
+        this,
+        owner,
+        interestToken,
+        true,
+      );
     if (interestToken) {
       entry.interests.delete(interestToken);
       interest!.waiting = false;
