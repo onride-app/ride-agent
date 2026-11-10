@@ -174,6 +174,11 @@ type PreparedEntry = {
   stable: string;
   costOwner: string;
   frameOwner: string;
+  sourceEvidenceEnds?: Map<string, Set<number>>;
+  historyBindings?: Map<
+    string,
+    { start: number; end: number; requiresRwa: boolean }
+  >;
   deadline: number;
   pin?: object;
   window?: PreparedAccountWindow;
@@ -500,16 +505,18 @@ export class CoreBridge {
     const snapshot = prepared
       ? await this.assertPrepared(prepared).readSource(
           (limits) =>
-            this.sourceFeed.readPrepared(
-              id,
-              async (work) => {
-                validate();
-                return this.assertPrepared(prepared).supplement(work, {
-                  signal: limits.signal,
-                });
-              },
-              limits,
-              validate,
+            this.preparedSource.exit(() =>
+              this.sourceFeed.readPrepared(
+                id,
+                async (work) => {
+                  validate();
+                  return this.assertPrepared(prepared).supplement(work, {
+                    signal: limits.signal,
+                  });
+                },
+                limits,
+                validate,
+              ),
             ),
           observation,
         )
@@ -548,7 +555,14 @@ export class CoreBridge {
           503,
         );
     }
-    if (prepared) validate();
+    if (prepared) {
+      validate();
+      const values = prepared.sourceEvidenceEnds?.get(id) ?? new Set<number>();
+      if (!values.has(snapshot.observed_at) && values.size >= 64)
+        throw this.preparedFailure();
+      values.add(snapshot.observed_at);
+      (prepared.sourceEvidenceEnds ??= new Map()).set(id, values);
+    }
     return snapshot;
   }
   private async readSource(id: string) {
@@ -1234,11 +1248,13 @@ export class CoreBridge {
       "has_nonterminal_executions",
       "audit_snapshot_hash",
       "write_binding",
+      "purpose",
     ]);
     if (
       !value ||
       typeof value !== "object" ||
       Array.isArray(value) ||
+      (value.purpose !== undefined && value.purpose !== "audit_source") ||
       Object.keys(value).some((k) => !allowed.has(k)) ||
       JSON.stringify(value).length > 32768 ||
       typeof value.id !== "string" ||
@@ -1256,6 +1272,9 @@ export class CoreBridge {
         (s: any) =>
           !s ||
           typeof s.copy_id !== "string" ||
+          (s.fixed_last_fill_at !== undefined &&
+            (!Number.isSafeInteger(s.fixed_last_fill_at) ||
+              s.fixed_last_fill_at < 0)) ||
           (s.copy_mode !== undefined &&
             !["ride_recommends", "fixed", "proportional"].includes(
               s.copy_mode,
@@ -1285,6 +1304,20 @@ export class CoreBridge {
     )
       throw this.preparedFailure();
     return entry.window;
+  }
+  private activeReadonlyControl(user: string, p: Portfolio): boolean {
+    const entry = this.preparedEntries.get(fingerprint([user, p.id]));
+    return (
+      !!entry &&
+      entry.portfolio.purpose === "audit_source" &&
+      !entry.expired &&
+      !!entry.window &&
+      entry.window.expires_at > now() &&
+      entry.portfolio.revision === p.revision &&
+      (entry.portfolio.control_id ?? null) === (p.control_id ?? null) &&
+      (entry.portfolio.venue_accounts?.perps ?? entry.portfolio.account_id) ===
+        (p.venue_accounts?.perps ?? p.account_id)
+    );
   }
   private preparedHandle(
     handle: string,
@@ -1345,15 +1378,19 @@ export class CoreBridge {
     value: any,
     limits?: AccountObservationLimits,
   ) {
+    const reply = (result: Record<string, unknown>) =>
+      value?.purpose === "audit_source"
+        ? { ...result, purpose: "audit_source", execution_eligible: false }
+        : result;
     if (this.infoReadRoute !== "core" || this.network !== "mainnet")
-      return { state: "unsupported" };
+      return reply({ state: "unsupported" });
     const p = this.preparedInput(value),
       stable = preparedOperationalBinding(p);
     if (typeof user !== "string" || !user || user.length > 256)
       throw this.preparedFailure();
     const key = fingerprint([user, p.id]);
     if (this.preparedCreating.has(key))
-      return { state: "pending", retry_after_ms: 250 };
+      return reply({ state: "pending", retry_after_ms: 250 });
     if (this.preparedCreating.size >= 64) throw this.preparedFailure();
     this.preparedCreating.set(key, { stable, cancelled: false });
     try {
@@ -1361,15 +1398,21 @@ export class CoreBridge {
       // Metadata does not prove ownership of an already granted peer lease.
       // Only its handle, expiry or drain may end that live read capability.
       if (entry?.window && !entry.expired && entry.window.expires_at > now())
-        return p.sleeves.some((s) => s.copy_mode === "fixed")
-          ? { state: "unsupported" }
-          : { state: "pending", retry_after_ms: 250 };
-      if (p.sleeves.some((s) => s.copy_mode === "fixed")) {
+        return p.purpose !== "audit_source" &&
+          p.sleeves.some((s) => s.copy_mode === "fixed")
+          ? reply({ state: "unsupported" })
+          : reply({ state: "pending", retry_after_ms: 250 });
+      const fixed = p.sleeves.filter((s) => s.copy_mode === "fixed");
+      if (
+        (p.purpose !== "audit_source" && fixed.length > 0) ||
+        (p.purpose === "audit_source" &&
+          new Set(fixed.map((s) => s.trader.id)).size !== fixed.length)
+      ) {
         if (entry && !entry.window && entry.stable === stable) {
           await this.finishPrepared(entry).catch(() => {});
           this.preparedEntries.delete(key);
         }
-        return { state: "unsupported" };
+        return reply({ state: "unsupported" });
       }
       for (const [id, old] of this.preparedEntries) {
         if (old.deadline <= now() && old !== entry) {
@@ -1387,7 +1430,7 @@ export class CoreBridge {
         throw this.preparedFailure();
       }
       if (entry?.window || entry?.polling)
-        return { state: "pending", retry_after_ms: 250 };
+        return reply({ state: "pending", retry_after_ms: 250 });
       if (!entry) {
         if (this.preparedEntries.size >= 64) throw this.preparedFailure();
         const costOwner = await this.preparedIdentity(user, p);
@@ -1436,6 +1479,19 @@ export class CoreBridge {
           entry.deadline,
           entry.pin,
           limits?.signal,
+          {
+            purpose: p.purpose ?? "audit_submit",
+            historySources:
+              p.purpose === "audit_source"
+                ? [
+                    ...new Set(
+                      p.sleeves
+                        .filter((s) => s.copy_mode === "fixed")
+                        .map((s) => s.trader.id),
+                    ),
+                  ]
+                : [],
+          },
         );
         if (entry.expired || this.preparedEntries.get(key) !== entry) {
           await window.close();
@@ -1450,18 +1506,18 @@ export class CoreBridge {
           Math.max(0, window.expires_at - now()),
         );
         entry.timer.unref();
-        return {
+        return reply({
           state: "ready",
           handle: entry.handle,
           mode: window.mode,
           expires_at: window.expires_at,
-        };
+        });
       } catch (error) {
         if (isPreparedBundleUnsupported(error)) {
           await this.finishPrepared(entry).catch(() => {});
           if (this.preparedEntries.get(key) === entry)
             this.preparedEntries.delete(key);
-          return { state: "unsupported" };
+          return reply({ state: "unsupported" });
         }
         const pin = framePendingContinuation(error);
         if (pin && (entry.expired || this.preparedEntries.get(key) !== entry)) {
@@ -1471,11 +1527,11 @@ export class CoreBridge {
         if (pin && !entry.expired && this.preparedEntries.get(key) === entry) {
           if (entry.pin && entry.pin !== pin) throw this.preparedFailure();
           entry.pin = pin;
-          return {
+          return reply({
             state: "pending",
             retry_after_ms:
               (error as AgentError).details?.retry_after_ms ?? 1000,
-          };
+          });
         }
         await this.finishPrepared(entry).catch(() => {});
         throw error;
@@ -1492,16 +1548,34 @@ export class CoreBridge {
       stable = preparedOperationalBinding(p),
       key = fingerprint([user, p.id]);
     const entry = this.preparedEntries.get(key);
+    const readonly = p.purpose === "audit_source";
+    const reply = (cancelled: boolean) =>
+      readonly ? { ok: true, pending_cancelled: cancelled } : { ok: true };
     // A pending interest is not ownership of a peer's ready window.
-    if (entry?.window) return { ok: true };
+    if (
+      entry?.window &&
+      !(
+        readonly &&
+        entry.stable === stable &&
+        (entry.expired || entry.window.expires_at <= now())
+      )
+    )
+      return reply(false);
     const creating = this.preparedCreating.get(key);
     if (creating?.stable === stable) creating.cancelled = true;
+    if (
+      readonly &&
+      ((entry && entry.stable !== stable) ||
+        (creating && creating.stable !== stable))
+    )
+      return reply(false);
     if (entry && entry.stable === stable) {
-      await this.finishPrepared(entry).catch(() => {});
+      if (readonly) await this.finishPrepared(entry);
+      else await this.finishPrepared(entry).catch(() => {});
       if (this.preparedEntries.get(key) === entry)
         this.preparedEntries.delete(key);
     }
-    return { ok: true };
+    return reply(!creating);
   }
 
   private checkPreparedSource(
@@ -1527,7 +1601,7 @@ export class CoreBridge {
     limits?: AccountObservationLimits,
   ) {
     const window = this.assertPrepared(entry);
-    const compact = preparedPortfolioInput(p);
+    const compact = preparedPortfolioInput(p, entry.portfolio.purpose);
     if (
       entry.auditHash ||
       entry.attempted ||
@@ -1570,6 +1644,8 @@ export class CoreBridge {
     return snap;
   }
   private prepareExecution(entry: PreparedEntry, value: any, proposal: any) {
+    if (entry.portfolio.purpose === "audit_source")
+      throw this.preparedFailure();
     const window = this.assertPrepared(entry),
       p = this.preparedInput(value);
     window.assertNextChildReady();
@@ -2673,6 +2749,8 @@ export class CoreBridge {
       "SELECT fingerprint,payload,response FROM ride_agent_core_outbox WHERE execution_id=$1 AND user_id=$2 AND portfolio_id=$3",
       [e.id, user, p.id],
     );
+    if (!existing.rowCount && this.activeReadonlyControl(user, p))
+      throw this.preparedFailure();
     if (prepared && existing.rowCount) throw this.preparedFailure();
     if (!existing.rowCount && e.expires_at <= now())
       throw new AgentError(
@@ -2883,6 +2961,7 @@ export class CoreBridge {
         // never cancels an outboxed action or adds another financial retry.
         await this.finishPrepared(prepared);
       }
+      if (this.activeReadonlyControl(user, p)) throw this.preparedFailure();
       await this.pool.query(
         "INSERT INTO ride_agent_core_outbox(execution_id,user_id,portfolio_id,fingerprint,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
         [e.id, user, p.id, e.fingerprint, payload],
@@ -3264,6 +3343,133 @@ export class CoreBridge {
     }
     check();
   }
+  private async sourceFills(
+    input: any,
+    entry?: PreparedEntry,
+    observation?: AccountObservationLimits,
+  ) {
+    if (entry) {
+      this.assertPrepared(entry);
+      const fixed = entry.portfolio.sleeves.filter(
+        (s) =>
+          s.state !== "closed" &&
+          s.copy_mode === "fixed" &&
+          s.trader.id === input.trader_id,
+      );
+      if (
+        entry.portfolio.purpose !== "audit_source" ||
+        !entry.auditHash ||
+        fixed.length !== 1 ||
+        input.market !== "perps" ||
+        !Number.isSafeInteger(fixed[0].fixed_last_fill_at) ||
+        input.start_at !== fixed[0].fixed_last_fill_at ||
+        !entry.sourceEvidenceEnds?.get(input.trader_id)?.has(input.end_at) ||
+        sourceRequiresRwa(fixed[0].trader as Candidate) !==
+          (input.minimum_requires_rwa === true)
+      )
+        throw this.preparedFailure();
+      const prior = entry.historyBindings?.get(input.trader_id);
+      const binding = {
+        start: input.start_at,
+        end: input.end_at,
+        requiresRwa: input.minimum_requires_rwa === true,
+      };
+      if (prior && fingerprint(prior) !== fingerprint(binding))
+        throw this.preparedFailure();
+      (entry.historyBindings ??= new Map()).set(input.trader_id, binding);
+    }
+    if (
+      !Number.isSafeInteger(input.start_at) ||
+      !Number.isSafeInteger(input.end_at) ||
+      input.end_at <= input.start_at ||
+      input.end_at - input.start_at > 31 * 86400_000 ||
+      input.end_at > now()
+    )
+      throw new AgentError(
+        "INVALID_WINDOW",
+        "Invalid source history window.",
+        false,
+        400,
+      );
+    if (input.market !== "perps")
+      return {
+        fills: [],
+        complete: false,
+        reason: "Authenticated prediction source fill history is unavailable.",
+      };
+    if (
+      input.minimum_requires_rwa !== undefined &&
+      typeof input.minimum_requires_rwa !== "boolean"
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "Source observation scope is invalid.",
+        false,
+        400,
+      );
+    const source = await this.source(
+      input.trader_id,
+      input.minimum_requires_rwa === true,
+      observation,
+    );
+    const row = await this.resolve(input.trader_id);
+    if (!sourceEvidenceReady(source) || !Array.isArray(source.perps_dexes))
+      throw new AgentError(
+        "SOURCE_FILL_EVIDENCE_MISSING",
+        "Observed Perps source scopes are unavailable.",
+        true,
+      );
+    const readHistory = () =>
+      this.paged(
+        "userFillsByTime",
+        row.address,
+        input.start_at,
+        input.end_at,
+        true,
+      );
+    const history = entry
+      ? await this.assertPrepared(entry).history(
+          input.trader_id,
+          readHistory,
+          (payload) => {
+            const value = payload as Record<string, unknown>;
+            if (
+              !value ||
+              value.type !== "userFillsByTime" ||
+              value.user !== row.address ||
+              !Number.isSafeInteger(value.startTime) ||
+              (value.startTime as number) < input.start_at ||
+              (value.startTime as number) > input.end_at ||
+              value.endTime !== input.end_at ||
+              value.aggregateByTime !== false ||
+              Object.keys(value).some(
+                (key) =>
+                  ![
+                    "type",
+                    "user",
+                    "startTime",
+                    "endTime",
+                    "aggregateByTime",
+                  ].includes(key),
+              )
+            )
+              throw this.preparedFailure();
+          },
+          observation,
+        )
+      : await readHistory();
+    return {
+      complete: history.complete,
+      observation_scope_requires_rwa: source.observation_scope_requires_rwa,
+      fills: scopedSourceFills(
+        history.events,
+        input.trader_id,
+        source.perps_dexes,
+        input.start_at,
+        input.end_at,
+      ),
+    };
+  }
   async operation(
     op: string,
     input: any,
@@ -3292,7 +3498,8 @@ export class CoreBridge {
       switch (op) {
         case "finish_portfolio":
           await this.finishPrepared(entry).catch(() => {});
-          this.preparedEntries.delete(entry.key);
+          if (this.preparedEntries.get(entry.key) === entry)
+            this.preparedEntries.delete(entry.key);
           return { ok: true };
         case "prepare_execution":
           return this.prepareExecution(entry, input.portfolio, input.proposal);
@@ -3304,6 +3511,8 @@ export class CoreBridge {
             submitObservation,
           );
         case "submit":
+          if (entry.portfolio.purpose === "audit_source")
+            throw this.preparedFailure();
           this.bindPreparedExecution(
             entry,
             input.user_id,
@@ -3331,6 +3540,12 @@ export class CoreBridge {
               input.minimum_requires_rwa === true,
               submitObservation,
             ),
+          );
+        case "source_fills":
+          if (entry.portfolio.purpose !== "audit_source")
+            throw this.preparedFailure();
+          return this.preparedSource.run(entry, () =>
+            this.sourceFills(input, entry, submitObservation),
           );
         case "read_plan_evidence":
           if (!Array.isArray(input.traders) || !input.traders.length)
@@ -3428,67 +3643,8 @@ export class CoreBridge {
           input.trader_id,
           input.minimum_requires_rwa === true,
         );
-      case "source_fills": {
-        if (
-          !Number.isSafeInteger(input.start_at) ||
-          !Number.isSafeInteger(input.end_at) ||
-          input.end_at <= input.start_at ||
-          input.end_at - input.start_at > 31 * 86400_000 ||
-          input.end_at > now()
-        )
-          throw new AgentError(
-            "INVALID_WINDOW",
-            "Invalid source history window.",
-            false,
-            400,
-          );
-        if (input.market !== "perps")
-          return {
-            fills: [],
-            complete: false,
-            reason:
-              "Authenticated prediction source fill history is unavailable.",
-          };
-        if (
-          input.minimum_requires_rwa !== undefined &&
-          typeof input.minimum_requires_rwa !== "boolean"
-        )
-          throw new AgentError(
-            "SOURCE_SCOPE_UNAVAILABLE",
-            "Source observation scope is invalid.",
-            false,
-            400,
-          );
-        const source = await this.source(
-          input.trader_id,
-          input.minimum_requires_rwa === true,
-        );
-        const row = await this.resolve(input.trader_id);
-        if (!sourceEvidenceReady(source) || !Array.isArray(source.perps_dexes))
-          throw new AgentError(
-            "SOURCE_FILL_EVIDENCE_MISSING",
-            "Observed Perps source scopes are unavailable.",
-            true,
-          );
-        const history = await this.paged(
-          "userFillsByTime",
-          row.address,
-          input.start_at,
-          input.end_at,
-          true,
-        );
-        return {
-          complete: history.complete,
-          observation_scope_requires_rwa: source.observation_scope_requires_rwa,
-          fills: scopedSourceFills(
-            history.events,
-            input.trader_id,
-            source.perps_dexes,
-            input.start_at,
-            input.end_at,
-          ),
-        };
-      }
+      case "source_fills":
+        return this.sourceFills(input);
       case "notification_status": {
         const tokens = await this.core("push_tokens", {
           user_id: input.user_id,
@@ -3524,6 +3680,8 @@ export class CoreBridge {
       case "activation_check":
         return this.activationCheck(input.user_id, input.portfolio);
       case "bind":
+        if (this.activeReadonlyControl(input.user_id, input.portfolio))
+          throw this.preparedFailure();
         return this.account(input.user_id, input.portfolio, true);
       case "account":
         return this.account(input.user_id, input.portfolio);
@@ -3670,7 +3828,7 @@ export async function startManagedCoreBridge(
     const submitObservation =
       req.params.operation === "submit" ||
       req.params.operation === "prepare_portfolio" ||
-      (["account", "source"].includes(req.params.operation) &&
+      (["account", "source", "source_fills"].includes(req.params.operation) &&
         !!req.get("x-ride-read-window"))
         ? submitObservationCancellation(req, res)
         : undefined;

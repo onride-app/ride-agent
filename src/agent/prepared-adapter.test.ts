@@ -8,7 +8,10 @@ import { AgentError, failure } from "./contracts.js";
 import { candidate, snapshot } from "./fixtures.js";
 import { fingerprint, now, recommend, type Execution } from "./domain.js";
 import { fromPlan } from "./service.js";
-import { preparedPortfolioInput } from "./prepared-portfolio.js";
+import {
+  preparedPortfolioInput,
+  preparedOperationalBinding,
+} from "./prepared-portfolio.js";
 
 const handle = "fixture_private_capability_0123456789abcdef";
 function fixturePortfolio() {
@@ -65,11 +68,15 @@ type Call = {
 async function transport(
   prepare: () => any,
   work: (adapter: BridgeAdapter, calls: Call[]) => Promise<void>,
+  options: {
+    finish?: () => unknown | Promise<unknown>;
+    monotonicClock?: () => number;
+  } = {},
 ) {
   const app = express(),
     calls: Call[] = [];
   app.use(express.text({ type: "application/json", limit: "2mb" }));
-  app.post("/internal/agent/:operation", (req, res) => {
+  app.post("/internal/agent/:operation", async (req, res) => {
     const operation = req.params.operation as string;
     calls.push({
       operation,
@@ -79,6 +86,11 @@ async function transport(
     });
     if (operation === "prepare_portfolio") {
       const value = prepare();
+      if (value instanceof AgentError)
+        res.status(value.httpStatus).json(failure(value));
+      else res.json(value);
+    } else if (operation === "finish_portfolio" && options.finish) {
+      const value = await options.finish();
       if (value instanceof AgentError)
         res.status(value.httpStatus).json(failure(value));
       else res.json(value);
@@ -94,6 +106,8 @@ async function transport(
       });
     else if (operation === "submit")
       res.json({ task_id: "task_original_fixture" });
+    else if (operation === "source_fills")
+      res.json({ fills: [], complete: true });
     else res.json({ ok: true });
   });
   const server = createServer(app);
@@ -101,7 +115,12 @@ async function transport(
   try {
     const port = (server.address() as AddressInfo).port;
     await work(
-      new BridgeAdapter(`http://127.0.0.1:${port}`, "fixture-service-token"),
+      new BridgeAdapter(
+        `http://127.0.0.1:${port}`,
+        "fixture-service-token",
+        undefined,
+        options.monotonicClock,
+      ),
       calls,
     );
   } finally {
@@ -116,6 +135,240 @@ const ready = (mode: "cold" | "warm" = "warm") => ({
   handle,
   mode,
   expires_at: now() + 20000,
+});
+const readonlyReady = () => ({
+  ...ready(),
+  purpose: "audit_source",
+  execution_eligible: false,
+});
+
+it("requires explicit readonly purpose echo and never treats an old warm reply as financial authority", async () => {
+  for (const reply of [
+    ready(),
+    { ...readonlyReady(), execution_eligible: true },
+    { state: "pending", retry_after_ms: 1000 },
+  ]) {
+    await transport(
+      () => reply,
+      async (adapter, calls) => {
+        const p = fixturePortfolio();
+        let entered = false;
+        await assert.rejects(
+          adapter.withPreparedPortfolio(
+            "user",
+            preparedPortfolioInput(p, "audit_source"),
+            async () => {
+              entered = true;
+            },
+          ),
+          { code: "EXECUTOR_RESPONSE_INVALID" },
+        );
+        assert.equal(entered, false);
+        assert.equal(
+          calls.filter((c) =>
+            ["account", "prepare_execution", "submit"].includes(c.operation),
+          ).length,
+          0,
+        );
+        if (reply.state === "ready")
+          assert.equal(
+            calls.filter((c) => c.operation === "finish_portfolio").length,
+            1,
+          );
+      },
+    );
+  }
+});
+
+it("readonly release in flight blocks same-scope financial RPCs until a strict success acknowledgment", async () => {
+  let release!: (value: unknown) => void, seen!: () => void;
+  const gate = new Promise<unknown>((r) => {
+      release = r;
+    }),
+    received = new Promise<void>((r) => {
+      seen = r;
+    });
+  await transport(
+    readonlyReady,
+    async (adapter, calls) => {
+      const p = fixturePortfolio(),
+        e = execution(p);
+      await adapter.withPreparedPortfolio(
+        "user",
+        preparedPortfolioInput(p, "audit_source"),
+        async (window) => {
+          assert.equal(window.mode, "warm");
+          assert.equal(window.purpose, "audit_source");
+          assert.equal(window.execution_eligible, false);
+          const finishing = window.release!();
+          await received;
+          await assert.rejects(adapter.submit("user", p, e), {
+            code: "EXECUTION_REJECTED",
+          });
+          await assert.rejects(adapter.bind("user", p), {
+            code: "EXECUTION_REJECTED",
+          });
+          await assert.rejects(adapter.prepareExecution("user", p, e), {
+            code: "EXECUTION_REJECTED",
+          });
+          assert.equal(
+            calls.filter((c) =>
+              ["submit", "bind", "prepare_execution"].includes(c.operation),
+            ).length,
+            0,
+          );
+          release({ ok: true });
+          await finishing;
+          await adapter.submit("user", p, e);
+          assert.equal(calls.filter((c) => c.operation === "submit").length, 1);
+          assert.equal(
+            calls.find((c) => c.operation === "submit")!.header,
+            undefined,
+          );
+        },
+      );
+    },
+    {
+      finish: () => {
+        seen();
+        return gate;
+      },
+    },
+  );
+});
+
+it("false missing and failed readonly release ACKs keep the local financial barrier without blocking unrelated scope", async () => {
+  for (const reply of [
+    { ok: false },
+    {},
+    new AgentError("EXECUTOR_UNAVAILABLE", "fixture", true, 503),
+  ]) {
+    await transport(
+      readonlyReady,
+      async (adapter, calls) => {
+        const p = fixturePortfolio(),
+          e = execution(p);
+        await adapter.withPreparedPortfolio(
+          "user",
+          preparedPortfolioInput(p, "audit_source"),
+          async (window) => {
+            await assert.rejects(window.release!());
+            await assert.rejects(adapter.submit("user", p, e), {
+              code: "EXECUTION_REJECTED",
+            });
+            await assert.rejects(adapter.bind("user", p), {
+              code: "EXECUTION_REJECTED",
+            });
+            await assert.rejects(adapter.prepareExecution("user", p, e), {
+              code: "EXECUTION_REJECTED",
+            });
+            assert.equal(
+              calls.filter((c) =>
+                ["submit", "bind", "prepare_execution"].includes(c.operation),
+              ).length,
+              0,
+            );
+            const foreign = {
+              ...p,
+              id: p.id + "_other",
+              account_id: "different_account",
+              venue_accounts: { perps: "different_account" },
+            };
+            await adapter.submit("other_user", foreign, e);
+            assert.equal(
+              calls.find((c) => c.operation === "submit")!.header,
+              undefined,
+            );
+          },
+        );
+      },
+      { finish: () => reply },
+    );
+  }
+});
+
+it("readonly Fixed history uses the exact selected cursor and private header while legacy metadata hashes stay unchanged", async () => {
+  await transport(readonlyReady, async (adapter, calls) => {
+    const p = fixturePortfolio();
+    p.sleeves[0].copy_mode = "fixed";
+    p.sleeves[0].fixed_last_fill_at = now() - 1000;
+    const legacy = preparedPortfolioInput(p),
+      explicitLegacy = preparedPortfolioInput(p, "audit_submit"),
+      ro = preparedPortfolioInput(p, "audit_source");
+    assert.deepEqual(legacy, explicitLegacy);
+    assert.equal(Object.hasOwn(legacy, "purpose"), false);
+    assert.equal(Object.hasOwn(legacy.sleeves[0], "fixed_last_fill_at"), false);
+    assert.equal(
+      ro.sleeves[0].fixed_last_fill_at,
+      p.sleeves[0].fixed_last_fill_at,
+    );
+    assert.notEqual(
+      preparedOperationalBinding(legacy),
+      preparedOperationalBinding(ro),
+    );
+    await adapter.withPreparedPortfolio("user", ro, async () => {
+      await adapter.account("user", p);
+      await adapter.sourceFills(
+        p.sleeves[0].trader,
+        p.sleeves[0].fixed_last_fill_at!,
+        now(),
+      );
+      const history = calls.filter((c) => c.operation === "source_fills");
+      assert.equal(history.length, 1);
+      assert.equal(history[0].header, handle);
+      await assert.rejects(
+        adapter.sourceFills(
+          p.sleeves[0].trader,
+          p.sleeves[0].fixed_last_fill_at! - 1,
+          now(),
+        ),
+        { code: "SOURCE_SCOPE_UNAVAILABLE" },
+      );
+      await assert.rejects(
+        adapter.sourceFills(
+          { ...p.sleeves[0].trader, id: "foreign_source" },
+          p.sleeves[0].fixed_last_fill_at!,
+          now(),
+        ),
+        { code: "SOURCE_SCOPE_UNAVAILABLE" },
+      );
+      assert.equal(
+        calls.filter((c) => c.operation === "source_fills").length,
+        1,
+      );
+    });
+  });
+});
+
+it("readonly local assertLive preserves the original monotonic lifetime through a wall clock rollback", async (t) => {
+  let wall = 1793200000000,
+    mono = 0;
+  t.mock.method(Date, "now", () => wall);
+  await transport(
+    readonlyReady,
+    async (adapter, calls) => {
+      const p = fixturePortfolio();
+      await adapter.withPreparedPortfolio(
+        "user",
+        preparedPortfolioInput(p, "audit_source"),
+        async (window) => {
+          mono = 20001;
+          wall -= 60000;
+          assert.throws(() => window.assertLive!(), {
+            code: "VENUE_READ_DEADLINE",
+          });
+          await assert.rejects(adapter.account("user", p), {
+            code: "VENUE_READ_DEADLINE",
+          });
+          assert.equal(
+            calls.filter((c) => c.operation === "account").length,
+            0,
+          );
+        },
+      );
+    },
+    { monotonicClock: () => mono },
+  );
 });
 
 it("keeps the prepared capability in private headers and preserves exact financial request bytes", async () => {

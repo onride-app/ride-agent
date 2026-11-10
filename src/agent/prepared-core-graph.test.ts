@@ -128,6 +128,7 @@ async function fixture(
     unified?: boolean;
     threeSources?: boolean;
     existingSourceBackoff?: boolean;
+    concentratedSources?: boolean;
   } = {},
 ) {
   const time = new Time();
@@ -194,7 +195,8 @@ async function fixture(
     sourceRows = p.sleeves.map((sleeve, i) => ({
       trader: sleeve.trader.id,
       address: "0x" + String(i + 3).repeat(40),
-      asset: sleeve.trader.assets[0],
+      asset:
+        options.concentratedSources && i < 2 ? "BTC" : sleeve.trader.assets[0],
     })),
     sourceByAddress = new Map(sourceRows.map((row) => [row.address, row])),
     outboxes = new Map<string, any>(),
@@ -220,7 +222,8 @@ async function fixture(
     identityCalls = 0;
   let denyOrdinarySources = false,
     ordinarySourceDenials = 0,
-    sourcePoll: (() => void) | undefined;
+    sourcePoll: (() => void) | undefined,
+    fullSourceHistoryPage = false;
   const budget = new VenueReadBudget({
     clock: time.clock,
     timers: time.timers,
@@ -344,6 +347,15 @@ async function fixture(
         case "userFunding":
         case "userNonFundingLedgerUpdates":
           data = [];
+          if (
+            fullSourceHistoryPage &&
+            req.type === "userFillsByTime" &&
+            sourceByAddress.has(req.user)
+          )
+            data = Array.from({ length: 2000 }, (_, i) => ({
+              tid: i,
+              time: req.startTime + i,
+            }));
           break;
         case "allMids":
           data = options.threeSources
@@ -379,8 +391,13 @@ async function fixture(
         ).length === 3
       ) {
         assert.ok(
-          held >= 184,
-          "three real sources cannot borrow the second W184 scope",
+          held >=
+            (begins.at(-1).weight === 304
+              ? 120
+              : begins.at(-1).weight === 184
+                ? 0
+                : 184),
+          "three real sources cannot borrow reserved B or H credit",
         );
         assert.equal(paid + held, 900);
         events.push("three-source-second-scope-protected");
@@ -523,11 +540,11 @@ async function fixture(
     end: async () => {},
   };
   t.after(async () => bridge.close());
-  async function prepare() {
+  async function prepare(purpose?: "audit_source") {
     return (await time.run(
       bridge.operation("prepare_portfolio", {
         user_id: graphUser,
-        portfolio: preparedPortfolioInput(p),
+        portfolio: preparedPortfolioInput(p, purpose),
       }),
     )) as any;
   }
@@ -616,6 +633,13 @@ async function fixture(
       denyOrdinarySources = value;
     },
     ordinarySourceDenials: () => ordinarySourceDenials,
+    fullSourceHistoryPage: () => {
+      fullSourceHistoryPage = true;
+    },
+    diversifySources: () => {
+      for (const [i, row] of sourceRows.entries())
+        row.asset = p.sleeves[i].trader.assets[0];
+    },
     pollSources: () => sourcePoll?.(),
     bank: () => ({ paid, held, dirty, generation, posts, identityCalls }),
     setPlan: (value: any) => {
@@ -928,18 +952,306 @@ it("successful audit registers a repeated selected trader and identical scope on
   );
 });
 
-for (const { threeSources, existingSourceBackoff } of [
-  { threeSources: false, existingSourceBackoff: false },
-  { threeSources: true, existingSourceBackoff: false },
-  { threeSources: true, existingSourceBackoff: true },
+it("the actual readonly server graph reserves304 for complete A/S/F, rejects all financial entrypoints and keeps original outboxed recovery", async (t) => {
+  const f = await fixture(t, { unified: true, threeSources: true });
+  const fixed = f.p.sleeves[2];
+  fixed.copy_mode = "fixed";
+  fixed.fixed_last_fill_at = f.time.at - 10000;
+  f.resetBank(596);
+  const ready = await f.prepare("audit_source");
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.mode, "warm");
+  assert.equal(ready.purpose, "audit_source");
+  assert.equal(ready.execution_eligible, false);
+  assert.equal(f.begins.at(-1).weight, 304);
+  await f.audit(ready);
+  const sources = new Map<string, any>();
+  for (const sleeve of f.p.sleeves)
+    sources.set(
+      sleeve.trader.id,
+      await f.time.run(
+        f.bridge.operation(
+          "source",
+          {
+            trader_id: sleeve.trader.id,
+          },
+          undefined,
+          undefined,
+          ready.handle,
+        ),
+      ),
+    );
+  const source = sources.get(fixed.trader.id);
+  const input = {
+    trader_id: fixed.trader.id,
+    market: "perps",
+    start_at: fixed.fixed_last_fill_at,
+    end_at: source.observed_at,
+  };
+  const result = (await f.time.run(
+    f.bridge.operation(
+      "source_fills",
+      input,
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.fills, []);
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.bank().paid, 596 + 144 + 6 + 20);
+  assert.equal(f.bank().held, 134);
+  const reads = f.reads.length;
+  await assert.rejects(
+    f.bridge.operation(
+      "source_fills",
+      { ...input, start_at: input.start_at! + 1 },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  );
+  await assert.rejects(f.proposal(ready));
+  await assert.rejects(
+    f.bridge.operation("bind", { user_id: graphUser, portfolio: f.p }),
+  );
+  const frozen = {
+    id: "readonly-original-id",
+    key: "perps:BTC",
+    target_quantity: "0.1",
+    allocations: {},
+    revision: f.p.revision,
+    created_at: f.time.at,
+    expires_at: f.time.at + 60000,
+  };
+  const e: Execution = {
+    ...frozen,
+    fingerprint: fingerprint(frozen),
+    status: "queued",
+    task_id: null,
+    observed_quantity: null,
+    reserve_usdc: "1",
+    error: null,
+  };
+  await assert.rejects(
+    f.bridge.operation(
+      "submit",
+      { user_id: graphUser, portfolio: f.p, execution: e },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  );
+  await assert.rejects(
+    f.bridge.operation("submit", {
+      user_id: graphUser,
+      portfolio: f.p,
+      execution: e,
+    }),
+  );
+  assert.equal(f.reads.length, reads);
+  assert.equal(f.outboxes.size, 0);
+  assert.equal(f.bank().posts, 0);
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: preparedPortfolioInput(f.p, "audit_source"),
+    }),
+    { ok: true, pending_cancelled: false },
+  );
+  const response = { task_id: "original-outboxed-task" };
+  f.outboxes.set(e.id, {
+    fingerprint: e.fingerprint,
+    payload: { execution_id: e.id },
+    response,
+  });
+  assert.deepEqual(await f.bridge.submit(graphUser, f.p, e), response);
+  assert.equal(
+    f.bank().posts,
+    0,
+    "existing frozen response is returned without a new financial call",
+  );
+  assert.equal(f.b.activeReadonlyControl("another-user", f.p), false);
+  assert.equal(
+    f.b.activeReadonlyControl(graphUser, {
+      ...f.p,
+      account_id: "other-account",
+      venue_accounts: {},
+    }),
+    false,
+  );
+  assert.equal(
+    f.b.activeReadonlyControl(graphUser, {
+      ...f.p,
+      control_id: "other-control",
+    }),
+    false,
+  );
+  assert.equal(f.p.executions.length, 0);
+  await f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    ready.handle,
+  );
+});
+
+it("readonly history preserves the full-page continuation and refuses its second120 dispatch without changing the original cursor", async (t) => {
+  const f = await fixture(t, { unified: true, threeSources: true });
+  const fixed = f.p.sleeves[2];
+  fixed.copy_mode = "fixed";
+  fixed.fixed_last_fill_at = f.time.at - 10000;
+  f.resetBank(596);
+  f.fullSourceHistoryPage();
+  const ready = await f.prepare("audit_source");
+  await f.audit(ready);
+  const source = (await f.time.run(
+    f.bridge.operation(
+      "source",
+      { trader_id: fixed.trader.id },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  const before = f.reads.length,
+    cursor = fixed.fixed_last_fill_at;
+  await assert.rejects(
+    f.time.run(
+      f.bridge.operation(
+        "source_fills",
+        {
+          trader_id: fixed.trader.id,
+          market: "perps",
+          start_at: cursor,
+          end_at: source.observed_at,
+        },
+        undefined,
+        undefined,
+        ready.handle,
+      ),
+    ),
+  );
+  const history = f.reads
+    .slice(before)
+    .filter((r) => r.type === "userFillsByTime");
+  assert.equal(history.length, 1);
+  assert.equal(history[0].actual, 120);
+  assert.equal(fixed.fixed_last_fill_at, cursor);
+  assert.equal(f.p.executions.length, 0);
+  assert.equal(f.outboxes.size, 0);
+  assert.equal(f.bank().posts, 0);
+  assert.equal(f.bank().dirty, false);
+});
+
+it("readonly pending cancellation has exact acknowledgement and never claims a ready peer was cancelled", async (t) => {
+  const f = await fixture(t, { unified: true });
+  f.pendingFrames(true);
+  const pending = await f.prepare("audit_source");
+  assert.equal(pending.state, "pending");
+  assert.equal(pending.purpose, "audit_source");
+  assert.equal(pending.execution_eligible, false);
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: preparedPortfolioInput(f.p, "audit_source"),
+    }),
+    { ok: true, pending_cancelled: true },
+  );
+  assert.equal(f.b.preparedEntries.size, 0);
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.reads.length, 0);
+});
+
+it("readonly strict cancellation confirms only the same expired window and leaves a live or foreign ready peer intact", async (t) => {
+  const f = await fixture(t, { unified: true });
+  const ready = await f.prepare("audit_source"),
+    compact = preparedPortfolioInput(f.p, "audit_source");
+  assert.equal(ready.state, "ready");
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: compact,
+    }),
+    { ok: true, pending_cancelled: false },
+  );
+  assert.equal(f.bank().held, 184);
+  await f.time.advance(20001);
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: { ...compact, revision: compact.revision + 1 },
+    }),
+    { ok: true, pending_cancelled: false },
+  );
+  assert.deepEqual(
+    await f.bridge.operation("cancel_prepared_portfolio", {
+      user_id: graphUser,
+      portfolio: compact,
+    }),
+    { ok: true, pending_cancelled: true },
+  );
+  await flush();
+  assert.equal(f.b.preparedEntries.size, 0);
+  assert.equal(f.bank().held, 0);
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.reads.length, 0);
+  assert.equal(f.bank().posts, 0);
+});
+
+for (const {
+  threeSources,
+  existingSourceBackoff,
+  readonlyFixed,
+  incompleteHistory,
+} of [
+  {
+    threeSources: false,
+    existingSourceBackoff: false,
+    readonlyFixed: false,
+    incompleteHistory: false,
+  },
+  {
+    threeSources: true,
+    existingSourceBackoff: false,
+    readonlyFixed: false,
+    incompleteHistory: false,
+  },
+  {
+    threeSources: true,
+    existingSourceBackoff: true,
+    readonlyFixed: false,
+    incompleteHistory: false,
+  },
+  {
+    threeSources: true,
+    existingSourceBackoff: false,
+    readonlyFixed: true,
+    incompleteHistory: false,
+  },
+  {
+    threeSources: true,
+    existingSourceBackoff: false,
+    readonlyFixed: true,
+    incompleteHistory: true,
+  },
 ])
   it(
-    "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, both fresh scopes and one original outbox (" +
-      (existingSourceBackoff
-        ? "three distinct sources after existing UNSENT backoff"
-        : threeSources
-          ? "three distinct sources"
-          : "one source") +
+    "actual Runner and real PostgreSQL commits traverse authenticated managed HTTP, " +
+      (readonlyFixed
+        ? "readonly mixedFixed A/S/F with zero financial identifiers ("
+        : "both fresh scopes and one original outbox (") +
+      (incompleteHistory
+        ? "full history page cannot advance its cursor"
+        : readonlyFixed
+          ? "complete original cursor strategy"
+          : existingSourceBackoff
+            ? "three distinct sources after existing UNSENT backoff"
+            : threeSources
+              ? "three distinct sources"
+              : "one source") +
       ")",
     { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
     async (t) => {
@@ -947,6 +1259,7 @@ for (const { threeSources, existingSourceBackoff } of [
           unified: true,
           threeSources,
           existingSourceBackoff,
+          concentratedSources: readonlyFixed,
         }),
         url = new URL(process.env.RIDE_AGENT_TEST_DATABASE_URL!);
       assert.ok(["127.0.0.1", "localhost", "[::1]"].includes(url.hostname));
@@ -1041,6 +1354,14 @@ for (const { threeSources, existingSourceBackoff } of [
         return e;
       });
       f.p.executions.push(...originalHistory);
+      if (readonlyFixed) {
+        const fixed = f.p.sleeves[2];
+        fixed.copy_mode = "fixed";
+        fixed.fixed_margin_usdc = "2";
+        fixed.fixed_last_fill_at = f.time.at - 10000;
+        fixed.source_quantities = { "perps:SOL": "5" };
+        fixed.fixed_targets = { "perps:SOL": "0.1" };
+      }
       await repository.transact(graphUser, async (state) => {
         state.portfolios.push(f.p);
       });
@@ -1088,12 +1409,24 @@ for (const { threeSources, existingSourceBackoff } of [
         "discovery cannot materialize a financial identifier",
       );
       assert.equal(f.bank().posts, 0);
+      if (readonlyFixed) {
+        assert.equal(
+          state.portfolios[0].target_blocker?.code,
+          "ASSET_CONCENTRATION",
+          "actual ordinary discovery supplies the readonly routing blocker",
+        );
+        f.diversifySources();
+      }
       await flush();
       assert.equal(f.bank().held, 0);
       await f.time.advance(60001);
       // The preceding charges have really aged out of the local ledger. This
       // finite external-ledger fixture offers just enough room for the warm pair.
-      f.resetBank(900 - 2 * f.planDemand());
+      f.resetBank(
+        900 - (readonlyFixed ? f.planDemand() + 120 : 2 * f.planDemand()),
+      );
+      const originalCursor = state.portfolios[0].sleeves[2]?.fixed_last_fill_at;
+      if (incompleteHistory) f.fullSourceHistoryPage();
       let originalRetryAt = 0;
       const sourceRetryAt = new Map<string, number>();
       if (existingSourceBackoff) {
@@ -1133,6 +1466,75 @@ for (const { threeSources, existingSourceBackoff } of [
         ),
         originalHistory,
       );
+      if (readonlyFixed) {
+        const saved = state.portfolios[0];
+        assert.equal(
+          executions.length,
+          0,
+          "a readonly window cannot materialize a new financial identifier",
+        );
+        assert.equal(f.outboxes.size, 0);
+        assert.equal(f.bank().posts, 0);
+        assert.equal(f.begins.at(-1).weight, 304);
+        assert.equal(f.begins.at(-1).mode, "learned");
+        const freshReads = f.reads.slice(before),
+          sourceReads = freshReads.filter(
+            (read) =>
+              read.type === "clearinghouseState" &&
+              read.user !== f.identity.master,
+          ),
+          historyReads = freshReads.filter(
+            (read) =>
+              read.type === "userFillsByTime" &&
+              read.user !== f.identity.master,
+          );
+        assert.equal(sourceReads.length, 3);
+        assert.equal(new Set(sourceReads.map((read) => read.user)).size, 3);
+        assert.ok(
+          sourceReads.every(
+            (read) => !!read.context?.frame_id && f.time.at - read.at <= 5000,
+          ),
+        );
+        assert.equal(
+          historyReads.length,
+          1,
+          "only a full conservatively120-reserved first history page can dispatch",
+        );
+        assert.ok(historyReads[0].context?.frame_id);
+        for (const type of [
+          "userFunding",
+          "userNonFundingLedgerUpdates",
+          "spotClearinghouseState",
+        ])
+          assert.equal(
+            freshReads.filter((read) => read.type === type).length,
+            1,
+            "readonly has one complete A and physically no B",
+          );
+        assert.equal(f.bank().dirty, false);
+        assert.equal(
+          f.planDemand(),
+          184,
+          "H never enters the single-account scope cost plan",
+        );
+        if (incompleteHistory) {
+          assert.equal(historyReads[0].actual, 120);
+          assert.equal(saved.sleeves[2].fixed_last_fill_at, originalCursor);
+          assert.equal(saved.last_error?.code, "VENUE_READ_BUDGET_EXHAUSTED");
+        } else {
+          assert.equal(historyReads[0].actual, 20);
+          assert.ok(saved.sleeves[2].fixed_last_fill_at! > originalCursor!);
+          assert.equal(
+            saved.sleeves[2].fixed_last_fill_at,
+            saved.sleeves[2].last_source_at,
+          );
+          assert.equal(saved.target_blocker, undefined);
+          assert.equal(saved.last_error, undefined);
+          assert.equal(f.bank().paid, 596 + 144 + 6 + 20);
+        }
+        assert.equal(f.bank().held, 0);
+        return;
+      }
       assert.equal(
         executions.length,
         1,
@@ -1317,6 +1719,52 @@ it("metadata cancellation cannot end an already ready peer", async (t) => {
   assert.equal(f.events.filter((e) => e === "end").length, 0);
   assert.equal(f.b.preparedEntries.size, 1);
   await f.audit(ready);
+  assert.equal(f.bank().dirty, false);
+});
+
+it("a deferred old finish cannot delete a newly prepared same-key peer", async (t) => {
+  const f = await fixture(t),
+    oldReady = await f.prepare(),
+    old = [...f.b.preparedEntries.values()][0] as any,
+    originalClose = old.window.close.bind(old.window);
+  let release!: () => void,
+    first = true;
+  const barrier = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Close currently invalidates local admission synchronously. A deferred close
+  // completion models the registry ownership invariant without claiming a live
+  // network-release race in the present implementation.
+  old.window.close = async () => {
+    await originalClose();
+    if (first) {
+      first = false;
+      await barrier;
+    }
+  };
+  const finishing = f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    oldReady.handle,
+  );
+  await flush();
+  assert.equal(old.expired, true);
+  assert.equal(f.bank().held, 0);
+  await assert.rejects(
+    f.prepare(),
+    "the expired episode is cleared without same-call rebooking",
+  );
+  const newReady = await f.prepare();
+  assert.equal(newReady.state, "ready");
+  assert.notEqual(newReady.handle, oldReady.handle);
+  const current = [...f.b.preparedEntries.values()][0] as any;
+  release();
+  assert.deepEqual(await finishing, { ok: true });
+  assert.equal(f.b.preparedEntries.get(current.key), current);
+  assert.equal(f.bank().held, 488);
+  await f.audit(newReady);
   assert.equal(f.bank().dirty, false);
 });
 

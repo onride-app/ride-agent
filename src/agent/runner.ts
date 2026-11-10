@@ -53,6 +53,7 @@ import {
   preparedPortfolioInput,
   preparedOperationalBinding,
   type PreparedPortfolioInput,
+  type PreparedReadPurpose,
 } from "./prepared-portfolio.js";
 import {
   runMonitorTrace,
@@ -111,14 +112,12 @@ function preparationCandidate(state: State): PreparedPortfolioInput | null {
   const active = state.portfolios.filter((p) => p.state !== "closed");
   if (active.length !== 1) return null;
   const p = active[0];
+  const purpose: PreparedReadPurpose =
+    p.target_blocker != null ? "audit_source" : "audit_submit";
   if (
     !(p.venue_accounts?.perps ?? p.account_id) ||
     !p.ledger_started_at ||
     p.loss_latched ||
-    // A rejected source proposal needs ordinary audit/source/risk progress,
-    // not paired capacity for a new increase. This is only a routing hint;
-    // the next complete planning pass still revalidates and clears blockers.
-    p.target_blocker != null ||
     !["active", "attention"].includes(p.state) ||
     p.sleeves.length === 0 ||
     p.sleeves.some(
@@ -126,7 +125,7 @@ function preparationCandidate(state: State): PreparedPortfolioInput | null {
         s.trader.market !== "perps" ||
         s.state !== "active" ||
         !s.initialized ||
-        s.copy_mode === "fixed",
+        (s.copy_mode === "fixed" && purpose !== "audit_source"),
     ) ||
     state.portfolios.some((portfolio) =>
       portfolio.executions.some(
@@ -135,13 +134,30 @@ function preparationCandidate(state: State): PreparedPortfolioInput | null {
     )
   )
     return null;
-  return structuredClone(preparedPortfolioInput(p));
+  return structuredClone(preparedPortfolioInput(p, purpose));
 }
 
 class PreparedSelectionChanged extends Error {}
+function sameReadScope(
+  p: Portfolio | PreparedPortfolioInput,
+  expected: PreparedPortfolioInput,
+) {
+  return (
+    p.id === expected.id &&
+    p.revision === expected.revision &&
+    p.control_id === expected.control_id &&
+    (p.venue_accounts?.perps ?? p.account_id) ===
+      (expected.venue_accounts?.perps ?? expected.account_id)
+  );
+}
 type TickAdmission =
   | { kind: "legacy" }
-  | { kind: "discover" }
+  | {
+      kind: "discover";
+      expected?: PreparedPortfolioInput;
+      releaseUnconfirmed?: true;
+      releaseError?: unknown;
+    }
   | {
       kind: "prepared";
       expected: PreparedPortfolioInput;
@@ -158,8 +174,19 @@ export class AgentRunner {
     PreparedPortfolioInput | null
   >();
   private pendingPreparations = new Map<string, PreparedPortfolioInput>();
+  private readonlyReleaseBarriers = new Map<
+    string,
+    {
+      expected: PreparedPortfolioInput;
+      expiresAt?: number;
+      monotonicUntil?: number;
+    }
+  >();
   private notifications: NotificationDispatcher;
-  constructor(private service: AgentService) {
+  constructor(
+    private service: AgentService,
+    private readonly monotonicClock: () => number = () => performance.now(),
+  ) {
     this.notifications = new NotificationDispatcher(
       service.repository,
       service.adapter,
@@ -178,8 +205,50 @@ export class AgentRunner {
   private async routeTick(user: string): Promise<void> {
     const adapter = this.service.adapter;
     if (!adapter.withPreparedPortfolio) return this.tickBody(user);
+    const barrier = this.readonlyReleaseBarriers.get(user);
+    if (barrier) {
+      if (
+        barrier.expiresAt !== undefined &&
+        barrier.monotonicUntil !== undefined &&
+        now() >= barrier.expiresAt &&
+        this.monotonicClock() >= barrier.monotonicUntil
+      )
+        this.readonlyReleaseBarriers.delete(user);
+      else {
+        try {
+          if (!adapter.cancelPreparedPortfolio)
+            throw new Error("Readonly cancellation unavailable");
+          await adapter.cancelPreparedPortfolio(user, barrier.expected);
+          if (this.readonlyReleaseBarriers.get(user) === barrier)
+            this.readonlyReleaseBarriers.delete(user);
+          const pending = this.pendingPreparations.get(user);
+          if (
+            pending &&
+            preparedOperationalBinding(pending) ===
+              preparedOperationalBinding(barrier.expected)
+          )
+            this.pendingPreparations.delete(user);
+        } catch (error) {
+          return this.tickBody(user, {
+            kind: "discover",
+            expected: barrier.expected,
+            releaseUnconfirmed: true,
+            releaseError: error,
+          });
+        }
+      }
+    }
     const candidate = this.preparationCandidates.get(user);
     if (!candidate) return this.tickBody(user, { kind: "discover" });
+    const previousPending = this.pendingPreparations.get(user);
+    if (
+      previousPending &&
+      preparedOperationalBinding(previousPending) !==
+        preparedOperationalBinding(candidate)
+    )
+      // A failed exact cancellation must not be replaced by another purpose's
+      // pending token. Ordinary audits and controls still make progress.
+      return this.tickBody(user, { kind: "discover", expected: candidate });
     if (this.pendingPreparations.size >= 2000)
       this.pendingPreparations.delete(
         this.pendingPreparations.keys().next().value!,
@@ -197,17 +266,67 @@ export class AgentRunner {
         async (window) => {
           clearOwnPending();
           entered = true;
-          await this.tickBody(user, {
-            kind: "prepared",
-            expected: candidate,
-            window,
-          });
+          if (candidate.purpose !== "audit_source") {
+            await this.tickBody(user, {
+              kind: "prepared",
+              expected: candidate,
+              window,
+            });
+            return;
+          }
+          const originalMonotonicUntil =
+            this.monotonicClock() +
+            Math.max(0, Math.min(20000, window.expires_at - now()));
+          let released: Promise<void> | undefined;
+          const release = () =>
+            (released ??= (async () => {
+              try {
+                if (typeof window.release !== "function")
+                  throw new AgentError(
+                    "VENUE_COST_PLAN_UNAVAILABLE",
+                    "Read-only release is unavailable.",
+                    true,
+                    503,
+                  );
+                await window.release();
+                const barrier = this.readonlyReleaseBarriers.get(user);
+                if (
+                  barrier &&
+                  preparedOperationalBinding(barrier.expected) ===
+                    preparedOperationalBinding(candidate) &&
+                  (barrier.expiresAt === undefined ||
+                    barrier.expiresAt === window.expires_at)
+                )
+                  this.readonlyReleaseBarriers.delete(user);
+              } catch (error) {
+                if (!this.readonlyReleaseBarriers.has(user))
+                  this.readonlyReleaseBarriers.set(user, {
+                    expected: structuredClone(candidate),
+                    expiresAt: window.expires_at,
+                    monotonicUntil: originalMonotonicUntil,
+                  });
+                throw error;
+              }
+            })());
+          try {
+            await this.tickBody(user, {
+              kind: "prepared",
+              expected: candidate,
+              window: { ...window, release },
+            });
+          } finally {
+            // This owner exists outside every PG phase and commit. Cleanup
+            // cannot replace the original error or lose an unconfirmed lease.
+            await release().catch(() => {});
+          }
         },
       );
       if (result.state === "complete") return;
       if (result.state === "unsupported") {
         clearOwnPending();
-        return this.tickBody(user);
+        return candidate.purpose === "audit_source"
+          ? this.tickBody(user, { kind: "discover", expected: candidate })
+          : this.tickBody(user);
       }
     } catch (error) {
       // Never rerun a callback that may already have committed its one ID or
@@ -217,7 +336,7 @@ export class AgentRunner {
     }
     // Pending preparation must still run existing audits, controls, recovery
     // and notifications, while eligible new targets remain unmaterialized.
-    await this.tickBody(user, { kind: "discover" });
+    await this.tickBody(user, { kind: "discover", expected: candidate });
   }
   private async tickBody(
     user: string,
@@ -226,11 +345,74 @@ export class AgentRunner {
     const { repository, adapter } = this.service;
     const createdPreparedIds = new Set<string>();
     let attemptedPendingCancellation = false;
-    let preparedInterrupted = false;
+    let preparedInterrupted =
+      admission.kind === "discover" && admission.releaseUnconfirmed === true;
+    let preparedReleaseError: unknown =
+      admission.kind === "discover" ? admission.releaseError : undefined;
+    let preparedReleaseFailed = preparedInterrupted;
+    const auditSourceOnly = new Map<string, PreparedPortfolioInput>();
     const leavePreparedForRisk = async () => {
-      if (admission.kind !== "prepared" || preparedInterrupted) return;
+      if (
+        preparedInterrupted ||
+        (admission.kind !== "prepared" && !auditSourceOnly.size)
+      )
+        return;
       preparedInterrupted = true;
-      await admission.window.release?.();
+      try {
+        if (admission.kind === "prepared") {
+          if (
+            admission.expected.purpose === "audit_source" &&
+            typeof admission.window.release !== "function"
+          )
+            throw new AgentError(
+              "VENUE_COST_PLAN_UNAVAILABLE",
+              "Read-only window cannot be released.",
+              true,
+              503,
+            );
+          await admission.window.release?.();
+        } else {
+          const previous = auditSourceOnly.values().next().value!;
+          if (!adapter.cancelPreparedPortfolio)
+            throw new AgentError(
+              "VENUE_COST_PLAN_UNAVAILABLE",
+              "Read-only pending release is unavailable.",
+              true,
+              503,
+            );
+          // Unlike a legacy cancellation, this readonly request requires an
+          // explicit no-ready/own-pending ACK before ordinary financial work.
+          await adapter.cancelPreparedPortfolio(user, previous);
+          if (this.pendingPreparations.get(user)?.id === previous.id)
+            this.pendingPreparations.delete(user);
+        }
+        if (admission.kind !== "prepared") {
+          const barrier = this.readonlyReleaseBarriers.get(user);
+          const expected = auditSourceOnly.values().next().value;
+          if (
+            barrier &&
+            expected &&
+            preparedOperationalBinding(barrier.expected) ===
+              preparedOperationalBinding(expected)
+          )
+            this.readonlyReleaseBarriers.delete(user);
+        }
+      } catch (error) {
+        preparedReleaseFailed = true;
+        preparedReleaseError = error;
+        const expected = auditSourceOnly.values().next().value;
+        if (
+          admission.kind !== "prepared" &&
+          expected &&
+          !this.readonlyReleaseBarriers.has(user)
+        )
+          this.readonlyReleaseBarriers.set(user, {
+            expected: structuredClone(expected),
+          });
+        // Cleanup cannot suppress urgent fencing/cancellation. The target
+        // creation gates below still reject every financial fallback.
+        if (!auditSourceOnly.size) throw error;
+      }
     };
     const transact = async <T>(
       phase: "audit_control" | "observe_plan" | "durable_notify",
@@ -238,6 +420,27 @@ export class AgentRunner {
     ) => {
       let nextCandidate: PreparedPortfolioInput | null | undefined;
       const checked: MonitorCallback<T> = async (state, history) => {
+        if (phase === "audit_control" && admission.kind !== "legacy") {
+          if (admission.expected?.purpose === "audit_source") {
+            const existing = state.portfolios.find(
+              (p) => p.id === admission.expected!.id,
+            );
+            if (existing && sameReadScope(existing, admission.expected))
+              auditSourceOnly.set(existing.id, admission.expected);
+            else {
+              const barrier = this.readonlyReleaseBarriers.get(user);
+              if (
+                barrier &&
+                preparedOperationalBinding(barrier.expected) ===
+                  preparedOperationalBinding(admission.expected)
+              )
+                this.readonlyReleaseBarriers.delete(user);
+            }
+          }
+          const selected = preparationCandidate(state);
+          if (selected?.purpose === "audit_source")
+            auditSourceOnly.set(selected.id, selected);
+        }
         if (phase === "audit_control" && admission.kind === "prepared") {
           const current = preparationCandidate(state);
           if (
@@ -281,7 +484,22 @@ export class AgentRunner {
             await adapter.cancelPreparedPortfolio(user, pending);
             if (this.pendingPreparations.get(user) === pending)
               this.pendingPreparations.delete(user);
+            const barrier = this.readonlyReleaseBarriers.get(user);
+            if (
+              pending.purpose === "audit_source" &&
+              barrier &&
+              preparedOperationalBinding(barrier.expected) ===
+                preparedOperationalBinding(pending)
+            )
+              this.readonlyReleaseBarriers.delete(user);
           } catch {
+            if (
+              pending.purpose === "audit_source" &&
+              !this.readonlyReleaseBarriers.has(user)
+            )
+              this.readonlyReleaseBarriers.set(user, {
+                expected: structuredClone(pending),
+              });
             // Resource cleanup never replaces a committed audit, reconciliation
             // or risk action. Retry at most once on a later ordinary tick.
           }
@@ -400,6 +618,7 @@ export class AgentRunner {
               e.task_id &&
               !["completed", "failed", "superseded"].includes(e.status),
           )) {
+            await leavePreparedForRisk();
             const observed = await adapter.execution(user, p, e);
             e.status = observed.status;
             e.observed_quantity = observed.observed_quantity;
@@ -653,6 +872,51 @@ export class AgentRunner {
         const getSources = () => (sources ??= startSources(p));
         const publicFailures = new Set<unknown>();
         let replayedSourceError: MonitorError | undefined;
+        const readonlyBefore = auditSourceOnly.has(p.id)
+          ? {
+              sleeves: structuredClone(p.sleeves),
+              decisions:
+                p.decisions === undefined
+                  ? undefined
+                  : structuredClone(p.decisions),
+            }
+          : undefined;
+        let readonlyStale = false;
+        const assertReadonlyPlanFresh = (sources: SourceSnapshot[]) => {
+          if (!readonlyBefore) return;
+          try {
+            if (admission.kind === "prepared" && !preparedInterrupted) {
+              if (typeof admission.window.assertLive !== "function")
+                throw new AgentError(
+                  "VENUE_COST_PLAN_UNAVAILABLE",
+                  "Read-only lifetime is unverified.",
+                  true,
+                  503,
+                );
+              admission.window.assertLive();
+            }
+            if (
+              !fresh(p.snapshot!.observed_at) ||
+              sources.some(
+                (source) =>
+                  !sourceEvidenceReady(source) ||
+                  !fresh(source.observed_at, 5000) ||
+                  source.positions.some(
+                    (position) => !fresh(position.observed_at, 5000),
+                  ),
+              )
+            )
+              throw new AgentError(
+                "SOURCE_STALE",
+                "Original read-only evidence expired before planning.",
+                true,
+                503,
+              );
+          } catch (error) {
+            readonlyStale = true;
+            throw error;
+          }
+        };
         const publicRead = async <T>(work: () => Promise<T>): Promise<T> => {
           try {
             if (sourceReadRetryPending(p)) {
@@ -868,6 +1132,7 @@ export class AgentRunner {
                   "Source fills are incomplete; fixed-copy targets remain unchanged.",
                   true,
                 );
+              assertReadonlyPlanFresh(plannedSources);
               fixedWindowVerified = true;
               for (const fill of orderedSourceFills(
                 fills.fills,
@@ -1200,6 +1465,7 @@ export class AgentRunner {
             }
             plannedChanges.set(s.copy_id, t);
           }
+          assertReadonlyPlanFresh(plannedSources);
           p.last_error = undefined;
           if (p.state === "attention")
             p.state = p.loss_latched ? "loss_triggered" : "active";
@@ -1250,10 +1516,13 @@ export class AgentRunner {
             let q = target?.quantity ?? "0";
             if (!price) continue;
             if (sourceUpdateBlocked && D(q).eq(observed)) continue;
-            let allocations = sourceUpdateBlocked
-              ? {}
-              : internalCross(p, key, price);
-            if (!sourceUpdateBlocked) checkpoint(state, p, key, now());
+            const sourceOnly = auditSourceOnly.has(p.id);
+            let allocations =
+              sourceUpdateBlocked || sourceOnly
+                ? {}
+                : internalCross(p, key, price);
+            if (!sourceUpdateBlocked && !sourceOnly)
+              checkpoint(state, p, key, now());
             if (D(q).eq(observed)) continue;
             if (p.preferences.portfolio_kind && key.startsWith("perps:")) {
               const check = checkPerpsOrder(snap, key, q);
@@ -1292,7 +1561,7 @@ export class AgentRunner {
                   q = "0";
                   for (const sleeve of p.sleeves)
                     if (sleeve.intents[key]) sleeve.intents[key].quantity = "0";
-                  if (!sourceUpdateBlocked) {
+                  if (!sourceUpdateBlocked && !sourceOnly) {
                     allocations = internalCross(p, key, price);
                     checkpoint(state, p, key, now());
                   }
@@ -1352,11 +1621,15 @@ export class AgentRunner {
             // Rejected source changes cannot authorize increases or virtual
             // ownership transfers from old intents. Only independently owned,
             // one-direction reductions can proceed without an internal cross.
-            if (sourceUpdateBlocked) {
+            if (sourceUpdateBlocked || sourceOnly) {
               if (!reduction) continue;
               const owned = ownedReductionAllocations(p, key, q, observed);
               if (!owned) continue;
               allocations = owned;
+              if (sourceOnly) {
+                await leavePreparedForRisk();
+                if (preparedReleaseFailed) throw preparedReleaseError;
+              }
               checkpoint(state, p, key, now());
             }
             if (
@@ -1385,11 +1658,14 @@ export class AgentRunner {
               await leavePreparedForRisk();
             if (
               admission.kind === "discover" &&
+              !(sourceOnly && reduction) &&
               preparationCandidate(state)?.id === p.id
             )
               continue;
             const prepared =
               admission.kind === "prepared" && !preparedInterrupted;
+            if (sourceOnly && (!reduction || prepared || preparedReleaseFailed))
+              continue;
             if (
               prepared &&
               (admission.window.mode === "cold" || createdPreparedIds.size > 0)
@@ -1513,6 +1789,11 @@ export class AgentRunner {
           if (p.state === "closed" || !sourceReadRetryPending(p))
             p.source_read_error = undefined;
         } catch (e) {
+          if (readonlyStale && readonlyBefore) {
+            p.sleeves = readonlyBefore.sleeves;
+            if (readonlyBefore.decisions === undefined) delete p.decisions;
+            else p.decisions = readonlyBefore.decisions;
+          }
           const err =
             e instanceof AgentError
               ? e
@@ -1602,8 +1883,10 @@ export class AgentRunner {
                 admission.kind === "prepared" &&
                 !preparedInterrupted &&
                 !createdPreparedIds.has(e.id)
-              )
-                continue;
+              ) {
+                if (admission.expected.purpose !== "audit_source") continue;
+                await leavePreparedForRisk();
+              }
               if (e.retirement !== undefined) {
                 const request = perpsRecoveryRequest(
                   user,
@@ -1694,6 +1977,8 @@ export class AgentRunner {
                 }
                 // The bridge revalidates source revision, ownership, authority, price
                 // deviation, live margin and Core policy immediately before signing.
+                if (auditSourceOnly.has(p.id) && preparedReleaseFailed)
+                  continue;
                 const submissionStarted = submissionDiagnosticStart();
                 let submit: Awaited<ReturnType<typeof adapter.submit>>;
                 try {
@@ -1739,7 +2024,12 @@ export class AgentRunner {
                 );
               }
             }
-          if (admission.kind === "prepared") await admission.window.release?.();
+          if (admission.kind === "prepared") {
+            const cleanup = admission.window.release?.();
+            if (admission.expected.purpose === "audit_source") {
+              await cleanup?.catch(() => {});
+            } else await cleanup;
+          }
           const prefs = state.notification_preferences;
           if (prefs?.daily_digest) {
             const local = localDay(now(), prefs.timezone),

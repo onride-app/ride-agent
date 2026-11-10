@@ -47,9 +47,17 @@ export function privateExecutionHistory(
   return changed ? kept : p.executions;
 }
 
+export type PreparedReadPurpose = "audit_submit" | "audit_source";
+
 /** Private operational metadata only: never an execution or account response. */
-export function preparedPortfolioInput(p: Portfolio) {
+export function preparedPortfolioInput(
+  p: Portfolio,
+  purpose: PreparedReadPurpose = "audit_submit",
+) {
+  if (purpose !== "audit_submit" && purpose !== "audit_source")
+    throw new Error("Invalid prepared read purpose.");
   return {
+    ...(purpose === "audit_source" ? { purpose } : {}),
     id: p.id,
     revision: p.revision,
     control_id: p.control_id,
@@ -63,6 +71,9 @@ export function preparedPortfolioInput(p: Portfolio) {
       copy_id: s.copy_id,
       state: s.state,
       copy_mode: s.copy_mode,
+      ...(purpose === "audit_source" && s.copy_mode === "fixed"
+        ? { fixed_last_fill_at: s.fixed_last_fill_at }
+        : {}),
       trader: {
         id: s.trader.id,
         market: s.trader.market,
