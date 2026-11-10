@@ -2,7 +2,9 @@ import {
   inputs,
   preferences,
   AgentError,
-  result,
+  result as resultEnvelope,
+  publicReadDetails,
+  publicReadError,
   type Preferences,
   type ToolName,
   type Result,
@@ -78,6 +80,54 @@ import { isPlanReadEvidence } from "./read-evidence.js";
 import type { PlanReadEvidence } from "./read-evidence.js";
 import { sourceEvidenceView } from "./source-evidence-view.js";
 import { localized, resolveLocale, type Locale } from "./locale.js";
+
+// Only public projections change: persisted monitor errors and event data keep
+// their managed diagnostic fields for operators. Copy only changed branches.
+function publicReadProjection<T>(value: T, diagnostics = false): T {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) {
+    let changed: unknown[] | undefined;
+    for (let index = 0; index < value.length; index++) {
+      const next = publicReadProjection(value[index], diagnostics);
+      if (next !== value[index]) {
+        changed ??= value.slice();
+        changed[index] = next;
+      }
+    }
+    return (changed ?? value) as T;
+  }
+  const original = value as Record<string, unknown>;
+  const errorLike =
+    typeof original.code === "string" ||
+    typeof original.retryable === "boolean";
+  let projected: Record<string, unknown> = diagnostics
+    ? publicReadDetails(original)
+    : original;
+  if (errorLike && projected.details && typeof projected.details === "object")
+    projected = publicReadError(projected as { details?: object });
+  let changed = projected !== original ? projected : undefined;
+  for (const key in projected) {
+    if (!Object.hasOwn(projected, key)) continue;
+    const item = projected[key];
+    const next = publicReadProjection(
+      item,
+      diagnostics || key === "diagnostics" || (errorLike && key === "details"),
+    );
+    if (next !== item) {
+      changed ??= { ...projected };
+      changed[key] = next;
+    }
+  }
+  return (changed ?? value) as T;
+}
+
+function result(
+  data: Record<string, unknown>,
+  status: Result["status"] = "ok",
+  warnings: string[] = [],
+): Result {
+  return resultEnvelope(publicReadProjection(data), status, warnings);
+}
 
 export class AgentService {
   get funding() {

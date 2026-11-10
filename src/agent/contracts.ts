@@ -334,6 +334,9 @@ export const errorDetails = z
       .regex(/^[A-Z0-9_]{1,64}$/)
       .optional(),
     retry_after_ms: z.number().int().nonnegative().max(60_000).optional(),
+    read_stage: z.enum(["account", "source", "history"]).optional(),
+    requested_weight: z.number().int().nonnegative().max(1000).optional(),
+    remaining_weight: z.number().int().nonnegative().max(1000).optional(),
     blockers: z
       .array(z.string().regex(/^[A-Z0-9_]{1,64}$/))
       .max(20)
@@ -341,6 +344,11 @@ export const errorDetails = z
   })
   .strict();
 export type ErrorDetails = z.infer<typeof errorDetails>;
+export const publicErrorDetails = errorDetails.omit({
+  read_stage: true,
+  requested_weight: true,
+  remaining_weight: true,
+});
 export const output = z
   .object({
     version: z.literal("3"),
@@ -366,7 +374,7 @@ export const output = z
         code: z.string(),
         message: z.string(),
         retryable: z.boolean(),
-        details: errorDetails.optional(),
+        details: publicErrorDetails.optional(),
       })
       .strict()
       .optional(),
@@ -398,7 +406,35 @@ export function result(
     as_of: new Date().toISOString(),
   };
 }
-export function failure(error: unknown): Result {
+/** Keep new managed-only read counters out of public legacy error/event shapes. */
+export function publicReadDetails<T extends object>(details: T): T {
+  if (
+    !["read_stage", "requested_weight", "remaining_weight"].some((key) =>
+      Object.hasOwn(details, key),
+    )
+  )
+    return details;
+  const {
+    read_stage: _stage,
+    requested_weight: _requested,
+    remaining_weight: _remaining,
+    ...original
+  } = details as T & {
+    read_stage?: unknown;
+    requested_weight?: unknown;
+    remaining_weight?: unknown;
+  };
+  return original as T;
+}
+export function publicReadError<T extends { details?: object }>(error: T): T {
+  if (!error.details) return error;
+  const details = publicReadDetails(error.details);
+  return details === error.details ? error : { ...error, details };
+}
+export function failure(
+  error: unknown,
+  options: { internalReadDiagnostics?: boolean } = {},
+): Result {
   const e =
     error instanceof AgentError
       ? error
@@ -415,13 +451,17 @@ export function failure(error: unknown): Result {
             true,
             500,
           );
+  let details = e.details ? errorDetails.parse(e.details) : undefined;
+  if (details && !options.internalReadDiagnostics) {
+    details = publicReadDetails(details);
+  }
   return {
     ...result({}, "failed"),
     error: {
       code: e.code,
       message: e.message,
       retryable: e.retryable,
-      ...(e.details ? { details: errorDetails.parse(e.details) } : {}),
+      ...(details ? { details } : {}),
     },
   };
 }

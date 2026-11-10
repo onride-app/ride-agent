@@ -91,6 +91,11 @@ export interface AccountReadBundle extends AccountReadReservation {
   beginHistorySupplement(source: string): AccountReadReservation;
   assertNextChildReady(): void;
 }
+export interface PreparedSupplementPlan {
+  readonly key: string;
+  readonly sourceWeight: number;
+  readonly historyWeights: Readonly<Record<string, number>>;
+}
 type Observation = {
   ticket: AccountReadReservation;
   owner: string;
@@ -111,6 +116,8 @@ type Observation = {
   capacityTrialLimit?: number;
   trialExceeded?: boolean;
   supplement?: boolean;
+  readStage?: "account" | "source" | "history";
+  resource?: { key: string; source?: string; priorSpent: number };
   bundle?: {
     limit: number;
     count: number;
@@ -118,6 +125,7 @@ type Observation = {
     child?: Observation;
     supplementRemaining?: number;
     historyRemaining?: Map<string, number>;
+    supplements?: PreparedSupplementPlan;
   };
 };
 type Owner = {
@@ -184,6 +192,11 @@ export class VenueReadBudget {
     string,
     { demand: number; seen: number; peaks: number[]; attempt?: object }
   >();
+  private supplementHints = new Map<
+    string,
+    { at: number; source: number; history: Map<string, number> }
+  >();
+  private supplementSnapshots = new WeakSet<object>();
   private observationPlanAttempts = new Map<
     string,
     { token: object; at: number }
@@ -490,6 +503,92 @@ export class VenueReadBudget {
       this.observationQueue.delete(interest.owner);
     this.pump();
   }
+  /** Resource demand only: no source data, successful-scope claim, fee or TTL renewal. */
+  preparedSupplementPlan(
+    key: string,
+    historySources: readonly string[],
+  ): PreparedSupplementPlan {
+    if (
+      typeof key !== "string" ||
+      !key ||
+      key.length > 256 ||
+      historySources.length > 8 ||
+      new Set(historySources).size !== historySources.length ||
+      historySources.some(
+        (source) =>
+          typeof source !== "string" || !source || source.length > 256,
+      )
+    )
+      throw costPlanUnavailable();
+    const at = this.clock();
+    for (const [id, hint] of this.supplementHints)
+      if (hint.at < at - ACCOUNT_OBSERVATION_PLAN_TTL_MS)
+        this.supplementHints.delete(id);
+    const hint = this.supplementHints.get(key);
+    const plan = Object.freeze({
+      key,
+      sourceWeight: Math.max(120, hint?.source ?? 0),
+      historyWeights: Object.freeze(
+        Object.fromEntries(
+          historySources.map((source) => [
+            source,
+            Math.max(240, hint?.history.get(source) ?? 0),
+          ]),
+        ),
+      ),
+    });
+    this.supplementSnapshots.add(plan);
+    return plan;
+  }
+  private supplementPlanCurrent(
+    plan: PreparedSupplementPlan,
+    sources: readonly string[],
+  ): boolean {
+    if (!this.supplementSnapshots.has(plan)) return false;
+    const current = this.preparedSupplementPlan(plan.key, sources);
+    return (
+      current.sourceWeight === plan.sourceWeight &&
+      sources.length === Object.keys(plan.historyWeights).length &&
+      sources.every(
+        (source) =>
+          current.historyWeights[source] === plan.historyWeights[source],
+      )
+    );
+  }
+  private recordSupplementNeed(frame: Observation, nextWeight: number): void {
+    if (
+      !frame.resource ||
+      frame.pending ||
+      this.observation?.closed ||
+      !this.ownsObservation(frame.ticket)
+    )
+      return;
+    const needed = frame.resource.priorSpent + frame.committed + nextWeight;
+    if (!Number.isSafeInteger(needed) || needed < 1) return;
+    let hint = this.supplementHints.get(frame.resource.key);
+    if (!hint) {
+      if (this.supplementHints.size >= 512) {
+        const oldest = [...this.supplementHints].sort(
+          (a, b) => a[1].at - b[1].at,
+        )[0];
+        if (oldest) this.supplementHints.delete(oldest[0]);
+      }
+      hint = { at: this.clock(), source: 120, history: new Map() };
+      this.supplementHints.set(frame.resource.key, hint);
+    }
+    hint.at = this.clock();
+    if (frame.readStage === "source")
+      hint.source = Math.max(hint.source, needed);
+    else if (
+      frame.readStage === "history" &&
+      frame.resource.source &&
+      (hint.history.has(frame.resource.source) || hint.history.size < 8)
+    )
+      hint.history.set(
+        frame.resource.source,
+        Math.max(240, hint.history.get(frame.resource.source) ?? 0, needed),
+      );
+  }
   beginObservation(
     owner: string,
     capacityTrial?: { fullDemand: number; reservedWeight: number },
@@ -498,6 +597,7 @@ export class VenueReadBudget {
       childLimit: number;
       count: 1 | 2;
       historySources?: readonly string[];
+      supplements?: PreparedSupplementPlan;
     },
   ): AccountReadReservation {
     this.prune();
@@ -538,8 +638,19 @@ export class VenueReadBudget {
               (source) =>
                 typeof source !== "string" || !source || source.length > 256,
             ))) ||
+        (bundle.supplements &&
+          (bundle.count !== 1 ||
+            !this.supplementPlanCurrent(
+              bundle.supplements,
+              bundle.historySources ?? [],
+            ))) ||
         bundle.childLimit * bundle.count +
-          (bundle.historySources?.length ?? 0) * 120 >
+          (bundle.supplements?.sourceWeight ?? 0) +
+          (bundle.historySources ?? []).reduce(
+            (sum, source) =>
+              sum + (bundle.supplements?.historyWeights[source] ?? 120),
+            0,
+          ) >
           this.limit ||
         (capacityTrial
           ? bundle.count !== 1 ||
@@ -549,7 +660,12 @@ export class VenueReadBudget {
       throw costPlanUnavailable();
     const reservedWeight = bundle
       ? bundle.childLimit * bundle.count +
-        (bundle.historySources?.length ?? 0) * 120
+        (bundle.supplements?.sourceWeight ?? 0) +
+        (bundle.historySources ?? []).reduce(
+          (sum, source) =>
+            sum + (bundle.supplements?.historyWeights[source] ?? 120),
+          0,
+        )
       : (capacityTrial?.reservedWeight ?? entry.demand);
     const first = this.observationQueue.keys().next().value;
     if (this.observation || first !== owner) {
@@ -703,8 +819,17 @@ export class VenueReadBudget {
               count: bundle.count,
               opened: 0,
               historyRemaining: new Map(
-                (bundle.historySources ?? []).map((source) => [source, 120]),
+                (bundle.historySources ?? []).map((source) => [
+                  source,
+                  bundle.supplements?.historyWeights[source] ?? 120,
+                ]),
               ),
+              ...(bundle.supplements
+                ? {
+                    supplements: bundle.supplements,
+                    supplementRemaining: bundle.supplements.sourceWeight,
+                  }
+                : {}),
             },
           }
         : {}),
@@ -728,12 +853,13 @@ export class VenueReadBudget {
     interestToken: object,
     cold = false,
     historySources: readonly string[] = [],
+    supplements?: PreparedSupplementPlan,
   ): AccountReadBundle {
     const ticket = this.beginObservation(
       owner,
       cold ? { fullDemand: this.limit, reservedWeight: childLimit } : undefined,
       interestToken,
-      { childLimit, count, historySources },
+      { childLimit, count, historySources, supplements },
     );
     const openChild = (
       kind: "account" | "source" | "history" = "account",
@@ -777,6 +903,7 @@ export class VenueReadBudget {
             child.closed
           )
             return;
+          if (child.trialExceeded) this.recordSupplementNeed(child, 0);
           child.closed = true;
           child.complete = complete;
           if (
@@ -806,7 +933,11 @@ export class VenueReadBudget {
               0,
               parent.bundle!.supplementRemaining! - child.committed,
             );
-          else if (child.complete && parent.bundle!.opened === 1)
+          else if (
+            child.complete &&
+            parent.bundle!.opened === 1 &&
+            !parent.bundle!.supplements
+          )
             parent.bundle!.supplementRemaining = Math.max(
               0,
               childLimit - child.committed,
@@ -820,7 +951,7 @@ export class VenueReadBudget {
               this.invalidateObservationPlan(owner, child.planAttempt);
           }
           if (!child.pending) parent.bundle!.child = undefined;
-          if (complete && !child.complete) throw this.trialExhausted();
+          if (complete && !child.complete) throw this.trialExhausted(child);
         },
       };
       const prior = this.observationPlans.get(owner);
@@ -841,6 +972,19 @@ export class VenueReadBudget {
         started: this.clock(),
         capacityTrialLimit: scopeLimit,
         supplement,
+        readStage: kind,
+        ...(supplement && parent.bundle.supplements
+          ? {
+              resource: {
+                key: parent.bundle.supplements.key,
+                ...(kind === "history" ? { source: historySource } : {}),
+                priorSpent:
+                  (kind === "history"
+                    ? parent.bundle.supplements.historyWeights[historySource!]
+                    : parent.bundle.supplements.sourceWeight) - scopeLimit,
+              },
+            }
+          : {}),
         publishCostPlan: (value) => {
           learned = value;
         },
@@ -1110,13 +1254,28 @@ export class VenueReadBudget {
       },
     );
   }
-  private trialExhausted() {
+  private trialExhausted(frame?: Observation, requestedWeight?: number) {
     return new AgentError(
       "VENUE_READ_BUDGET_EXHAUSTED",
       "Complete account scope exceeds its explicit capacity trial; fresh complete evidence is still required.",
       true,
       503,
-      { retry_after_ms: 60000, reason_code: "READ_FRAME_CAPACITY" },
+      {
+        retry_after_ms: 60000,
+        reason_code: "READ_FRAME_CAPACITY",
+        ...(frame?.readStage ? { read_stage: frame.readStage } : {}),
+        ...(Number.isSafeInteger(requestedWeight) &&
+        requestedWeight! >= 0 &&
+        requestedWeight! <= this.limit
+          ? { requested_weight: requestedWeight }
+          : {}),
+        ...(frame &&
+        Number.isSafeInteger(frame.remaining) &&
+        frame.remaining >= 0 &&
+        frame.remaining <= this.limit
+          ? { remaining_weight: frame.remaining }
+          : {}),
+      },
     );
   }
   acquire(
@@ -1157,7 +1316,8 @@ export class VenueReadBudget {
         (frame.trialExceeded || (cost > frame.remaining && frame.pending === 0))
       ) {
         frame.trialExceeded = true;
-        return reject(this.trialExhausted());
+        this.recordSupplementNeed(frame, cost);
+        return reject(this.trialExhausted(frame, cost));
       }
       if (
         !this.exclusive &&
@@ -1330,7 +1490,8 @@ export class VenueReadBudget {
           next.signal.removeEventListener("abort", next.cancel);
           trialFrame.trialExceeded = true;
           trialFrame.sampleInvalid = true;
-          next.reject(this.trialExhausted());
+          this.recordSupplementNeed(trialFrame, next.cost);
+          next.reject(this.trialExhausted(trialFrame, next.cost));
           continue;
         }
         if (
@@ -1479,8 +1640,11 @@ export class VenueReadBudget {
             this.pump();
             // The full actual fee is already recorded above, including debt.
             // It cannot become a successful or partial account observation.
-            if (frame?.trialExceeded || meter?.trialExceeded)
-              throw this.trialExhausted();
+            if (frame?.trialExceeded || meter?.trialExceeded) {
+              const exhausted = meter?.trialExceeded ? meter : frame;
+              if (exhausted) this.recordSupplementNeed(exhausted, 0);
+              throw this.trialExhausted(exhausted);
+            }
           },
           uncertain,
           release: () => {

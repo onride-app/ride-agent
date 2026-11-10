@@ -22,6 +22,7 @@ import {
   type ReadTicket,
   type AccountReadReservation,
   type AccountReadBundle,
+  type PreparedSupplementPlan,
   VenueReadBudget,
 } from "./venue-read-budget.js";
 
@@ -1228,6 +1229,7 @@ export class VenueReads {
           childLimit: number;
           childCount: 1 | 2;
           historySources: readonly string[];
+          supplements?: PreparedSupplementPlan;
         }
       | undefined;
     if (this.frameCoordinator) {
@@ -1235,11 +1237,6 @@ export class VenueReads {
       // already queued fleet reservation. This peek claims no local capacity
       // and never changes the cold hint, plan lifetime or FIFO membership.
       const historyReservation = readCost({ type: "userFillsByTime" }).reserve;
-      const trialCapacity = this.frameCoordinator.capacity - historyReservation;
-      const hint = this.budget.peekObservationFramePlan(
-        scope.owner!,
-        trialCapacity,
-      );
       const historySources = bundle?.historySources ?? [];
       if (
         historySources.length > 8 ||
@@ -1251,13 +1248,45 @@ export class VenueReads {
         (historySources.length > 0 && bundle?.purpose !== "audit_source")
       )
         throw costPlanUnavailable();
+      const supplements =
+        bundle?.purpose === "audit_source"
+          ? this.budget.preparedSupplementPlan(
+              scope.frameOwner ?? scope.owner!,
+              historySources,
+            )
+          : undefined;
+      const supplementalWeight = supplements
+        ? supplements.sourceWeight +
+          Object.values(supplements.historyWeights).reduce(
+            (sum, weight) => sum + weight,
+            0,
+          )
+        : historySources.length * historyReservation;
+      const trialCapacity = Math.min(
+        this.frameCoordinator.capacity - historyReservation,
+        this.frameCoordinator.capacity - supplementalWeight,
+      );
+      if (trialCapacity < Math.min(120, this.budget.limit)) {
+        const unsupported = new AgentError(
+          "VENUE_READ_BUDGET_EXHAUSTED",
+          "This complete read window exceeds its unchanged fleet capacity.",
+          true,
+          503,
+          { reason_code: "READ_FRAME_CAPACITY", retry_after_ms: 60000 },
+        );
+        if (bundle) unsupportedPreparedBundles.add(unsupported);
+        throw unsupported;
+      }
+      const hint = this.budget.peekObservationFramePlan(
+        scope.owner!,
+        trialCapacity,
+      );
       const childLimit = hint.cold
         ? Math.min(hint.fullDemand, trialCapacity)
         : hint.fullDemand;
       const childCount: 1 | 2 =
         bundle && bundle.purpose !== "audit_source" && !hint.cold ? 2 : 1;
-      const reservedWeight =
-        childLimit * childCount + historySources.length * historyReservation;
+      const reservedWeight = childLimit * childCount + supplementalWeight;
       if (
         bundle &&
         childLimit <= this.frameCoordinator.capacity &&
@@ -1291,6 +1320,7 @@ export class VenueReads {
         childLimit,
         childCount,
         historySources,
+        supplements,
       };
       await this.reserveFrame(
         scope,
@@ -1329,6 +1359,7 @@ export class VenueReads {
               scope.localInterest!,
               fleetPlan!.cold,
               fleetPlan!.historySources,
+              fleetPlan!.supplements,
             )
           : this.budget.beginObservation(
               scope.owner!,

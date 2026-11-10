@@ -224,6 +224,9 @@ async function fixture(
     ordinarySourceDenials = 0,
     sourcePoll: (() => void) | undefined,
     fullSourceHistoryPage = false;
+  let sourceHistoryPages: number[] | undefined,
+    historySequence = 0;
+  let slowSourceHistory = false;
   const budget = new VenueReadBudget({
     clock: time.clock,
     timers: time.timers,
@@ -277,6 +280,7 @@ async function fixture(
         user: req.user,
         at: time.at,
         context,
+        startTime: req.startTime,
       };
       reads.push(observedRead);
       if (
@@ -312,11 +316,24 @@ async function fixture(
       }
       let data: any;
       switch (req.type) {
+        case "userDexAbstraction":
+          data = false;
+          break;
         case "userAbstraction":
-          data = options.unified ? "unifiedAccount" : "disabled";
+          data =
+            options.unified && req.user === identity.master
+              ? "unifiedAccount"
+              : "disabled";
           break;
         case "perpDexs":
           data = [null];
+          break;
+        case "perpCategories":
+          data = [
+            ["BTC", "crypto"],
+            ["ETH", "crypto"],
+            ["SOL", "crypto"],
+          ];
           break;
         case "spotClearinghouseState":
           data = {
@@ -356,6 +373,30 @@ async function fixture(
               tid: i,
               time: req.startTime + i,
             }));
+          if (
+            sourceHistoryPages &&
+            req.type === "userFillsByTime" &&
+            sourceByAddress.has(req.user)
+          )
+            data = Array.from(
+              { length: sourceHistoryPages.shift() ?? 0 },
+              (_, i) => {
+                const sequence = historySequence++;
+                return {
+                  coin: sourceByAddress.get(req.user)!.asset,
+                  side: sequence % 2 === 0 ? "B" : "A",
+                  sz: "1",
+                  px: "100",
+                  tid: sequence + 1000,
+                  oid: sequence + 2000,
+                  startPosition: sequence % 2 === 0 ? "5" : "6",
+                  closedPnl: "0",
+                  fee: "0",
+                  feeToken: "USDC",
+                  time: req.startTime + i,
+                };
+              },
+            );
           break;
         case "allMids":
           data = options.threeSources
@@ -392,9 +433,9 @@ async function fixture(
       ) {
         assert.ok(
           held >=
-            (begins.at(-1).weight === 304
-              ? 120
-              : begins.at(-1).weight === 184
+            (begins.at(-1).weight === 544
+              ? 240
+              : begins.at(-1).weight === 304
                 ? 0
                 : 184),
           "three real sources cannot borrow reserved B or H credit",
@@ -403,6 +444,14 @@ async function fixture(
         events.push("three-source-second-scope-protected");
       }
       events.push("wire:" + req.type);
+      if (
+        slowSourceHistory &&
+        req.type === "userFillsByTime" &&
+        sourceByAddress.has(req.user)
+      )
+        await new Promise<void>((resolve) =>
+          time.timers.setTimeout(resolve, 6000),
+        );
       const response = Response.json(data);
       recordCoordinatedEvidence(response, time.at);
       return response;
@@ -635,6 +684,13 @@ async function fixture(
     ordinarySourceDenials: () => ordinarySourceDenials,
     fullSourceHistoryPage: () => {
       fullSourceHistoryPage = true;
+    },
+    sourceHistoryPages: (pages: number[]) => {
+      sourceHistoryPages = [...pages];
+      historySequence = 0;
+    },
+    slowSourceHistory: (value: boolean) => {
+      slowSourceHistory = value;
     },
     diversifySources: () => {
       for (const [i, row] of sourceRows.entries())
@@ -952,18 +1008,18 @@ it("successful audit registers a repeated selected trader and identical scope on
   );
 });
 
-it("the actual readonly server graph reserves304 for complete A/S/F, rejects all financial entrypoints and keeps original outboxed recovery", async (t) => {
+it("the actual readonly server graph reserves544 for complete A/S/F, rejects all financial entrypoints and keeps original outboxed recovery", async (t) => {
   const f = await fixture(t, { unified: true, threeSources: true });
   const fixed = f.p.sleeves[2];
   fixed.copy_mode = "fixed";
   fixed.fixed_last_fill_at = f.time.at - 10000;
-  f.resetBank(596);
+  f.resetBank(356);
   const ready = await f.prepare("audit_source");
   assert.equal(ready.state, "ready");
   assert.equal(ready.mode, "warm");
   assert.equal(ready.purpose, "audit_source");
   assert.equal(ready.execution_eligible, false);
-  assert.equal(f.begins.at(-1).weight, 304);
+  assert.equal(f.begins.at(-1).weight, 544);
   await f.audit(ready);
   const sources = new Map<string, any>();
   for (const sleeve of f.p.sleeves)
@@ -1000,8 +1056,8 @@ it("the actual readonly server graph reserves304 for complete A/S/F, rejects all
   assert.equal(result.complete, true);
   assert.deepEqual(result.fills, []);
   assert.equal(f.bank().dirty, false);
-  assert.equal(f.bank().paid, 596 + 144 + 6 + 20);
-  assert.equal(f.bank().held, 134);
+  assert.equal(f.bank().paid, 356 + 144 + 6 + 20);
+  assert.equal(f.bank().held, 374);
   const reads = f.reads.length;
   await assert.rejects(
     f.bridge.operation(
@@ -1098,12 +1154,91 @@ it("the actual readonly server graph reserves304 for complete A/S/F, rejects all
   );
 });
 
-it("readonly history preserves the full-page continuation and refuses its second120 dispatch without changing the original cursor", async (t) => {
+it("the real A164 graph can read authoritative RWA S46 and H500 plus its empty tail without borrowing any pool", async (t) => {
+  const f = await fixture(t, { unified: true, threeSources: true });
+  delete f.p.sleeves[0].copy_mode;
+  f.p.sleeves[1].copy_mode = "proportional";
+  const fixed = f.p.sleeves[2];
+  fixed.copy_mode = "fixed";
+  fixed.fixed_last_fill_at = f.time.at - 10000;
+  const originalAccount = f.b.account.bind(f.b);
+  f.b.account = async (...args: any[]) => {
+    const value = await originalAccount(...args);
+    await f.b.info({ type: "userDexAbstraction", user: f.identity.master });
+    return value;
+  };
+  const oldRwa = process.env.RIDE_AGENT_RWA_ENABLED;
+  process.env.RIDE_AGENT_RWA_ENABLED = "true";
+  t.after(() => {
+    if (oldRwa === undefined) delete process.env.RIDE_AGENT_RWA_ENABLED;
+    else process.env.RIDE_AGENT_RWA_ENABLED = oldRwa;
+  });
+  f.resetBank(356);
+  const ready = await f.prepare("audit_source");
+  await f.audit(ready);
+  assert.equal(
+    f.reads.reduce((sum, r) => sum + r.actual, 0),
+    164,
+  );
+  assert.equal(f.planDemand(), 184);
+  const resolve = f.b.resolve.bind(f.b);
+  f.b.resolve = async (id: string) => ({
+    ...(await resolve(id)),
+    ...(id === fixed.trader.id ? { tags: ["category:stocks_rwa"] } : {}),
+  });
+  const start = f.reads.length;
+  let snapshot: any;
+  for (const sleeve of f.p.sleeves) {
+    const source = await f.time.run(
+      f.bridge.operation(
+        "source",
+        { trader_id: sleeve.trader.id },
+        undefined,
+        undefined,
+        ready.handle,
+      ),
+    );
+    if (sleeve === fixed) snapshot = source;
+  }
+  assert.equal(
+    f.reads.slice(start).reduce((sum, r) => sum + r.actual, 0),
+    46,
+  );
+  f.sourceHistoryPages([500, 0]);
+  const history = (await f.time.run(
+    f.bridge.operation(
+      "source_fills",
+      {
+        trader_id: fixed.trader.id,
+        market: "perps",
+        start_at: fixed.fixed_last_fill_at,
+        end_at: snapshot.observed_at,
+      },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  assert.equal(history.complete, true);
+  assert.equal(history.fills.length, 500);
+  assert.equal(
+    f.reads.slice(start).filter((r) => r.type === "userFillsByTime").length,
+    2,
+  );
+  assert.equal(f.bank().paid, 356 + 164 + 46 + 65);
+  assert.equal(f.bank().held, 269);
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.planDemand(), 184);
+  assert.equal(f.p.executions.length, 0);
+  assert.equal(f.bank().posts, 0);
+});
+
+it("readonly history preserves the full-page continuation and refuses its third120 dispatch without changing the original cursor", async (t) => {
   const f = await fixture(t, { unified: true, threeSources: true });
   const fixed = f.p.sleeves[2];
   fixed.copy_mode = "fixed";
   fixed.fixed_last_fill_at = f.time.at - 10000;
-  f.resetBank(596);
+  f.resetBank(356);
   f.fullSourceHistoryPage();
   const ready = await f.prepare("audit_source");
   await f.audit(ready);
@@ -1137,13 +1272,112 @@ it("readonly history preserves the full-page continuation and refuses its second
   const history = f.reads
     .slice(before)
     .filter((r) => r.type === "userFillsByTime");
-  assert.equal(history.length, 1);
-  assert.equal(history[0].actual, 120);
+  assert.equal(history.length, 2);
+  assert.ok(history.every((read) => read.actual === 120));
   assert.equal(fixed.fixed_last_fill_at, cursor);
   assert.equal(f.p.executions.length, 0);
   assert.equal(f.outboxes.size, 0);
   assert.equal(f.bank().posts, 0);
   assert.equal(f.bank().dirty, false);
+});
+
+it("a new history episode grows H240 to360 and rereads the complete original range instead of reusing paid partial pages", async (t) => {
+  const f = await fixture(t, { unified: true, threeSources: true }),
+    fixed = f.p.sleeves[2];
+  fixed.copy_mode = "fixed";
+  fixed.fixed_last_fill_at = f.time.at - 10000;
+  f.resetBank(356);
+  f.sourceHistoryPages([2000, 2000, 0]);
+  let ready = await f.prepare("audit_source");
+  await f.audit(ready);
+  let source = (await f.time.run(
+    f.bridge.operation(
+      "source",
+      { trader_id: fixed.trader.id },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  const originalCursor = fixed.fixed_last_fill_at;
+  await assert.rejects(
+    f.time.run(
+      f.bridge.operation(
+        "source_fills",
+        {
+          trader_id: fixed.trader.id,
+          market: "perps",
+          start_at: originalCursor,
+          end_at: source.observed_at,
+        },
+        undefined,
+        undefined,
+        ready.handle,
+      ),
+    ),
+    (e) => {
+      assert.equal((e as any).details.read_stage, "history");
+      return true;
+    },
+  );
+  assert.equal(fixed.fixed_last_fill_at, originalCursor);
+  assert.equal(f.bank().paid, 356 + 144 + 2 + 240);
+  await f.bridge.operation(
+    "finish_portfolio",
+    { user_id: graphUser },
+    undefined,
+    undefined,
+    ready.handle,
+  );
+  await flush();
+  await f.time.advance(60001);
+  f.resetBank(236);
+  f.sourceHistoryPages([2000, 2000, 0]);
+  const before = f.reads.length;
+  ready = await f.prepare("audit_source");
+  assert.equal(f.begins.at(-1).weight, 664);
+  await f.audit(ready);
+  source = (await f.time.run(
+    f.bridge.operation(
+      "source",
+      { trader_id: fixed.trader.id },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  const result = (await f.time.run(
+    f.bridge.operation(
+      "source_fills",
+      {
+        trader_id: fixed.trader.id,
+        market: "perps",
+        start_at: originalCursor,
+        end_at: source.observed_at,
+      },
+      undefined,
+      undefined,
+      ready.handle,
+    ),
+  )) as any;
+  assert.equal(result.complete, true);
+  assert.equal(result.fills.length, 4000);
+  const pages = f.reads
+    .slice(before)
+    .filter(
+      (r) => r.type === "userFillsByTime" && r.user !== f.identity.master,
+    );
+  assert.equal(pages.length, 3);
+  assert.equal(pages[0].startTime, originalCursor);
+  assert.equal(
+    fixed.fixed_last_fill_at,
+    originalCursor,
+    "the server supplies complete evidence; only original Runner strategy can advance state",
+  );
+  assert.equal(f.planDemand(), 184);
+  assert.equal(f.bank().dirty, false);
+  assert.equal(f.p.executions.length, 0);
+  assert.equal(f.outboxes.size, 0);
 });
 
 it("readonly pending cancellation has exact acknowledgement and never claims a ready peer was cancelled", async (t) => {
@@ -1177,7 +1411,7 @@ it("readonly strict cancellation confirms only the same expired window and leave
     }),
     { ok: true, pending_cancelled: false },
   );
-  assert.equal(f.bank().held, 184);
+  assert.equal(f.bank().held, 304);
   await f.time.advance(20001);
   assert.deepEqual(
     await f.bridge.operation("cancel_prepared_portfolio", {
@@ -1206,36 +1440,49 @@ for (const {
   existingSourceBackoff,
   readonlyFixed,
   incompleteHistory,
+  slowHistory,
 } of [
   {
     threeSources: false,
     existingSourceBackoff: false,
     readonlyFixed: false,
     incompleteHistory: false,
+    slowHistory: false,
   },
   {
     threeSources: true,
     existingSourceBackoff: false,
     readonlyFixed: false,
     incompleteHistory: false,
+    slowHistory: false,
   },
   {
     threeSources: true,
     existingSourceBackoff: true,
     readonlyFixed: false,
     incompleteHistory: false,
+    slowHistory: false,
   },
   {
     threeSources: true,
     existingSourceBackoff: false,
     readonlyFixed: true,
     incompleteHistory: false,
+    slowHistory: false,
   },
   {
     threeSources: true,
     existingSourceBackoff: false,
     readonlyFixed: true,
     incompleteHistory: true,
+    slowHistory: false,
+  },
+  {
+    threeSources: true,
+    existingSourceBackoff: false,
+    readonlyFixed: true,
+    incompleteHistory: false,
+    slowHistory: true,
   },
 ])
   it(
@@ -1243,15 +1490,17 @@ for (const {
       (readonlyFixed
         ? "readonly mixedFixed A/S/F with zero financial identifiers ("
         : "both fresh scopes and one original outbox (") +
-      (incompleteHistory
-        ? "full history page cannot advance its cursor"
-        : readonlyFixed
-          ? "complete original cursor strategy"
-          : existingSourceBackoff
-            ? "three distinct sources after existing UNSENT backoff"
-            : threeSources
-              ? "three distinct sources"
-              : "one source") +
+      (slowHistory
+        ? "slow complete history cannot advance a stale source cursor"
+        : incompleteHistory
+          ? "full history page cannot advance its cursor"
+          : readonlyFixed
+            ? "complete original cursor strategy"
+            : existingSourceBackoff
+              ? "three distinct sources after existing UNSENT backoff"
+              : threeSources
+                ? "three distinct sources"
+                : "one source") +
       ")",
     { skip: !process.env.RIDE_AGENT_TEST_DATABASE_URL, timeout: 30000 },
     async (t) => {
@@ -1357,7 +1606,7 @@ for (const {
       if (readonlyFixed) {
         const fixed = f.p.sleeves[2];
         fixed.copy_mode = "fixed";
-        fixed.fixed_margin_usdc = "2";
+        fixed.fixed_margin_usdc = "0.4";
         fixed.fixed_last_fill_at = f.time.at - 10000;
         fixed.source_quantities = { "perps:SOL": "5" };
         fixed.fixed_targets = { "perps:SOL": "0.1" };
@@ -1423,10 +1672,12 @@ for (const {
       // The preceding charges have really aged out of the local ledger. This
       // finite external-ledger fixture offers just enough room for the warm pair.
       f.resetBank(
-        900 - (readonlyFixed ? f.planDemand() + 120 : 2 * f.planDemand()),
+        900 - (readonlyFixed ? f.planDemand() + 120 + 240 : 2 * f.planDemand()),
       );
       const originalCursor = state.portfolios[0].sleeves[2]?.fixed_last_fill_at;
       if (incompleteHistory) f.fullSourceHistoryPage();
+      else if (readonlyFixed) f.sourceHistoryPages([500, 0]);
+      f.slowSourceHistory(slowHistory);
       let originalRetryAt = 0;
       const sourceRetryAt = new Map<string, number>();
       if (existingSourceBackoff) {
@@ -1475,13 +1726,14 @@ for (const {
         );
         assert.equal(f.outboxes.size, 0);
         assert.equal(f.bank().posts, 0);
-        assert.equal(f.begins.at(-1).weight, 304);
+        assert.equal(f.begins.at(-1).weight, 544);
         assert.equal(f.begins.at(-1).mode, "learned");
         const freshReads = f.reads.slice(before),
           sourceReads = freshReads.filter(
             (read) =>
               read.type === "clearinghouseState" &&
-              read.user !== f.identity.master,
+              read.user !== f.identity.master &&
+              (!slowHistory || !!read.context?.frame_id),
           ),
           historyReads = freshReads.filter(
             (read) =>
@@ -1490,15 +1742,16 @@ for (const {
           );
         assert.equal(sourceReads.length, 3);
         assert.equal(new Set(sourceReads.map((read) => read.user)).size, 3);
+        assert.ok(sourceReads.every((read) => !!read.context?.frame_id));
         assert.ok(
-          sourceReads.every(
-            (read) => !!read.context?.frame_id && f.time.at - read.at <= 5000,
-          ),
+          slowHistory
+            ? sourceReads.some((read) => f.time.at - read.at > 5000)
+            : sourceReads.every((read) => f.time.at - read.at <= 5000),
         );
         assert.equal(
           historyReads.length,
-          1,
-          "only a full conservatively120-reserved first history page can dispatch",
+          2,
+          "each dispatched history page owns its full conservative120",
         );
         assert.ok(historyReads[0].context?.frame_id);
         for (const type of [
@@ -1517,12 +1770,18 @@ for (const {
           184,
           "H never enters the single-account scope cost plan",
         );
-        if (incompleteHistory) {
-          assert.equal(historyReads[0].actual, 120);
+        if (incompleteHistory || slowHistory) {
+          assert.equal(historyReads[0].actual, incompleteHistory ? 120 : 45);
           assert.equal(saved.sleeves[2].fixed_last_fill_at, originalCursor);
-          assert.equal(saved.last_error?.code, "VENUE_READ_BUDGET_EXHAUSTED");
+          assert.equal(
+            saved.last_error?.code,
+            incompleteHistory ? "VENUE_READ_BUDGET_EXHAUSTED" : "SOURCE_STALE",
+          );
         } else {
-          assert.equal(historyReads[0].actual, 20);
+          assert.deepEqual(
+            historyReads.map((read) => read.actual),
+            [45, 20],
+          );
           assert.ok(saved.sleeves[2].fixed_last_fill_at! > originalCursor!);
           assert.equal(
             saved.sleeves[2].fixed_last_fill_at,
@@ -1530,7 +1789,7 @@ for (const {
           );
           assert.equal(saved.target_blocker, undefined);
           assert.equal(saved.last_error, undefined);
-          assert.equal(f.bank().paid, 596 + 144 + 6 + 20);
+          assert.equal(f.bank().paid, 356 + 144 + 6 + 65);
         }
         assert.equal(f.bank().held, 0);
         return;
