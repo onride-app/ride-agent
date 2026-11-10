@@ -8,6 +8,7 @@ import {
   preparedProposalBinding,
   privateExecutionHistory,
   type PreparedPortfolioInput,
+  type PreparedReadPurpose,
 } from "./prepared-portfolio.js";
 import type {
   AccountSnapshot,
@@ -35,6 +36,9 @@ export interface ActivationCheck {
 }
 export interface PreparedPortfolioWindow {
   mode: "cold" | "warm";
+  purpose?: "audit_source";
+  execution_eligible?: false;
+  assertLive?(): void;
   expires_at: number;
   /** End read credit before digest/history/notification work. */
   release?(): Promise<void>;
@@ -57,8 +61,11 @@ type ReadWindowContext = {
   portfolio: PreparedPortfolioInput;
   handle: string;
   mode: "cold" | "warm";
+  purpose: PreparedReadPurpose;
   expiresAt: number;
+  monotonicUntil: number;
   active: boolean;
+  financialReleased: boolean;
   bound?: { id: string; fingerprint: string };
   proposal?: string;
   finish?: Promise<void>;
@@ -218,6 +225,15 @@ function invalidBridgeResponse(response: Response): AgentError {
   );
 }
 
+function readOnlyExecutionRejected(): AgentError {
+  return new AgentError(
+    "EXECUTION_REJECTED",
+    "Read-only observation cannot prepare or submit an execution.",
+    false,
+    409,
+  );
+}
+
 function validBridgeResponse(operation: string, data: unknown): boolean {
   if (operation === "candidates") return Array.isArray(data);
   if (operation === "read_plan_evidence") return isPlanReadEvidence(data);
@@ -280,6 +296,8 @@ export class BridgeAdapter implements VenueAdapter {
     private url: string,
     private token: string,
     privateHttpHost?: string,
+    private readonly windowMonotonicClock: () => number = () =>
+      performance.now(),
   ) {
     const u = new URL(url);
     const privateHttp =
@@ -329,6 +347,29 @@ export class BridgeAdapter implements VenueAdapter {
       ? AbortSignal.any([timeoutSignal, callerSignal])
       : timeoutSignal;
     const context = this.readWindows.getStore();
+    const scopedPortfolio =
+      record(input) && record(input.portfolio) ? input.portfolio : undefined;
+    const scopedAccounts =
+      scopedPortfolio && record(scopedPortfolio.venue_accounts)
+        ? scopedPortfolio.venue_accounts
+        : undefined;
+    const sameReadPortfolio =
+      !!context &&
+      record(input) &&
+      input.user_id === context.user &&
+      scopedPortfolio?.id === context.portfolio.id &&
+      (scopedAccounts?.perps ?? scopedPortfolio?.account_id) ===
+        (context.portfolio.venue_accounts?.perps ??
+          context.portfolio.account_id) &&
+      scopedPortfolio?.control_id === context.portfolio.control_id;
+    if (
+      context &&
+      context.purpose === "audit_source" &&
+      !context.financialReleased &&
+      sameReadPortfolio &&
+      ["prepare_execution", "bind", "submit"].includes(operation)
+    )
+      throw readOnlyExecutionRejected();
     let windowHandle = explicitWindowHandle;
     const selectedSources = new Set(
       context?.portfolio.sleeves.map((s) => s.trader.id),
@@ -336,26 +377,72 @@ export class BridgeAdapter implements VenueAdapter {
     const sourceMatches =
       operation === "source"
         ? record(input) && selectedSources.has(String(input.trader_id))
-        : operation === "read_plan_evidence"
+        : operation === "source_fills"
           ? record(input) &&
-            Array.isArray(input.traders) &&
-            input.traders.every(
-              (trader) =>
-                record(trader) && selectedSources.has(String(trader.id)),
-            )
-          : true;
+            input.market === "perps" &&
+            context?.purpose === "audit_source" &&
+            selectedSources.has(String(input.trader_id)) &&
+            context.portfolio.sleeves.some(
+              (s) =>
+                s.state !== "closed" &&
+                s.copy_mode === "fixed" &&
+                s.trader.id === input.trader_id,
+            ) &&
+            context.portfolio.sleeves
+              .filter(
+                (s) =>
+                  s.state !== "closed" &&
+                  s.copy_mode === "fixed" &&
+                  s.trader.id === input.trader_id,
+              )
+              .every(
+                (s) =>
+                  Number.isSafeInteger(s.fixed_last_fill_at) &&
+                  s.fixed_last_fill_at === input.start_at,
+              ) &&
+            Number.isSafeInteger(input.end_at) &&
+            Number.isSafeInteger(input.start_at) &&
+            Number(input.end_at) > Number(input.start_at) &&
+            Number(input.end_at) - Number(input.start_at) <= 31 * 86400_000 &&
+            Number(input.end_at) <= Date.now()
+          : operation === "read_plan_evidence"
+            ? record(input) &&
+              Array.isArray(input.traders) &&
+              input.traders.every(
+                (trader) =>
+                  record(trader) && selectedSources.has(String(trader.id)),
+              )
+            : true;
+    if (
+      context?.active &&
+      ((context.purpose === "audit_source" &&
+        ["source", "source_fills", "read_plan_evidence"].includes(operation) &&
+        !sourceMatches) ||
+        (operation === "source_fills" && context.purpose !== "audit_source"))
+    )
+      throw new AgentError(
+        "SOURCE_SCOPE_UNAVAILABLE",
+        "Read-only source history does not match the selected scope.",
+        false,
+        409,
+      );
     if (
       windowHandle === undefined &&
       context?.active &&
       sourceMatches &&
+      (["source", "source_fills", "read_plan_evidence"].includes(operation) ||
+        sameReadPortfolio) &&
       [
         "account",
         "prepare_execution",
         "submit",
         "source",
+        "source_fills",
         "read_plan_evidence",
       ].includes(operation)
     ) {
+      if (context.purpose === "audit_source")
+        this.assertReadWindowLive(context);
       if (Date.now() >= context.expiresAt)
         throw new AgentError(
           "VENUE_READ_DEADLINE",
@@ -433,6 +520,14 @@ export class BridgeAdapter implements VenueAdapter {
     portfolio: PreparedPortfolioInput,
     work: (window: PreparedPortfolioWindow) => Promise<T>,
   ): Promise<PreparedPortfolioResult<T>> {
+    if (portfolio.purpose !== undefined && portfolio.purpose !== "audit_source")
+      throw new AgentError(
+        "EXECUTOR_RESPONSE_INVALID",
+        "Read purpose is invalid.",
+        false,
+        502,
+      );
+    const purpose: PreparedReadPurpose = portfolio.purpose ?? "audit_submit";
     if (this.readWindows.getStore()?.active)
       throw new AgentError(
         "EXECUTOR_RESPONSE_INVALID",
@@ -458,6 +553,32 @@ export class BridgeAdapter implements VenueAdapter {
       throw error;
     }
     if (ready?.state === "unsupported") return { state: "unsupported" };
+    if (
+      (purpose === "audit_source" &&
+        (ready?.purpose !== "audit_source" ||
+          ready?.execution_eligible !== false)) ||
+      (purpose === "audit_submit" &&
+        ready?.purpose !== undefined &&
+        ready.purpose !== "audit_submit")
+    ) {
+      if (
+        ready?.state === "ready" &&
+        typeof ready.handle === "string" &&
+        /^[A-Za-z0-9_-]{32,128}$/.test(ready.handle)
+      )
+        await this.call(
+          "finish_portfolio",
+          { user_id: user, portfolio_id: portfolio.id },
+          undefined,
+          ready.handle,
+        ).catch(() => {});
+      throw new AgentError(
+        "EXECUTOR_RESPONSE_INVALID",
+        "Read readiness did not confirm the requested purpose.",
+        false,
+        502,
+      );
+    }
     if (ready?.state === "pending") {
       if (
         !Number.isSafeInteger(ready.retry_after_ms) ||
@@ -492,37 +613,73 @@ export class BridgeAdapter implements VenueAdapter {
       portfolio: structuredClone(portfolio),
       handle: ready.handle as string,
       mode: ready.mode as "cold" | "warm",
+      purpose,
       expiresAt: ready.expires_at as number,
+      monotonicUntil:
+        this.windowMonotonicClock() +
+        Math.max(0, ready.expires_at - Date.now()),
       active: true,
+      financialReleased: purpose !== "audit_source",
     };
     const finish = () => {
       context.active = false;
       context.bound = undefined;
-      return (context.finish ??= this.call(
-        "finish_portfolio",
-        {
-          user_id: user,
-          portfolio_id: portfolio.id,
-        },
-        undefined,
-        context.handle,
-      ).then(
-        () => undefined,
-        () => undefined,
-      ));
+      if (!context.finish) {
+        const result = this.call<{ ok?: unknown }>(
+          "finish_portfolio",
+          { user_id: user, portfolio_id: portfolio.id },
+          undefined,
+          context.handle,
+        ).then((value) => {
+          if (purpose === "audit_source" && value?.ok !== true)
+            throw new AgentError(
+              "EXECUTOR_RESPONSE_INVALID",
+              "Read-only window release was not acknowledged.",
+              true,
+              502,
+            );
+          context.financialReleased = true;
+        });
+        context.finish =
+          purpose === "audit_source" ? result : result.catch(() => undefined);
+        void context.finish.catch(() => {});
+      }
+      return context.finish;
     };
     try {
       const value = await this.readWindows.run(context, () =>
         work({
           mode: context.mode,
+          ...(purpose === "audit_source"
+            ? {
+                purpose,
+                execution_eligible: false as const,
+                assertLive: () => this.assertReadWindowLive(context),
+              }
+            : {}),
           expires_at: context.expiresAt,
           release: finish,
         }),
       );
       return { state: "complete", value };
     } finally {
-      await finish();
+      // An explicit readonly release propagates failure before a risk order
+      // can be created. Cleanup cannot replace an earlier business error.
+      await finish().catch(() => {});
     }
+  }
+  private assertReadWindowLive(context: ReadWindowContext): void {
+    if (
+      !context.active ||
+      Date.now() >= context.expiresAt ||
+      this.windowMonotonicClock() >= context.monotonicUntil
+    )
+      throw new AgentError(
+        "VENUE_READ_DEADLINE",
+        "Read-only observation window expired.",
+        true,
+        503,
+      );
   }
   async prepareExecution(
     user: string,
@@ -530,6 +687,14 @@ export class BridgeAdapter implements VenueAdapter {
     proposal: ExecutionProposal,
   ): Promise<ExecutionPreparation | null> {
     const context = this.readWindows.getStore();
+    if (
+      context &&
+      context.purpose === "audit_source" &&
+      !context.financialReleased &&
+      context.user === user &&
+      context.portfolio.id === portfolio.id
+    )
+      throw readOnlyExecutionRejected();
     if (!context?.active || context.mode !== "warm") return null;
     if (
       context.user !== user ||
@@ -565,6 +730,7 @@ export class BridgeAdapter implements VenueAdapter {
       bind: (execution) => {
         if (
           !context.active ||
+          context.purpose === "audit_source" ||
           context.bound ||
           Date.now() >= context.expiresAt ||
           preparedProposalBinding(execution) !== proposalBinding
@@ -600,10 +766,23 @@ export class BridgeAdapter implements VenueAdapter {
     user: string,
     previous: PreparedPortfolioInput,
   ) {
-    await this.call("cancel_prepared_portfolio", {
+    const value = await this.call<{
+      ok?: unknown;
+      pending_cancelled?: unknown;
+    }>("cancel_prepared_portfolio", {
       user_id: user,
       portfolio: previous,
     });
+    if (
+      previous.purpose === "audit_source" &&
+      (value?.ok !== true || value?.pending_cancelled !== true)
+    )
+      throw new AgentError(
+        "VENUE_COST_PLAN_UNAVAILABLE",
+        "Read-only pending cancellation was not confirmed.",
+        true,
+        503,
+      );
   }
   depositOptions() {
     return this.call<{ routes: any[]; notes?: string[] }>(

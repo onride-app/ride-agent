@@ -62,9 +62,15 @@ type AccountReadScope = {
   preparedIdentityVerified?: boolean;
   preparedHint?: Awaited<ReturnType<ObservationPlanStore["read"]>>;
   preparedClaim?: Promise<void>;
+  preparedHistoryGuard?: (payload: unknown) => void;
 };
+export interface PreparedReadWindowOptions {
+  purpose?: "audit_submit" | "audit_source";
+  historySources?: readonly string[];
+}
 export interface PreparedAccountWindow {
   readonly mode: "cold" | "warm";
+  readonly purpose: "audit_submit" | "audit_source";
   readonly expires_at: number;
   read<T>(
     work: () => Promise<T>,
@@ -79,6 +85,12 @@ export interface PreparedAccountWindow {
     limits?: AccountObservationLimits,
   ): Promise<T>;
   sourceRetryLimits(): PreparedSourceRetryLimits;
+  history<T>(
+    source: string,
+    work: () => Promise<T>,
+    guard: (payload: unknown) => void,
+    limits?: AccountObservationLimits,
+  ): Promise<T>;
   close(): Promise<void>;
   assertNextChildReady(): void;
 }
@@ -342,6 +354,7 @@ export class VenueReads {
     firstDeadline: number,
     continuation?: object,
     callerSignal?: AbortSignal,
+    options: PreparedReadWindowOptions = {},
   ): Promise<PreparedAccountWindow> {
     if (
       !this.frameCoordinator ||
@@ -351,7 +364,11 @@ export class VenueReads {
       !/^[0-9a-f]{64}$/.test(owner) ||
       !/^[0-9a-f]{64}$/.test(frameOwner) ||
       firstDeadline <= this.clock() ||
-      firstDeadline > this.clock() + 100000
+      firstDeadline > this.clock() + 100000 ||
+      (options.purpose !== undefined &&
+        !["audit_submit", "audit_source"].includes(options.purpose)) ||
+      ((options.historySources?.length ?? 0) > 0 &&
+        options.purpose !== "audit_source")
     )
       throw costPlanUnavailable();
     const scope: AccountReadScope = {
@@ -388,7 +405,7 @@ export class VenueReads {
     let parent: AccountReadBundle;
     try {
       parent = (await this.accountScope.run(scope, () =>
-        this.reserveObservation(scope, { continuation }),
+        this.reserveObservation(scope, { continuation, ...options }),
       )) as AccountReadBundle;
       if (scope.admission.signal.aborted) throw scope.admission.signal.reason;
     } catch (error) {
@@ -413,10 +430,13 @@ export class VenueReads {
       work: () => Promise<T>,
       limits: AccountObservationLimits,
       monotonicUntil: number,
+      history?: { source: string; guard: (payload: unknown) => void },
     ) => {
       if (closed || reading || reads < 1 || scope.admission.signal.aborted)
         throw costPlanUnavailable();
-      const ticket = parent.beginSupplement();
+      const ticket = history
+        ? parent.beginHistorySupplement(history.source)
+        : parent.beginSupplement();
       reading = true;
       const sourceScope: AccountReadScope = {
         ...scope,
@@ -429,6 +449,7 @@ export class VenueReads {
         durableAttempted: false,
         preparedHint: undefined,
         preparedClaim: undefined,
+        preparedHistoryGuard: history?.guard,
         admission: new AbortController(),
       };
       sourceScope.until = Math.min(scope.until, limits.deadlineMs ?? Infinity);
@@ -470,6 +491,7 @@ export class VenueReads {
     const supplement = async <T>(
       work: () => Promise<T>,
       limits: AccountObservationLimits = {},
+      history?: { source: string; guard: (payload: unknown) => void },
     ): Promise<T> => {
       // Source collection has two workers. Serialize only these supplemental
       // children, not account observations, inside this same original lease.
@@ -536,6 +558,7 @@ export class VenueReads {
           work,
           { ...limits, signal: admission.signal, deadlineMs: until },
           monotonicUntil,
+          history,
         );
         if (admission.signal.aborted) throw admission.signal.reason;
         return value;
@@ -552,9 +575,24 @@ export class VenueReads {
       }
     };
     const window: PreparedAccountWindow = {
-      mode: parent.childCount === 1 ? "cold" : "warm",
+      mode: parent.capacityTrial ? "cold" : "warm",
+      purpose: options.purpose ?? "audit_submit",
       expires_at: scope.until,
       supplement,
+      history: async <T>(
+        source: string,
+        work: () => Promise<T>,
+        guard: (payload: unknown) => void,
+        limits: AccountObservationLimits = {},
+      ) => {
+        if (
+          options.purpose !== "audit_source" ||
+          !options.historySources?.includes(source) ||
+          typeof guard !== "function"
+        )
+          throw costPlanUnavailable();
+        return supplement(work, limits, { source, guard });
+      },
       sourceRetryLimits: () => {
         if (closed || failed || reads < 1 || scope.admission.signal.aborted)
           throw costPlanUnavailable();
@@ -1120,7 +1158,7 @@ export class VenueReads {
   }
   private async reserveObservation(
     scope: AccountReadScope,
-    bundle?: { continuation?: object },
+    bundle?: PreparedReadWindowOptions & { continuation?: object },
   ): Promise<AccountReadReservation> {
     // A near-ready FIFO slot should not be lost to a complete monitor cycle's
     // reconciliation and commit work. Uncoordinated reads retain their original
@@ -1183,7 +1221,15 @@ export class VenueReads {
       }
     }
     let fleetPlan:
-      { fullDemand: number; reservedWeight: number; cold: boolean } | undefined;
+      | {
+          fullDemand: number;
+          reservedWeight: number;
+          cold: boolean;
+          childLimit: number;
+          childCount: 1 | 2;
+          historySources: readonly string[];
+        }
+      | undefined;
     if (this.frameCoordinator) {
       // A busy local source ledger must not prevent polling or expiring an
       // already queued fleet reservation. This peek claims no local capacity
@@ -1194,15 +1240,32 @@ export class VenueReads {
         scope.owner!,
         trialCapacity,
       );
+      const historySources = bundle?.historySources ?? [];
+      if (
+        historySources.length > 8 ||
+        new Set(historySources).size !== historySources.length ||
+        historySources.some(
+          (source) =>
+            typeof source !== "string" || !source || source.length > 256,
+        ) ||
+        (historySources.length > 0 && bundle?.purpose !== "audit_source")
+      )
+        throw costPlanUnavailable();
+      const childLimit = hint.cold
+        ? Math.min(hint.fullDemand, trialCapacity)
+        : hint.fullDemand;
+      const childCount: 1 | 2 =
+        bundle && bundle.purpose !== "audit_source" && !hint.cold ? 2 : 1;
+      const reservedWeight =
+        childLimit * childCount + historySources.length * historyReservation;
       if (
         bundle &&
-        !hint.cold &&
-        hint.fullDemand <= this.frameCoordinator.capacity &&
-        hint.fullDemand * 2 > this.frameCoordinator.capacity
+        childLimit <= this.frameCoordinator.capacity &&
+        reservedWeight > this.frameCoordinator.capacity
       ) {
         const unsupported = new AgentError(
           "VENUE_READ_BUDGET_EXHAUSTED",
-          "This complete single-scope cost is not eligible for a paired read window.",
+          "This complete read window exceeds its unchanged fleet capacity.",
           true,
           503,
           { reason_code: "READ_FRAME_CAPACITY", retry_after_ms: 60000 },
@@ -1211,9 +1274,7 @@ export class VenueReads {
         throw unsupported;
       }
       if (
-        (!hint.cold &&
-          hint.fullDemand * (bundle ? 2 : 1) >
-            this.frameCoordinator.capacity) ||
+        reservedWeight > this.frameCoordinator.capacity ||
         (hint.cold && trialCapacity < Math.min(120, this.budget.limit))
       ) {
         throw new AgentError(
@@ -1226,9 +1287,10 @@ export class VenueReads {
       }
       fleetPlan = {
         ...hint,
-        reservedWeight: hint.cold
-          ? Math.min(hint.fullDemand, trialCapacity)
-          : hint.fullDemand * (bundle ? 2 : 1),
+        reservedWeight,
+        childLimit,
+        childCount,
+        historySources,
       };
       await this.reserveFrame(
         scope,
@@ -1251,7 +1313,7 @@ export class VenueReads {
         if (fleetPlan) {
           const current = this.budget.peekObservationFramePlan(
             scope.owner!,
-            fleetPlan.reservedWeight,
+            fleetPlan.childLimit,
           );
           if (
             current.fullDemand !== fleetPlan.fullDemand ||
@@ -1262,12 +1324,11 @@ export class VenueReads {
         const reservation = bundle
           ? this.budget.beginObservationBundle(
               scope.owner!,
-              fleetPlan!.cold
-                ? fleetPlan!.reservedWeight
-                : fleetPlan!.fullDemand,
-              fleetPlan!.cold ? 1 : 2,
+              fleetPlan!.childLimit,
+              fleetPlan!.childCount,
               scope.localInterest!,
               fleetPlan!.cold,
+              fleetPlan!.historySources,
             )
           : this.budget.beginObservation(
               scope.owner!,
@@ -1397,6 +1458,15 @@ export class VenueReads {
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       this.checkCooldown(method, lane);
       const scope = this.accountScope.getStore();
+      if (
+        scope?.preparedHistoryGuard &&
+        (lane !== "source" ||
+          cost.method !== "userFillsByTime" ||
+          cost.reserve !== 120 ||
+          cost.unknownSurcharge)
+      )
+        throw costPlanUnavailable();
+      scope?.preparedHistoryGuard?.(payload);
       if (scope?.preparedParent) {
         if (!scope.preparedIdentityVerified) throw costPlanUnavailable();
       }

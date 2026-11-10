@@ -27,6 +27,9 @@ class Adapter extends FakeAdapter {
   pending = false;
   cleanupFails = false;
   windows = 0;
+  pairedWindows = 0;
+  readonlyWindows = 0;
+  activePurpose: "audit_source" | "audit_submit" = "audit_submit";
   prepares = 0;
   accounts = 0;
   sources = 0;
@@ -44,8 +47,12 @@ class Adapter extends FakeAdapter {
     work: (window: PreparedPortfolioWindow) => Promise<T>,
   ): Promise<PreparedPortfolioResult<T>> {
     this.windows++;
+    if (_p.purpose === "audit_source") this.readonlyWindows++;
+    else this.pairedWindows++;
     if (this.pending) return { state: "pending", retry_after_ms: 1000 };
     this.active = true;
+    this.activePurpose = _p.purpose ?? "audit_submit";
+    const expires = now() + 20000;
     const release = async () => {
       if (!this.active) return;
       this.active = false;
@@ -55,7 +62,20 @@ class Adapter extends FakeAdapter {
     try {
       return {
         state: "complete",
-        value: await work({ mode: "warm", expires_at: now() + 20000, release }),
+        value: await work({
+          mode: "warm",
+          expires_at: expires,
+          release,
+          ...(_p.purpose === "audit_source"
+            ? {
+                purpose: "audit_source" as const,
+                execution_eligible: false as const,
+                assertLive: () => {
+                  assert.ok(this.active && now() < expires);
+                },
+              }
+            : {}),
+        }),
       };
     } finally {
       await release();
@@ -71,6 +91,7 @@ class Adapter extends FakeAdapter {
     proposal: ExecutionProposal,
   ) {
     assert.equal(this.active, true);
+    assert.equal(this.activePurpose, "audit_submit");
     this.prepares++;
     this.proposals.push(structuredClone(proposal));
     return {
@@ -116,7 +137,14 @@ class Adapter extends FakeAdapter {
   }
   async submit(_user?: string, _p?: unknown, e?: Execution) {
     assert.ok(e);
-    if (this.active) assert.equal(this.bound.get(e.id), e.fingerprint);
+    if (this.active) {
+      assert.equal(
+        this.activePurpose,
+        "audit_submit",
+        "a readonly capability cannot submit",
+      );
+      assert.equal(this.bound.get(e.id), e.fingerprint);
+    }
     // The routing fixture models the adapter's separate fresh preflight, not
     // permission to reuse the earlier audit or make a real financial request.
     await this.account();
@@ -211,14 +239,15 @@ async function fixture(t: TestContext) {
   return { adapter, repository, runner, read, tick };
 }
 
-it("a rejected source basket keeps full ordinary audits and source advancement without repeatedly booking2W", async (t) => {
+it("a rejected source basket keeps full readonly audits and source advancement without repeatedly booking2W", async (t) => {
   const f = await fixture(t);
   for (let i = 0; i < 4; i++) await f.tick();
   const p = await f.read();
   assert.equal(p.target_blocker?.code, "ASSET_CONCENTRATION");
   assert.equal(f.adapter.accounts, 4);
   assert.equal(f.adapter.sources, 12);
-  assert.equal(f.adapter.windows, 0);
+  assert.equal(f.adapter.readonlyWindows, 3);
+  assert.equal(f.adapter.pairedWindows, 0);
   assert.equal(f.adapter.prepares, 0);
   assert.equal(p.executions.length, 0);
 });
@@ -230,11 +259,13 @@ it("only a fresh successful source/risk pass clears the routing blocker and the 
   f.adapter.changed = false;
   await f.tick();
   assert.equal((await f.read()).target_blocker, undefined);
-  assert.equal(f.adapter.windows, 0);
+  assert.equal(f.adapter.readonlyWindows, 1);
+  assert.equal(f.adapter.pairedWindows, 0);
   assert.equal((await f.read()).executions.length, 0);
   const before = f.adapter.accounts;
   await f.tick();
-  assert.equal(f.adapter.windows, 1);
+  assert.equal(f.adapter.pairedWindows, 1);
+  assert.equal(f.adapter.readonlyWindows, 1);
   assert.equal(f.adapter.prepares, 1);
   assert.equal(f.adapter.submitted.length, 1);
   assert.equal(
@@ -269,7 +300,12 @@ it("a persisted blocker still permits the original owned-only reduction without 
     }
   });
   await f.tick();
-  assert.equal(f.adapter.windows, 0);
+  assert.equal(f.adapter.readonlyWindows, 1);
+  assert.equal(f.adapter.pairedWindows, 0);
+  assert.ok(
+    f.adapter.events.indexOf("window:release") <
+      f.adapter.events.indexOf("submit"),
+  );
   assert.equal(f.adapter.submitted.length, 1);
   assert.equal(f.adapter.submitted[0].key, "perps:BTC");
   assert.equal(f.adapter.submitted[0].target_quantity, "0.1");
@@ -298,7 +334,8 @@ it("the ordinary blocked route still triggers loss fences, cancellation and owne
   });
   f.adapter.snap.account_value_usdc = "470";
   await f.tick();
-  assert.equal(f.adapter.windows, 0);
+  assert.equal(f.adapter.readonlyWindows, 1);
+  assert.equal(f.adapter.pairedWindows, 0);
   assert.equal((await f.read()).loss_latched, true);
   assert.ok(f.adapter.fences > 0 && f.adapter.cancelledRisk > 0);
   assert.equal(f.adapter.submitted.length, 3);
@@ -330,7 +367,8 @@ it("the blocker never replaces original unknown-ID reconciliation with new targe
     s.portfolios[0].executions.push(structuredClone(e));
   });
   await f.tick();
-  assert.equal(f.adapter.windows, 0);
+  assert.equal(f.adapter.readonlyWindows, 1);
+  assert.equal(f.adapter.pairedWindows, 0);
   assert.equal(f.adapter.reconciled, 1);
   assert.deepEqual((await f.read()).executions, [e]);
   assert.equal(f.adapter.submitted.length, 0);
@@ -367,7 +405,8 @@ it("a blocker appearing after cached routing releases an already-ready window be
   f.adapter.changed = true;
   f.adapter.events.length = 0;
   await f.tick();
-  assert.equal(f.adapter.windows, 1);
+  assert.equal(f.adapter.readonlyWindows, 1);
+  assert.equal(f.adapter.pairedWindows, 1);
   assert.equal(f.adapter.prepares, 0);
   assert.equal(f.adapter.events[0], "window:release");
   assert.ok(
@@ -390,7 +429,16 @@ for (const cleanupFails of [false, true])
     assert.equal((await f.read()).target_blocker?.code, "ASSET_CONCENTRATION");
     assert.equal(f.adapter.cancelled[0].id, (await f.read()).id);
     await f.tick();
-    assert.equal(f.adapter.windows, 1, "blocked routing cannot poll/rebook2W");
+    assert.equal(
+      f.adapter.pairedWindows,
+      1,
+      "blocked routing cannot poll/rebook2W",
+    );
+    assert.equal(
+      f.adapter.readonlyWindows,
+      cleanupFails ? 0 : 1,
+      "a new readonly purpose never replaces an uncancelled old pending capability",
+    );
     assert.equal(f.adapter.cancelled.length, cleanupFails ? 2 : 1);
     assert.equal(f.adapter.accounts, 3);
     assert.equal(f.adapter.sources, 9);

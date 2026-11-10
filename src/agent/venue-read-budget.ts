@@ -88,6 +88,7 @@ export interface AccountReadBundle extends AccountReadReservation {
   readonly childCount: number;
   beginChild(): AccountReadReservation;
   beginSupplement(): AccountReadReservation;
+  beginHistorySupplement(source: string): AccountReadReservation;
   assertNextChildReady(): void;
 }
 type Observation = {
@@ -116,6 +117,7 @@ type Observation = {
     opened: number;
     child?: Observation;
     supplementRemaining?: number;
+    historyRemaining?: Map<string, number>;
   };
 };
 type Owner = {
@@ -492,7 +494,11 @@ export class VenueReadBudget {
     owner: string,
     capacityTrial?: { fullDemand: number; reservedWeight: number },
     interestToken?: object,
-    bundle?: { childLimit: number; count: 1 | 2 },
+    bundle?: {
+      childLimit: number;
+      count: 1 | 2;
+      historySources?: readonly string[];
+    },
   ): AccountReadReservation {
     this.prune();
     const now = this.clock();
@@ -523,7 +529,18 @@ export class VenueReadBudget {
       (!Number.isSafeInteger(bundle.childLimit) ||
         bundle.childLimit < 120 ||
         ![1, 2].includes(bundle.count) ||
-        bundle.childLimit * bundle.count > this.limit ||
+        (bundle.historySources !== undefined &&
+          ((bundle.historySources.length > 0 && bundle.count !== 1) ||
+            bundle.historySources.length > 8 ||
+            new Set(bundle.historySources).size !==
+              bundle.historySources.length ||
+            bundle.historySources.some(
+              (source) =>
+                typeof source !== "string" || !source || source.length > 256,
+            ))) ||
+        bundle.childLimit * bundle.count +
+          (bundle.historySources?.length ?? 0) * 120 >
+          this.limit ||
         (capacityTrial
           ? bundle.count !== 1 ||
             bundle.childLimit !== capacityTrial.reservedWeight
@@ -531,7 +548,8 @@ export class VenueReadBudget {
     )
       throw costPlanUnavailable();
     const reservedWeight = bundle
-      ? bundle.childLimit * bundle.count
+      ? bundle.childLimit * bundle.count +
+        (bundle.historySources?.length ?? 0) * 120
       : (capacityTrial?.reservedWeight ?? entry.demand);
     const first = this.observationQueue.keys().next().value;
     if (this.observation || first !== owner) {
@@ -684,6 +702,9 @@ export class VenueReadBudget {
               limit: bundle.childLimit,
               count: bundle.count,
               opened: 0,
+              historyRemaining: new Map(
+                (bundle.historySources ?? []).map((source) => [source, 120]),
+              ),
             },
           }
         : {}),
@@ -706,14 +727,19 @@ export class VenueReadBudget {
     count: 1 | 2,
     interestToken: object,
     cold = false,
+    historySources: readonly string[] = [],
   ): AccountReadBundle {
     const ticket = this.beginObservation(
       owner,
       cold ? { fullDemand: this.limit, reservedWeight: childLimit } : undefined,
       interestToken,
-      { childLimit, count },
+      { childLimit, count, historySources },
     );
-    const openChild = (supplement = false) => {
+    const openChild = (
+      kind: "account" | "source" | "history" = "account",
+      historySource?: string,
+    ) => {
+      const supplement = kind !== "account";
       const parent = this.observation;
       if (
         parent?.ticket !== ticket ||
@@ -723,12 +749,17 @@ export class VenueReadBudget {
         parent.bundle.child ||
         (supplement
           ? parent.bundle.opened < 1 ||
-            parent.bundle.supplementRemaining === undefined
+            (kind === "history"
+              ? historySource === undefined ||
+                !parent.bundle.historyRemaining?.has(historySource)
+              : parent.bundle.supplementRemaining === undefined)
           : parent.bundle.opened >= count)
       )
         throw costPlanUnavailable();
       const scopeLimit = supplement
-        ? parent.bundle.supplementRemaining!
+        ? kind === "history"
+          ? parent.bundle.historyRemaining!.get(historySource!)!
+          : parent.bundle.supplementRemaining!
         : childLimit;
       let learned: ObservationCostPlan | null = null;
       const childTicket: AccountReadReservation = {
@@ -761,7 +792,16 @@ export class VenueReadBudget {
             child.complete = false;
           if (child.complete && !supplement && child.committed > 0)
             this.learnObservation(child);
-          if (supplement)
+          if (kind === "history")
+            parent.bundle!.historyRemaining!.set(
+              historySource!,
+              Math.max(
+                0,
+                parent.bundle!.historyRemaining!.get(historySource!)! -
+                  child.committed,
+              ),
+            );
+          else if (supplement)
             parent.bundle!.supplementRemaining = Math.max(
               0,
               parent.bundle!.supplementRemaining! - child.committed,
@@ -816,7 +856,8 @@ export class VenueReadBudget {
       childLimit,
       childCount: count,
       beginChild: () => openChild(),
-      beginSupplement: () => openChild(true),
+      beginSupplement: () => openChild("source"),
+      beginHistorySupplement: (source: string) => openChild("history", source),
       assertNextChildReady: () => {
         const parent = this.observation;
         if (

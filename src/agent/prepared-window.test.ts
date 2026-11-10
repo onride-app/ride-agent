@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { VenueReads } from "./venue-reads.js";
+import { VenueReads, type PreparedReadWindowOptions } from "./venue-reads.js";
 import { VenueReadBudget, type BudgetTimers } from "./venue-read-budget.js";
 import {
   coreFrameCoordinator,
@@ -70,7 +70,7 @@ class Time {
     return value;
   }
 }
-function fixture() {
+function fixture(options: { paid?: number } = {}) {
   const time = new Time(),
     owner = "a".repeat(64),
     frameOwner = "b".repeat(64),
@@ -79,7 +79,7 @@ function fixture() {
     events: string[] = [];
   let hangProvider = false;
   let held = 0,
-    paid = 532,
+    paid = options.paid ?? 532,
     grant = true,
     generation = 1,
     dirty = false,
@@ -232,8 +232,19 @@ function fixture() {
     hang: (value: boolean) => {
       hangProvider = value;
     },
-    prepare: (pin?: object, first = time.at + 100000) =>
-      reads.prepareAccountWindow(owner, frameOwner, first, pin),
+    prepare: (
+      pin?: object,
+      first = time.at + 100000,
+      windowOptions?: PreparedReadWindowOptions,
+    ) =>
+      reads.prepareAccountWindow(
+        owner,
+        frameOwner,
+        first,
+        pin,
+        undefined,
+        windowOptions,
+      ),
   };
 }
 it("real factory pending keeps one UUID/first deadline and performs no dirty claim or provider read", async () => {
@@ -311,6 +322,238 @@ it("full900 bank allows audit84 then selected SourceFeed6 and preserves a fresh 
   feed.close();
   assert.equal(f.bank().held, 0);
   assert.equal(f.budget.snapshot().used, 174);
+});
+
+it("a warm readonly single184 window keeps its learned mode and has only A plus its actual unused source credit, never B", async () => {
+  const f = fixture({ paid: 716 });
+  const window = await f.prepare(undefined, f.time.at + 100000, {
+    purpose: "audit_source",
+  });
+  assert.equal(window.mode, "warm");
+  assert.equal(window.purpose, "audit_source");
+  assert.equal(f.begins[0].weight, 184);
+  assert.equal(f.bank().used, 900);
+  await f.time.run(window.read(f.audit));
+  const { feed } = nativeSourceFeed(f);
+  for (const id of ["one", "two", "three"])
+    await f.time.run(feed.read(id, (work) => window.supplement(work)));
+  assert.equal(f.bank().paid, 806);
+  assert.equal(f.bank().held, 94);
+  assert.equal(f.bank().dirty, false);
+  assert.throws(() => window.assertNextChildReady());
+  await assert.rejects(window.read(f.audit));
+  assert.equal(f.budget.snapshot().used, 90);
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.bank().held, 0);
+  assert.equal(f.time.events.size, 0);
+});
+
+it("a full900 readonly304 window isolates H120 from A184 and source surplus, and rejects a second history page before dispatch", async () => {
+  const f = fixture({ paid: 596 });
+  const window = await f.prepare(undefined, f.time.at + 100000, {
+    purpose: "audit_source",
+    historySources: ["fixed"],
+  });
+  assert.equal(window.mode, "warm");
+  assert.equal(f.begins[0].weight, 304);
+  await f.time.run(window.read(f.audit));
+  const { feed } = nativeSourceFeed(f);
+  for (const id of ["one", "two", "three"])
+    await f.time.run(feed.read(id, (work) => window.supplement(work)));
+  assert.equal(f.bank().held, 214, "A's remaining94 plus untouched H120");
+  const payload = {
+    type: "userFillsByTime",
+    user: "fixed",
+    startTime: 1,
+    endTime: 2,
+    aggregateByTime: false,
+  };
+  const guard = (input: unknown) => assert.deepEqual(input, payload);
+  await f.time.run(
+    window.history(
+      "fixed",
+      () =>
+        f.reads.read("https://api.hyperliquid.xyz/info", payload, 0, "source"),
+      guard,
+    ),
+  );
+  assert.equal(f.bank().paid, 706);
+  assert.equal(f.bank().held, 194);
+  const before = f.contexts.length;
+  await assert.rejects(
+    f.time.run(
+      window.history(
+        "fixed",
+        () =>
+          f.reads.read(
+            "https://api.hyperliquid.xyz/info",
+            payload,
+            0,
+            "source",
+          ),
+        guard,
+      ),
+    ),
+  );
+  assert.equal(
+    f.contexts.length,
+    before,
+    "remaining H100 cannot dispatch conservative120",
+  );
+  assert.equal(f.budget.snapshot().used, 110);
+  assert.equal(
+    f.bank().dirty,
+    false,
+    "H failure cannot dirty or relearn completed A",
+  );
+  feed.close();
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.bank().held, 0);
+  assert.equal(f.time.events.size, 0);
+});
+
+it("history credit rejects other methods, accounts and undeclared sources without spending A or H", async () => {
+  for (const wrong of ["method", "account", "source"]) {
+    const f = fixture({ paid: 596 });
+    const window = await f.prepare(undefined, f.time.at + 100000, {
+      purpose: "audit_source",
+      historySources: ["fixed"],
+    });
+    await f.time.run(window.read(f.audit));
+    const before = f.contexts.length;
+    const payload = {
+      type: wrong === "method" ? "userFunding" : "userFillsByTime",
+      user: wrong === "account" ? "foreign" : "fixed",
+    };
+    await assert.rejects(
+      f.time.run(
+        window.history(
+          wrong === "source" ? "foreign" : "fixed",
+          () =>
+            f.reads.read(
+              "https://api.hyperliquid.xyz/info",
+              payload,
+              0,
+              "source",
+            ),
+          (input: any) => {
+            if (input.user !== "fixed")
+              throw new Error("foreign history account");
+          },
+        ),
+      ),
+    );
+    assert.equal(f.contexts.length, before);
+    assert.equal(f.budget.snapshot().used, 84);
+    assert.equal(f.bank().dirty, false);
+    await window.close();
+    await f.reads.drainAccounts();
+    assert.equal(f.time.events.size, 0);
+  }
+});
+
+it("readonly history and source share the same serialized queue, with H refunds excluded from source credit", async () => {
+  const f = fixture({ paid: 596 }),
+    window = await f.prepare(undefined, f.time.at + 100000, {
+      purpose: "audit_source",
+      historySources: ["fixed"],
+    });
+  await f.time.run(window.read(f.audit));
+  let release!: () => void,
+    sourceStarted = false;
+  const history = window.history(
+    "fixed",
+    async () => {
+      await f.reads.read(
+        "https://api.hyperliquid.xyz/info",
+        { type: "userFillsByTime", user: "fixed" },
+        0,
+        "source",
+      );
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    (payload) => assert.equal((payload as any).user, "fixed"),
+  );
+  const source = window.supplement(async () => {
+    sourceStarted = true;
+    return f.reads.read(
+      "https://api.hyperliquid.xyz/info",
+      { type: "clearinghouseState", user: "selected" },
+      0,
+      "source",
+    );
+  });
+  await flush();
+  assert.equal(sourceStarted, false);
+  release();
+  await f.time.run(Promise.all([history, source]));
+  assert.equal(sourceStarted, true);
+  assert.equal(f.budget.snapshot().used, 106);
+  // Source may spend its original remaining98, but not the H100 refund.
+  await assert.rejects(
+    f.time.run(
+      window.supplement(() =>
+        f.reads.read(
+          "https://api.hyperliquid.xyz/info",
+          { type: "userFillsByTime", user: "source" },
+          0,
+          "source",
+        ),
+      ),
+    ),
+  );
+  assert.equal(f.budget.snapshot().used, 106);
+  assert.equal(f.bank().dirty, false);
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.time.events.size, 0);
+});
+
+it("readonly H keeps the parent's original20s expiry, real sent120 and completed A plan through a timeout", async () => {
+  const f = fixture({ paid: 596 }),
+    window = await f.prepare(undefined, f.time.at + 100000, {
+      purpose: "audit_source",
+      historySources: ["fixed"],
+    }),
+    expiry = window.expires_at;
+  await f.time.run(window.read(f.audit));
+  await f.time.advance(9000);
+  f.hang(true);
+  const work = window.history(
+    "fixed",
+    () =>
+      f.reads.read(
+        "https://api.hyperliquid.xyz/info",
+        { type: "userFillsByTime", user: "fixed" },
+        0,
+        "source",
+      ),
+    () => {},
+  );
+  const rejected = assert.rejects(work);
+  await flush();
+  assert.equal(f.budget.snapshot().used, 204);
+  assert.ok(f.contexts.at(-1).deadline_ms <= expiry);
+  await f.time.advance(expiry - f.time.at);
+  await rejected;
+  assert.equal(f.budget.snapshot().used, 204);
+  assert.equal(f.bank().dirty, false);
+  await assert.rejects(
+    window.history(
+      "fixed",
+      async () => assert.fail("expired history cannot start"),
+      () => {},
+    ),
+  );
+  await window.close();
+  await f.reads.drainAccounts();
+  assert.equal(f.bank().held, 0);
+  assert.equal(f.time.events.size, 0);
 });
 it("audit returns only after real first-child clean CAS, under the same parent timer", async () => {
   const f = fixture(),
