@@ -65,7 +65,10 @@ export class SourceFeed {
     };
   }
 
-  async read(id: string): Promise<SourceSnapshot> {
+  async read(
+    id: string,
+    onDemand?: (work: () => Promise<SourceSnapshot>) => Promise<SourceSnapshot>,
+  ): Promise<SourceSnapshot> {
     if (this.closed) throw this.closedError();
     const at = this.clock();
     let interest = this.interests.get(id);
@@ -83,7 +86,7 @@ export class SourceFeed {
     } else if (interest.snapshot && this.isFresh(interest.snapshot, at)) {
       return structuredClone(interest.snapshot);
     }
-    return structuredClone(await this.refresh(id));
+    return structuredClone(await this.refresh(id, onDemand));
   }
 
   pollOnce(): Promise<void> {
@@ -166,7 +169,10 @@ export class SourceFeed {
       [...this.interests.keys()].map((id) => this.refresh(id)),
     );
   }
-  private refresh(id: string): Promise<SourceSnapshot> {
+  private refresh(
+    id: string,
+    onDemand?: (work: () => Promise<SourceSnapshot>) => Promise<SourceSnapshot>,
+  ): Promise<SourceSnapshot> {
     const existing = this.flights.get(id);
     if (existing) return existing;
     if (this.closed) return Promise.reject(this.closedError());
@@ -183,7 +189,7 @@ export class SourceFeed {
       // renew interest, or spend another public REST read while it is fresh.
       return Promise.resolve(interest.snapshot);
     }
-    const work = this.perform(id);
+    const work = this.perform(id, onDemand);
     this.flights.set(id, work);
     const cleanup = () => {
       if (this.flights.get(id) === work) this.flights.delete(id);
@@ -208,7 +214,9 @@ export class SourceFeed {
     if (
       !(error instanceof AgentError) ||
       error.retryable !== true ||
-      !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(error.code)
+      !["VENUE_READ_BUDGET_EXHAUSTED", "VENUE_RATE_LIMITED"].includes(
+        error.code,
+      )
     )
       return this.retryCooldownMs;
     const delay = error.details?.retry_after_ms;
@@ -219,7 +227,10 @@ export class SourceFeed {
       ? Math.max(this.retryCooldownMs, delay)
       : this.retryCooldownMs;
   }
-  private async perform(id: string): Promise<SourceSnapshot> {
+  private async perform(
+    id: string,
+    onDemand?: (work: () => Promise<SourceSnapshot>) => Promise<SourceSnapshot>,
+  ): Promise<SourceSnapshot> {
     await this.acquire();
     try {
       if (this.closed) throw this.closedError();
@@ -231,7 +242,11 @@ export class SourceFeed {
           true,
           503,
         );
-      const snapshot = structuredClone(await this.fetchSource(id));
+      const snapshot = structuredClone(
+        await (onDemand
+          ? onDemand(() => this.fetchSource(id))
+          : this.fetchSource(id)),
+      );
       if (this.closed) throw this.closedError();
       if (!this.isFresh(snapshot, this.clock()))
         throw new AgentError(

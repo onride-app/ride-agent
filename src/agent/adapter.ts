@@ -2,6 +2,13 @@ import { AgentError, errorDetails } from "./contracts.js";
 import { isPlanReadEvidence, type PlanReadEvidence } from "./read-evidence.js";
 import { monitorOperation } from "./monitor-diagnostics.js";
 import { sourceRequiresRwa } from "./source-identities.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  preparedProposalInput,
+  preparedProposalBinding,
+  privateExecutionHistory,
+  type PreparedPortfolioInput,
+} from "./prepared-portfolio.js";
 import type {
   AccountSnapshot,
   Candidate,
@@ -26,7 +33,52 @@ export interface ActivationCheck {
   blockers: string[];
   idempotent_existing: boolean;
 }
+export interface PreparedPortfolioWindow {
+  mode: "cold" | "warm";
+  expires_at: number;
+  /** End read credit before digest/history/notification work. */
+  release?(): Promise<void>;
+}
+export type PreparedPortfolioResult<T> =
+  | { state: "unsupported" }
+  | { state: "pending"; retry_after_ms: number }
+  | { state: "complete"; value: T };
+export type ExecutionProposal = Pick<
+  Execution,
+  "key" | "target_quantity" | "allocations" | "revision" | "reserve_usdc"
+>;
+export interface ExecutionPreparation {
+  expires_at: number;
+  bind(execution: Execution): void;
+  cancel(): Promise<void>;
+}
+type ReadWindowContext = {
+  user: string;
+  portfolio: PreparedPortfolioInput;
+  handle: string;
+  mode: "cold" | "warm";
+  expiresAt: number;
+  active: boolean;
+  bound?: { id: string; fingerprint: string };
+  proposal?: string;
+  finish?: Promise<void>;
+};
 export interface VenueAdapter {
+  /** Private operational credit only; no completed financial evidence is reused. */
+  withPreparedPortfolio?<T>(
+    user: string,
+    portfolio: PreparedPortfolioInput,
+    work: (window: PreparedPortfolioWindow) => Promise<T>,
+  ): Promise<PreparedPortfolioResult<T>>;
+  prepareExecution?(
+    user: string,
+    portfolio: Portfolio,
+    proposal: ExecutionProposal,
+  ): Promise<ExecutionPreparation | null>;
+  cancelPreparedPortfolio?(
+    user: string,
+    previous: PreparedPortfolioInput,
+  ): Promise<void>;
   readPlanEvidence?(traders: Candidate[]): Promise<PlanReadEvidence>;
   activationCheck?(
     user: string,
@@ -127,7 +179,13 @@ function bridgeInput(input: unknown): unknown {
     return execution;
   };
   if (Array.isArray(portfolio.executions))
-    portfolio.executions = portfolio.executions.map(withoutDiagnostic);
+    portfolio.executions = privateExecutionHistory(
+      input.portfolio as unknown as Portfolio,
+      typeof input.user_id === "string" ? input.user_id : undefined,
+      record(input.execution) && typeof input.execution.id === "string"
+        ? input.execution.id
+        : undefined,
+    ).map(withoutDiagnostic);
   return {
     ...input,
     portfolio,
@@ -217,6 +275,7 @@ async function withBridgeDeadline<T>(
 // Private, authenticated execution boundary. It holds Core S2S identity, never
 // signing secrets. Its responses are normalized; machine routes cannot confirm.
 export class BridgeAdapter implements VenueAdapter {
+  private readonly readWindows = new AsyncLocalStorage<ReadWindowContext>();
   constructor(
     private url: string,
     private token: string,
@@ -243,28 +302,82 @@ export class BridgeAdapter implements VenueAdapter {
     operation: string,
     input: unknown,
     signal?: AbortSignal,
+    windowHandle?: string,
   ): Promise<T> {
     return monitorOperation(operation, () =>
-      this.performCall<T>(operation, input, signal),
+      this.performCall<T>(operation, input, signal, windowHandle),
     );
   }
   private async performCall<T>(
     operation: string,
     input: unknown,
     callerSignal?: AbortSignal,
+    explicitWindowHandle?: string,
   ): Promise<T> {
     // The complete account observation is bounded at 20s inside the bridge.
     // Leave transport margin for its typed failure and retry hint to arrive.
     const timeoutSignal = AbortSignal.timeout(
-      operation.startsWith("funding_")
-        ? 90000
-        : ["account", "preflight", "bind"].includes(operation)
-          ? 25000
-          : 20000,
+      ["finish_portfolio", "cancel_prepared_portfolio"].includes(operation)
+        ? 2000
+        : operation.startsWith("funding_")
+          ? 90000
+          : ["account", "preflight", "bind"].includes(operation)
+            ? 25000
+            : 20000,
     );
     const signal = callerSignal
       ? AbortSignal.any([timeoutSignal, callerSignal])
       : timeoutSignal;
+    const context = this.readWindows.getStore();
+    let windowHandle = explicitWindowHandle;
+    const selectedSources = new Set(
+      context?.portfolio.sleeves.map((s) => s.trader.id),
+    );
+    const sourceMatches =
+      operation === "source"
+        ? record(input) && selectedSources.has(String(input.trader_id))
+        : operation === "read_plan_evidence"
+          ? record(input) &&
+            Array.isArray(input.traders) &&
+            input.traders.every(
+              (trader) =>
+                record(trader) && selectedSources.has(String(trader.id)),
+            )
+          : true;
+    if (
+      windowHandle === undefined &&
+      context?.active &&
+      sourceMatches &&
+      [
+        "account",
+        "prepare_execution",
+        "submit",
+        "source",
+        "read_plan_evidence",
+      ].includes(operation)
+    ) {
+      if (Date.now() >= context.expiresAt)
+        throw new AgentError(
+          "VENUE_READ_DEADLINE",
+          "Prepared read window expired.",
+          true,
+          503,
+        );
+      if (operation === "submit") {
+        const execution = record(input) ? input.execution : undefined;
+        if (
+          !record(execution) ||
+          !context.bound ||
+          execution.id !== context.bound.id ||
+          execution.fingerprint !== context.bound.fingerprint
+        )
+          throw new AgentError(
+            "EXECUTION_REJECTED",
+            "Prepared execution identity changed.",
+          );
+      }
+      windowHandle = context.handle;
+    }
     let response: Response;
     try {
       response = await withBridgeDeadline(
@@ -273,6 +386,7 @@ export class BridgeAdapter implements VenueAdapter {
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${this.token}`,
+            ...(windowHandle ? { "x-ride-read-window": windowHandle } : {}),
           },
           body: JSON.stringify(bridgeInput(input)),
           signal,
@@ -313,6 +427,183 @@ export class BridgeAdapter implements VenueAdapter {
     if (!response.ok || !validBridgeResponse(operation, data))
       throw invalidBridgeResponse(response);
     return data as T;
+  }
+  async withPreparedPortfolio<T>(
+    user: string,
+    portfolio: PreparedPortfolioInput,
+    work: (window: PreparedPortfolioWindow) => Promise<T>,
+  ): Promise<PreparedPortfolioResult<T>> {
+    if (this.readWindows.getStore()?.active)
+      throw new AgentError(
+        "EXECUTOR_RESPONSE_INVALID",
+        "Nested read windows are unavailable.",
+        true,
+        502,
+      );
+    let ready: any;
+    try {
+      ready = await this.call<any>("prepare_portfolio", {
+        user_id: user,
+        portfolio,
+      });
+    } catch (error) {
+      // Explicit protocol negotiation with an older authenticated bridge.
+      // Operational/provider failures must never claim unsupported readiness.
+      if (
+        error instanceof AgentError &&
+        error.code === "NOT_FOUND" &&
+        error.message === "Unknown private adapter operation."
+      )
+        return { state: "unsupported" };
+      throw error;
+    }
+    if (ready?.state === "unsupported") return { state: "unsupported" };
+    if (ready?.state === "pending") {
+      if (
+        !Number.isSafeInteger(ready.retry_after_ms) ||
+        ready.retry_after_ms < 1 ||
+        ready.retry_after_ms > 60000
+      )
+        throw new AgentError(
+          "EXECUTOR_RESPONSE_INVALID",
+          "Read readiness response is invalid.",
+          true,
+          502,
+        );
+      return { state: "pending", retry_after_ms: ready.retry_after_ms };
+    }
+    if (
+      ready?.state !== "ready" ||
+      typeof ready.handle !== "string" ||
+      !/^[A-Za-z0-9_-]{32,128}$/.test(ready.handle) ||
+      !["cold", "warm"].includes(ready.mode) ||
+      !Number.isSafeInteger(ready.expires_at) ||
+      ready.expires_at <= Date.now() ||
+      ready.expires_at > Date.now() + 20000
+    )
+      throw new AgentError(
+        "EXECUTOR_RESPONSE_INVALID",
+        "Read readiness response is invalid.",
+        true,
+        502,
+      );
+    const context: ReadWindowContext = {
+      user,
+      portfolio: structuredClone(portfolio),
+      handle: ready.handle as string,
+      mode: ready.mode as "cold" | "warm",
+      expiresAt: ready.expires_at as number,
+      active: true,
+    };
+    const finish = () => {
+      context.active = false;
+      context.bound = undefined;
+      return (context.finish ??= this.call(
+        "finish_portfolio",
+        {
+          user_id: user,
+          portfolio_id: portfolio.id,
+        },
+        undefined,
+        context.handle,
+      ).then(
+        () => undefined,
+        () => undefined,
+      ));
+    };
+    try {
+      const value = await this.readWindows.run(context, () =>
+        work({
+          mode: context.mode,
+          expires_at: context.expiresAt,
+          release: finish,
+        }),
+      );
+      return { state: "complete", value };
+    } finally {
+      await finish();
+    }
+  }
+  async prepareExecution(
+    user: string,
+    portfolio: Portfolio,
+    proposal: ExecutionProposal,
+  ): Promise<ExecutionPreparation | null> {
+    const context = this.readWindows.getStore();
+    if (!context?.active || context.mode !== "warm") return null;
+    if (
+      context.user !== user ||
+      context.portfolio.id !== portfolio.id ||
+      context.proposal !== undefined ||
+      Date.now() >= context.expiresAt
+    )
+      throw new AgentError(
+        "EXECUTION_REJECTED",
+        "Prepared read authority changed.",
+      );
+    const proposalBinding = preparedProposalBinding(proposal);
+    // Pin before the await so two concurrent callers cannot claim one slot.
+    context.proposal = proposalBinding;
+    const result = await this.call<{ ready: boolean }>("prepare_execution", {
+      user_id: user,
+      portfolio: preparedProposalInput(portfolio, user),
+      proposal,
+    });
+    if (
+      result?.ready !== true ||
+      !context.active ||
+      Date.now() >= context.expiresAt
+    )
+      throw new AgentError(
+        "VENUE_READ_DEADLINE",
+        "Prepared read window expired.",
+        true,
+        503,
+      );
+    return {
+      expires_at: context.expiresAt,
+      bind: (execution) => {
+        if (
+          !context.active ||
+          context.bound ||
+          Date.now() >= context.expiresAt ||
+          preparedProposalBinding(execution) !== proposalBinding
+        )
+          throw new AgentError(
+            "EXECUTION_REJECTED",
+            "Prepared execution identity changed.",
+          );
+        context.bound = {
+          id: execution.id,
+          fingerprint: execution.fingerprint,
+        };
+      },
+      cancel: async () => {
+        context.active = false;
+        context.bound = undefined;
+        await (context.finish ??= this.call(
+          "finish_portfolio",
+          {
+            user_id: user,
+            portfolio_id: portfolio.id,
+          },
+          undefined,
+          context.handle,
+        ).then(
+          () => undefined,
+          () => undefined,
+        ));
+      },
+    };
+  }
+  async cancelPreparedPortfolio(
+    user: string,
+    previous: PreparedPortfolioInput,
+  ) {
+    await this.call("cancel_prepared_portfolio", {
+      user_id: user,
+      portfolio: previous,
+    });
   }
   depositOptions() {
     return this.call<{ routes: any[]; notes?: string[] }>(

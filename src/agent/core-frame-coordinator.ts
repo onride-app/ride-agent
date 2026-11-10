@@ -371,6 +371,19 @@ export function coreFrameCoordinator(
       const frame = [...frames.values()].find((entry) => entry.id === frameId);
       if (frame) await trackRelease(frame);
     },
+    async cancelPending(continuation) {
+      const pinned = pinnedFrames.get(continuation);
+      if (
+        !pinned ||
+        frames.get(pinned.owner) !== pinned.frame ||
+        pinned.frame.id !== pinned.id ||
+        pinned.frame.deadline !== pinned.deadline
+      )
+        throw identityChanged();
+      // A waiter never owns a peer's already granted lease.
+      if (pinned.frame.expires !== undefined) throw identityChanged();
+      await trackRelease(pinned.frame);
+    },
     async close() {
       closing = true;
       stop.abort(costPlanUnavailable());
