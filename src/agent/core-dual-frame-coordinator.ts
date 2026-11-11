@@ -27,6 +27,7 @@ type Frame = {
   pin: object;
   expires?: number;
   leaseIssued: boolean;
+  promotionUnknown: boolean;
 };
 type LeaseRecord = { frame: Frame; live(): boolean; consumed: boolean };
 const pins = new WeakMap<object, Frame>();
@@ -75,6 +76,8 @@ export interface CoreDualFrameCoordinator {
   reserve(plan: DualFramePlan, signal: AbortSignal, continuation?: object, ready?: boolean): Promise<DualFrameLease>;
   park(owner: string, signal: AbortSignal, continuation?: object): Promise<boolean>;
   isParked(continuation: object): boolean;
+  /** Private current pending proof; absent/unknown is never promotion authority. */
+  pendingPromotion?(continuation: object): Readonly<{ frame_id: string; plan: DualFramePlan }> | undefined;
   defer(continuation: object): AgentError;
   cancelPending(continuation: object): Promise<void>;
   end(frameId: string): Promise<void>;
@@ -165,7 +168,7 @@ export function coreDualFrameCoordinator(
       const binding = await currentBinding(signal);
       if (closing || signal.aborted || plan.deadline_ms <= clock()) throw costPlanUnavailable();
       const pin = Object.freeze({});
-      const result: Frame = { id: randomUUID(), plan: Object.freeze({ ...plan, h_weights: Object.freeze({ ...plan.h_weights }) }), binding, seq: 1, ready: false, acknowledged: false, initialPark: false, mayHaveApplied: false, polling: false, pin, leaseIssued: false };
+      const result: Frame = { id: randomUUID(), plan: Object.freeze({ ...plan, h_weights: Object.freeze({ ...plan.h_weights }) }), binding, seq: 1, ready: false, acknowledged: false, initialPark: false, mayHaveApplied: false, polling: false, pin, leaseIssued: false, promotionUnknown: false };
       // One synchronous transfer preserves the same reserved slot; there is
       // never a gap in which a competing owner can claim additional capacity.
       if (creating.get(plan.owner) !== work) throw costPlanUnavailable();
@@ -186,6 +189,7 @@ export function coreDualFrameCoordinator(
       notExpired(frame);
       if (!live(frame) || signal.aborted) throw costPlanUnavailable();
       frame.mayHaveApplied = true;
+      try {
       const { response, value } = await post(beginUrl, { protocol_version: 3, frame_id: frame.id, ...frame.plan, binding_id: frame.binding.binding_id, binding_generation: frame.binding.binding_generation, account_bank_id: frame.binding.account_bank_id, gateway_bank_id: frame.binding.gateway_bank_id, control_seq: frame.seq, ready: frame.ready }, signal);
       if (!live(frame) || signal.aborted) throw costPlanUnavailable();
       if (response.status === 200 && tuple(frame, value) && value.state === "cancelled" && value.control_applied === true && value.queued === false && value.a_reserved_weight === 0 && value.g_reserved_weight === 0 && value.expires_at === frame.plan.deadline_ms && value.retry_after_ms === 0 && value.control_seq === frame.seq && value.ready === frame.ready) {
@@ -205,9 +209,18 @@ export function coreDualFrameCoordinator(
           : !frame.ready || value.queued !== false || value.a_reserved_weight !== frame.plan.a_weight || value.g_reserved_weight !== g || value.source_ready !== true || value.expires_at > clock() + 20000 || value.retry_after_ms !== 0 || (frame.expires !== undefined && value.expires_at !== frame.expires)))
         throw costPlanUnavailable();
       frame.acknowledged = true;
-      if (!frame.ready) frame.initialPark = true;
+      if (!frame.ready) {
+        frame.initialPark = true;
+        // A strict parked ACK fences every older ready intent. A later same
+        // ready=true pending reply alone cannot fence an earlier lost grant.
+        frame.promotionUnknown = false;
+      }
       if (value.state === "granted") frame.expires ??= value.expires_at;
       return value;
+      } catch (error) {
+        frame.promotionUnknown = true;
+        throw error;
+      }
     };
     // Resolve a possibly applied intent before changing it. A transport error
     // can never become permission to downgrade or use a new UUID/FIRST.
@@ -270,6 +283,12 @@ export function coreDualFrameCoordinator(
     isParked(continuation) {
       const frame = pins.get(continuation);
       return !!frame && live(frame) && frame.initialPark && frame.acknowledged && !frame.ready && frame.expires === undefined && !frame.polling;
+    },
+    pendingPromotion(continuation) {
+      const frame = pins.get(continuation);
+      if (!frame || !live(frame) || !frame.initialPark || !frame.acknowledged || frame.polling ||
+        frame.promotionUnknown || frame.expires !== undefined || frame.leaseIssued) return undefined;
+      return Object.freeze({ frame_id: frame.id, plan: frame.plan });
     },
     defer(continuation) {
       const frame = pins.get(continuation);

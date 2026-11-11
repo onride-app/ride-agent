@@ -248,6 +248,9 @@ export class CoreBridge {
   ) {
     this.infoReadRoute = options.infoReadRoute ?? "official";
     const dual = coreDualBindingReader(coreUrl, coreToken, network, this.infoReadRoute, process.env);
+    const preparedPromotionV1 = process.env.RIDE_AGENT_PREPARED_PROMOTION_V1_ENABLED === "true";
+    if (preparedPromotionV1 && !dual)
+      throw new Error("Prepared promotion requires validated dual reads");
     this.dualReadsEnabled = !!dual;
     const physical = dual ? sharedPhysicalVenueBudgets(dual.authority) : undefined;
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
@@ -264,6 +267,7 @@ export class CoreBridge {
           this.infoReadRoute === "core" ? "core_shared_info" : "official",
         observationPlans: this.observationPlans,
         requireObservationPlanBinding: true,
+        preparedPromotionV1,
         nativeSourcePlanIssuer: this,
         freshSubmitReadIssuer: this,
         ...(dual && physical ? { budget: physical.account,

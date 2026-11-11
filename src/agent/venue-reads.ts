@@ -5,6 +5,7 @@ import { framePendingContinuation } from "./core-frame-coordinator.js";
 import { consumeDualFrameLease, dualFrameLeaseBinding, dualFramePendingContinuation, type CoreDualFrameCoordinator, type DualFrameLease, type DualFramePlan } from "./core-dual-frame-coordinator.js";
 import { hash64, payloadHash, type DualBinding } from "./dual-egress-contract.js";
 import { SourceReservation } from "./source-reservation.js";
+import { registerPreparedPromotion, type PreparedPromotionRegistration, type PreparedPromotionTurn } from "./prepared-promotion-arbiter.js";
 import { reportVenueReadDiagnostics } from "./venue-read-diagnostics.js";
 import {
   issueFreshSubmitReadPurpose,
@@ -145,6 +146,7 @@ type AccountReadScope = {
   sourceReservation?: SourceReadReservation;
   readStage?: "account" | "source" | "history";
   historySource?: string;
+  promotion?: PreparedPromotionRegistration;
 };
 export interface PreparedReadWindowOptions {
   purpose?: "audit_submit" | "audit_source";
@@ -301,6 +303,8 @@ export interface VenueReadOptions {
   /** A remote official hop cannot expire its claim at local Core-send time. */
   retainRemoteDispatch?: boolean;
   dualEgress?: DualEgressReadOptions;
+  /** Server-owned, default-off prepared-vs-prepared promotion arbitration. */
+  preparedPromotionV1?: boolean;
 }
 export type DualEgressReadOptions = Readonly<{
   coordinator: CoreDualFrameCoordinator;
@@ -319,6 +323,7 @@ export class VenueReads {
   >();
   private readonly preparedWindows = new Set<PreparedAccountWindow>();
   private readonly preparedOwners = new Set<string>();
+  private readonly promotions = new Set<PreparedPromotionRegistration>();
   private readonly preparingFrameOwners = new Set<string>();
   private readonly pendingPreparedBookings = new WeakMap<
     object,
@@ -340,6 +345,7 @@ export class VenueReads {
   private readonly freshSubmitReadIssuer?: object;
   private readonly retainRemoteDispatch: boolean;
   private readonly dual?: DualEgressReadOptions;
+  private readonly preparedPromotionV1: boolean;
   private readonly publicSource = new AsyncLocalStorage<{ id: number; binding?: Promise<DualBinding> }>();
   private sourceProducerSequence = 0;
   private frames = {
@@ -378,6 +384,9 @@ export class VenueReads {
     this.freshSubmitReadIssuer = options.freshSubmitReadIssuer;
     this.retainRemoteDispatch = options.retainRemoteDispatch ?? false;
     this.dual = options.dualEgress;
+    this.preparedPromotionV1 = options.preparedPromotionV1 ?? false;
+    if (this.preparedPromotionV1 && !this.dual)
+      throw new RangeError("Prepared promotion requires validated V3 dual egress");
     if (this.dual && (this.transport !== "core_shared_info" || !options.frameCoordinator || this.budget.limit !== 1000 || this.dual.sourceBudget.limit !== 1000 ||
       this.dual.sourceBudget === this.budget || !hash64(this.dual.accountBankId) || !hash64(this.dual.gatewayBankId) || this.dual.accountBankId === this.dual.gatewayBankId))
       throw new RangeError("V3 requires two actual disjoint physical ledgers and the original A coordinator");
@@ -798,6 +807,7 @@ export class VenueReads {
       preparedReadPurpose: options.purpose ?? "audit_submit",
       unsentGroup: { active: 0, revoked: false, candidates: new Set() },
     };
+    try {
     if (options.nativeSourcePlan || options.nativeSourceContext) {
       if (
         !options.nativeSourcePlan ||
@@ -828,6 +838,9 @@ export class VenueReads {
       scope.nativeSourcePlan = options.nativeSourcePlan;
     }
     if (callerSignal?.aborted) throw callerSignal.reason;
+    // Only a live private continuation can rank before metadata IO. A dormant
+    // coordinator pin never registers itself; this invocation owns the entry.
+    if (continuation) this.registerPromotion(scope, continuation, callerSignal);
     this.pendingPreparedBinding(scope, { ...options, continuation });
     const earlySchedule = this.budget.preparedObservationSchedule(owner);
     // An active A may have a dirty in-progress PG generation. Do not replace
@@ -1271,6 +1284,10 @@ export class VenueReads {
     scope.admission.signal.addEventListener("abort", expired, { once: true });
     this.preparedWindows.add(window);
     return window;
+    } finally {
+      scope.promotion?.close();
+      if (scope.promotion) this.promotions.delete(scope.promotion);
+    }
   }
   freshSubmitReadPurpose(
     issuer: object,
@@ -1505,6 +1522,7 @@ export class VenueReads {
   }
   async drainAccounts(): Promise<void> {
     this.draining = true;
+    for (const promotion of this.promotions) promotion.close();
     await Promise.allSettled(
       [...this.preparedWindows].map((window) => window.close()),
     );
@@ -1834,6 +1852,26 @@ export class VenueReads {
     if (left <= 0) throw this.accountDeadline();
     return Math.min(maximum, left);
   }
+  private registerPromotion(scope: AccountReadScope, pin: object, callerSignal?: AbortSignal): void {
+    if (!this.preparedPromotionV1 || scope.promotion) return;
+    const dual = this.dual!;
+    const proof = dual.coordinator.pendingPromotion?.(pin);
+    if (!proof || proof.plan.owner !== scope.frameOwner || proof.plan.deadline_ms !== scope.queueUntil) return;
+    for (const entry of this.promotions) if (!entry.live()) this.promotions.delete(entry);
+    if (this.promotions.size >= 64) throw dual.coordinator.defer(pin);
+    const g = proof.plan.s_weight + Object.values(proof.plan.h_weights).reduce((a, b) => a + b, 0);
+    try { scope.promotion = registerPreparedPromotion(this.budget, {
+      firstDeadline: proof.plan.deadline_ms,
+      wallUntil: scope.until,
+      monoUntil: scope.monotonicUntil,
+      wallClock: this.clock,
+      monoClock: this.monotonicClock,
+      signal: AbortSignal.any([scope.admission.signal, ...(callerSignal ? [callerSignal] : []), ...(this.callerSignal ? [this.callerSignal] : [])]),
+      eligible: () => !this.draining && dual.coordinator.pendingPromotion?.(pin)?.frame_id === proof.frame_id &&
+        this.budget.preparedObservationSchedule(scope.owner!).ready && dual.sourceBudget.sourceCapacityReady(g),
+    }); } catch { throw dual.coordinator.defer(pin); }
+    this.promotions.add(scope.promotion);
+  }
   private async reserveDualObservation(
     scope: AccountReadScope,
     bundle: PreparedReadWindowOptions & { continuation?: object },
@@ -1894,14 +1932,28 @@ export class VenueReads {
       // episode. The sole exception is the earlier pure active-A BUSY gate,
       // which avoids inspecting that A's dirty in-progress PG generation.
       remember(await dual.coordinator.bootstrap(plan, signal, pin));
+      this.registerPromotion(scope, pin!);
+      scope.promotion?.markValidated();
       const schedule = this.budget.preparedObservationSchedule(scope.owner!);
       if (!schedule.ready || !dual.sourceBudget.sourceCapacityReady(gatewayWeight)) {
         if (!dual.coordinator.isParked(pin!)) await dual.coordinator.park(scope.frameOwner!, signal, pin);
         throw dual.coordinator.defer(pin!);
       }
+      let turn: PreparedPromotionTurn | undefined;
+      if (scope.promotion) {
+        try { turn = await scope.promotion.acquire(); }
+        catch (error) {
+          if (signal.aborted) throw signal.reason;
+          throw dual.coordinator.defer(pin!);
+        }
+      }
+      try {
       const lease = await dual.coordinator.reserve(plan, signal, pin, true);
       scope.frameLease = lease;
       scope.dualLease = lease;
+      // A revoked/cancelled owner cannot consume a late grant or release a
+      // successor's turn. Outer cleanup ENDs this exact original lease.
+      if (turn && !turn.live()) throw costPlanUnavailable();
       this.accountReadTimeout();
       if (signal.aborted || lease.expires_at <= this.clock()) throw this.accountDeadline();
       scope.activateEvidenceDeadline!();
@@ -1913,8 +1965,10 @@ export class VenueReads {
       scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
       const originalChild = original.plan.a_weight / childCount;
       if (!Number.isSafeInteger(originalChild) || originalChild < childLimit) throw costPlanUnavailable();
-      // Core's one grant is already running. A local race may only consume its
-      // remaining time; no new20s, partial local book, or new Core reservation.
+      // With the opt-in turn, this is exactly one synchronous joint book.
+      // Ordinary/fresh scopes remain independent: if they won the local race,
+      // END this grant rather than waiting with held Core credit. The legacy
+      // path (including unresolved protocol uncertainty) retains its contract.
       for (;;) {
         this.accountReadTimeout();
         if (signal.aborted) throw signal.reason;
@@ -1943,6 +1997,7 @@ export class VenueReads {
             return parent;
           } catch (error) { source?.close(false); throw error; }
         }
+        if (turn) throw costPlanUnavailable();
         const remaining = this.accountReadTimeout();
         const delay = Math.max(1, Math.min(1000, local.ready ? 1000 : local.retryAfterMs, remaining));
         await new Promise<void>((resolve, reject) => {
@@ -1952,6 +2007,7 @@ export class VenueReads {
           if (signal.aborted) stop();
         });
       }
+      } finally { turn?.release(); }
     } catch (error) {
       const continuation = dualFramePendingContinuation(error);
       if (continuation) remember(continuation);

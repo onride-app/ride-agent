@@ -77,6 +77,7 @@ CI使用GitHub OIDC trusted publishing；平台注入的OIDC/GitHub runner变量
 | 键 | 服务与用途 | 秘密 |
 |---|---|---|
 | `RIDE_AGENT_INFO_FRAME_V3_ENABLED` | Core/App 显式开启新 prepared-parent 协议；默认 false，普通 A/fresh-submit 保持原 R61 协调 | 否 |
+| `RIDE_AGENT_PREPARED_PROMOTION_V1_ENABLED` | App server-owned、严格 `true` 才启用 prepared 请求本地零额度晋升仲裁；默认 false，要求已验证 V3 配置，不接受公开参数 | 否 |
 | `RIDE_AGENT_INFO_FRAME_V3_AUTHORITY_JSON` | Core/App/Gateway 同一份14字段原始 UTF8 稳定物理/配置 authority；不包含 boot nonce/deployment ID；空值或缺证明拒绝 opt-in | 不含凭据；真实值由受控运维配置 |
 | `RIDE_AGENT_SOURCE_FORWARD_ENABLED` | Gateway 狭窄 official-info forward；默认 false | 否 |
 | `RIDE_AGENT_SOURCE_READ_CLIENT_TOKEN` | Gateway 只读 quota/status/redeem 专用 token，至少32字符；不与 CoreServiceToken/forward key 共用 | 是 |
