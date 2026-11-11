@@ -28,8 +28,13 @@ import {
   ACCOUNT_OBSERVATION_COST_CONTRACT,
 } from "./account-observation-plans.js";
 import { coreInfoFetcher } from "./core-info-reads.js";
+import { coreDualBindingReader } from "./core-dual-binding.js";
+import { coreDualInfoFetcher } from "./core-dual-info-reads.js";
+import { coreDualFrameCoordinator } from "./core-dual-frame-coordinator.js";
+import { sharedPhysicalVenueBudgets } from "./physical-venue-budgets.js";
 import {
   coreFrameCoordinator,
+  frameReadinessOptions,
   framePendingContinuation,
 } from "./core-frame-coordinator.js";
 import {
@@ -214,6 +219,7 @@ export class CoreBridge {
   private venueReads: VenueReads;
   private observationPlans: AccountObservationPlans;
   private readonly infoReadRoute: "official" | "core";
+  private readonly dualReadsEnabled: boolean;
   private closing?: Promise<void>;
   private orderSnapshots: VenueOrderSnapshots;
   private sourceFeed = new SourceFeed((id) => this.readSource(id));
@@ -241,12 +247,18 @@ export class CoreBridge {
     options: { infoReadRoute?: "official" | "core" } = {},
   ) {
     this.infoReadRoute = options.infoReadRoute ?? "official";
+    const dual = coreDualBindingReader(coreUrl, coreToken, network, this.infoReadRoute, process.env);
+    const preparedPromotionV1 = process.env.RIDE_AGENT_PREPARED_PROMOTION_V1_ENABLED === "true";
+    if (preparedPromotionV1 && !dual)
+      throw new Error("Prepared promotion requires validated dual reads");
+    this.dualReadsEnabled = !!dual;
+    const physical = dual ? sharedPhysicalVenueBudgets(dual.authority) : undefined;
     this.orderSnapshots = new VenueOrderSnapshots(this.network);
     this.pool = new pg.Pool({ connectionString: database, max: 10 });
     this.observationPlans = new AccountObservationPlans(this.pool);
     this.venueReads = new VenueReads(
       this.infoReadRoute === "core"
-        ? coreInfoFetcher(coreUrl, coreToken)
+        ? dual ? coreDualInfoFetcher(coreUrl, coreToken, dual.currentBinding) : coreInfoFetcher(coreUrl, coreToken)
         : (url, init) => fetch(url, init),
       Date.now,
       2,
@@ -255,11 +267,23 @@ export class CoreBridge {
           this.infoReadRoute === "core" ? "core_shared_info" : "official",
         observationPlans: this.observationPlans,
         requireObservationPlanBinding: true,
+        preparedPromotionV1,
         nativeSourcePlanIssuer: this,
         freshSubmitReadIssuer: this,
+        ...(dual && physical ? { budget: physical.account,
+          retainRemoteDispatch: true,
+          dualEgress: { coordinator: coreDualFrameCoordinator(coreUrl, coreToken, dual.currentBinding),
+            sourceBudget: physical.gateway, currentBinding: dual.currentBinding,
+            accountBankId: dual.authority.account_bank_id, gatewayBankId: dual.authority.gateway_bank_id } } : {}),
         frameCoordinator:
           this.infoReadRoute === "core" && this.network === "mainnet"
-            ? coreFrameCoordinator(this.coreUrl, this.coreToken)
+            ? coreFrameCoordinator(
+                this.coreUrl,
+                this.coreToken,
+                undefined,
+                Date.now,
+                frameReadinessOptions(process.env),
+              )
             : undefined,
       },
     );
@@ -401,10 +425,12 @@ export class CoreBridge {
   }
   private async info(payload: unknown, source = false): Promise<any> {
     const { url, ttl, lane } = this.infoRequest(payload, source);
+    if (source && this.dualReadsEnabled) return this.venueReads.readPublicSource(url, payload, ttl);
     return this.venueReads.read(url, payload, ttl, lane);
   }
   private infoWithEvidence(payload: unknown, source = false) {
     const { url, ttl, lane } = this.infoRequest(payload, source);
+    if (source && this.dualReadsEnabled) return this.venueReads.readPublicSourceWithEvidence(url, payload, ttl);
     return this.venueReads.readWithEvidence(url, payload, ttl, lane);
   }
   private traderId(address: string) {
@@ -585,6 +611,10 @@ export class CoreBridge {
     return snapshot;
   }
   private async readSource(id: string) {
+    if (!this.dualReadsEnabled) return this.readSourceBody(id);
+    return this.venueReads.runPublicSource(() => this.readSourceBody(id));
+  }
+  private async readSourceBody(id: string) {
     if (
       this.venueReads.nativeSourceReadActive?.() !== true &&
       process.env.RIDE_AGENT_PREDICTION_ENABLED === "true" &&
@@ -3684,6 +3714,14 @@ export class CoreBridge {
     check();
   }
   private async sourceFills(
+    input: any,
+    entry?: PreparedEntry,
+    observation?: AccountObservationLimits,
+  ) {
+    if (!this.dualReadsEnabled) return this.sourceFillsBody(input, entry, observation);
+    return this.venueReads.runPublicSource(() => this.sourceFillsBody(input, entry, observation));
+  }
+  private async sourceFillsBody(
     input: any,
     entry?: PreparedEntry,
     observation?: AccountObservationLimits,

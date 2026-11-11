@@ -239,13 +239,14 @@ export async function invokeAccountRead(
   graphqlUrl: string,
   invokePortfolio: () => Promise<Result>,
   fetcher: typeof fetch = fetch,
+  balanceOptions: Parameters<typeof readAccountBalances>[4] = {},
 ): Promise<Result> {
   if (name === "get_my_copies")
     return readAccountCopies(graphqlUrl, token, args, fetcher);
   const reads = await Promise.allSettled([
     invokePortfolio(),
     readAccountCopies(graphqlUrl, token, {}, fetcher),
-    readAccountBalances(graphqlUrl, token, fetcher),
+    readAccountBalances(graphqlUrl, token, fetcher, undefined, balanceOptions),
   ]);
   let portfolio =
     reads[0].status === "fulfilled"

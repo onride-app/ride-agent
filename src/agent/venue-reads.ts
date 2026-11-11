@@ -2,6 +2,10 @@ import { AgentError } from "./contracts.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readCost, responseCost } from "./venue-read-cost.js";
 import { framePendingContinuation } from "./core-frame-coordinator.js";
+import { consumeDualFrameLease, dualFrameLeaseBinding, dualFramePendingContinuation, type CoreDualFrameCoordinator, type DualFrameLease, type DualFramePlan } from "./core-dual-frame-coordinator.js";
+import { hash64, payloadHash, type DualBinding } from "./dual-egress-contract.js";
+import { SourceReservation } from "./source-reservation.js";
+import { registerPreparedPromotion, type PreparedPromotionRegistration, type PreparedPromotionTurn } from "./prepared-promotion-arbiter.js";
 import { reportVenueReadDiagnostics } from "./venue-read-diagnostics.js";
 import {
   issueFreshSubmitReadPurpose,
@@ -46,7 +50,9 @@ import {
   type AccountReadReservation,
   type AccountReadBundle,
   type PreparedSupplementPlan,
+  type SourceReadReservation,
   VenueReadBudget,
+  ObservationAdmissionDeferred,
 } from "./venue-read-budget.js";
 
 type Entry = { at: number; until: number; evidenceAt: number; value: unknown };
@@ -73,6 +79,7 @@ type ObservationFleetPlan = Readonly<{
   supplements?: PreparedSupplementPlan;
 }>;
 type PendingPreparedBooking = {
+  readonly dual?: true;
   readonly owner: string;
   readonly frameOwner: string;
   readonly purpose: "audit_submit" | "audit_source";
@@ -123,6 +130,7 @@ type AccountReadScope = {
   activateEvidenceDeadline?(): void;
   frameOwner?: string;
   preparingBundle?: boolean;
+  preparedReadPurpose?: "audit_source" | "audit_submit";
   preparedParent?: AccountReadScope;
   preparedIdentityVerified?: boolean;
   preparedHint?: Awaited<ReturnType<ObservationPlanStore["read"]>>;
@@ -133,6 +141,12 @@ type AccountReadScope = {
   unsentGroup?: UnsentReadGroup;
   freshSubmitPurpose?: FreshSubmitReadPurpose;
   freshSubmitPermit?: FreshSubmitPacingPermit;
+  dualLease?: DualFrameLease;
+  sourceResource?: SourceReservation;
+  sourceReservation?: SourceReadReservation;
+  readStage?: "account" | "source" | "history";
+  historySource?: string;
+  promotion?: PreparedPromotionRegistration;
 };
 export interface PreparedReadWindowOptions {
   purpose?: "audit_submit" | "audit_source";
@@ -185,6 +199,7 @@ export type AccountObservationLimits = {
 /** Authenticated fleet admission; it must use the existing shared ledger. */
 export interface AccountReadFrameCoordinator {
   readonly capacity: number;
+  readonly readinessV2?: true;
   begin(
     owner: string,
     weight: number,
@@ -192,10 +207,17 @@ export interface AccountReadFrameCoordinator {
     signal: AbortSignal,
     mode: "learned" | "cold_trial",
     continuation?: object,
+    localReady?: boolean,
   ): Promise<AccountReadFrameLease>;
   end(frameId: string): Promise<void>;
   close?(): Promise<void>;
   cancelPending?(continuation: object): Promise<void>;
+  /** True only after a strict versioned Core park ACK for this existing episode. */
+  parkPending?(
+    owner: string,
+    signal: AbortSignal,
+    continuation?: object,
+  ): Promise<boolean>;
 }
 type Counters = {
   calls: number;
@@ -278,7 +300,19 @@ export interface VenueReadOptions {
   frameCoordinator?: AccountReadFrameCoordinator;
   nativeSourcePlanIssuer?: object;
   freshSubmitReadIssuer?: object;
+  /** A remote official hop cannot expire its claim at local Core-send time. */
+  retainRemoteDispatch?: boolean;
+  dualEgress?: DualEgressReadOptions;
+  /** Server-owned, default-off prepared-vs-prepared promotion arbitration. */
+  preparedPromotionV1?: boolean;
 }
+export type DualEgressReadOptions = Readonly<{
+  coordinator: CoreDualFrameCoordinator;
+  sourceBudget: VenueReadBudget;
+  currentBinding(signal: AbortSignal): Promise<DualBinding>;
+  accountBankId: string;
+  gatewayBankId: string;
+}>;
 
 // Completed account evidence is never reused. Metadata TTL and same-lane
 // single-flight are unchanged. Both HL hosts share one process weighted gate.
@@ -289,6 +323,7 @@ export class VenueReads {
   >();
   private readonly preparedWindows = new Set<PreparedAccountWindow>();
   private readonly preparedOwners = new Set<string>();
+  private readonly promotions = new Set<PreparedPromotionRegistration>();
   private readonly preparingFrameOwners = new Set<string>();
   private readonly pendingPreparedBookings = new WeakMap<
     object,
@@ -308,6 +343,11 @@ export class VenueReads {
   private readonly frameCoordinator?: AccountReadFrameCoordinator;
   private readonly nativeSourcePlanIssuer?: object;
   private readonly freshSubmitReadIssuer?: object;
+  private readonly retainRemoteDispatch: boolean;
+  private readonly dual?: DualEgressReadOptions;
+  private readonly preparedPromotionV1: boolean;
+  private readonly publicSource = new AsyncLocalStorage<{ id: number; binding?: Promise<DualBinding> }>();
+  private sourceProducerSequence = 0;
   private frames = {
     admitted: 0,
     denied: 0,
@@ -342,6 +382,14 @@ export class VenueReads {
     this.callerSignal = options.signal;
     this.nativeSourcePlanIssuer = options.nativeSourcePlanIssuer;
     this.freshSubmitReadIssuer = options.freshSubmitReadIssuer;
+    this.retainRemoteDispatch = options.retainRemoteDispatch ?? false;
+    this.dual = options.dualEgress;
+    this.preparedPromotionV1 = options.preparedPromotionV1 ?? false;
+    if (this.preparedPromotionV1 && !this.dual)
+      throw new RangeError("Prepared promotion requires validated V3 dual egress");
+    if (this.dual && (this.transport !== "core_shared_info" || !options.frameCoordinator || this.budget.limit !== 1000 || this.dual.sourceBudget.limit !== 1000 ||
+      this.dual.sourceBudget === this.budget || !hash64(this.dual.accountBankId) || !hash64(this.dual.gatewayBankId) || this.dual.accountBankId === this.dual.gatewayBankId))
+      throw new RangeError("V3 requires two actual disjoint physical ledgers and the original A coordinator");
     if (this.freshSubmitReadIssuer)
       registerFreshSubmitReadIssuer({
         issuer: this.freshSubmitReadIssuer,
@@ -372,6 +420,24 @@ export class VenueReads {
       throw new RangeError("Venue read deadline cannot exceed 12 seconds");
     this.report = options.report ?? reportVenueReadDiagnostics;
     this.lastReport = this.clock();
+  }
+  runPublicSource<T>(work: () => Promise<T>): Promise<T> {
+    if (!this.dual || this.publicSource.getStore()) return work();
+    return this.publicSource.run({ id: ++this.sourceProducerSequence }, work);
+  }
+  readPublicSource(url: string, payload: unknown, ttlMs = 0): Promise<any> {
+    return this.runPublicSource(() => this.read(url, payload, ttlMs, "source"));
+  }
+  readPublicSourceWithEvidence(url: string, payload: unknown, ttlMs = 0): Promise<VenueReadEvidence> {
+    return this.runPublicSource(() => this.readWithEvidence(url, payload, ttlMs, "source"));
+  }
+  private readStage(scope = this.accountScope.getStore()): "account" | "source" | "history" {
+    // An A child may legitimately use source-lane metadata. Its private stage
+    // takes precedence over both that lane and a surrounding source marker.
+    return scope ? scope.readStage ?? "account" : this.publicSource.getStore() ? "source" : "account";
+  }
+  private readBudget(scope = this.accountScope.getStore()): VenueReadBudget {
+    return this.dual && this.readStage(scope) !== "account" ? this.dual.sourceBudget : this.budget;
   }
   private count(
     method: string,
@@ -430,16 +496,21 @@ export class VenueReads {
       {
         retry_after_ms: Math.min(
           60000,
-          Math.max(1, this.budget.cooldownRemaining()),
+          Math.max(1, this.readBudget().cooldownRemaining()),
         ),
       },
     );
   }
   private checkCooldown(method: string, lane: ReadLane, countDenial = true) {
-    if (this.budget.cooldownRemaining() > 0) {
+    if (this.readBudget().cooldownRemaining() > 0) {
       if (countDenial) this.count(method, lane, "local_cooldown_denied");
       throw this.unavailable();
     }
+  }
+  private clearReadBankCache() {
+    if (!this.dual) { this.cache.clear(); return; }
+    const bank = this.readStage() === "account" ? this.dual.accountBankId : this.dual.gatewayBankId;
+    for (const key of this.cache.keys()) if (key.startsWith(bank + ":")) this.cache.delete(key);
   }
   private unsentState(scope: AccountReadScope): UnsentReadState {
     let state = this.unsentStates.get(scope);
@@ -525,7 +596,10 @@ export class VenueReads {
   async cancelPreparedPending(continuation: object): Promise<void> {
     if (!this.frameCoordinator?.cancelPending) throw costPlanUnavailable();
     const booking = this.pendingPreparedBookings.get(continuation);
-    await this.frameCoordinator.cancelPending(continuation);
+    if (booking?.dual) {
+      if (!this.dual) throw costPlanUnavailable();
+      await this.dual.coordinator.cancelPending(continuation);
+    } else await this.frameCoordinator.cancelPending(continuation);
     if (this.pendingPreparedBookings.get(continuation) === booking)
       this.pendingPreparedBookings.delete(continuation);
   }
@@ -730,8 +804,10 @@ export class VenueReads {
       queueUntil: firstDeadline,
       waitForFrameAdmission: false,
       preparingBundle: true,
+      preparedReadPurpose: options.purpose ?? "audit_submit",
       unsentGroup: { active: 0, revoked: false, candidates: new Set() },
     };
+    try {
     if (options.nativeSourcePlan || options.nativeSourceContext) {
       if (
         !options.nativeSourcePlan ||
@@ -762,18 +838,37 @@ export class VenueReads {
       scope.nativeSourcePlan = options.nativeSourcePlan;
     }
     if (callerSignal?.aborted) throw callerSignal.reason;
+    // Only a live private continuation can rank before metadata IO. A dormant
+    // coordinator pin never registers itself; this invocation owns the entry.
+    if (continuation) this.registerPromotion(scope, continuation, callerSignal);
     this.pendingPreparedBinding(scope, { ...options, continuation });
     const earlySchedule = this.budget.preparedObservationSchedule(owner);
     // An active A may have a dirty in-progress PG generation. Do not replace
     // its attempt or read/invalidate that hint merely to wait for its local slot.
     // This asserts no fresh plan compatibility; every later Core poll still
     // requires the complete fresh PG/per-pool checks below.
-    if (!earlySchedule.ready && earlySchedule.reason === "READ_LOCAL_BUSY")
+    if (!earlySchedule.ready && earlySchedule.reason === "READ_LOCAL_BUSY") {
+      if (this.dual && continuation) {
+        await this.dual.coordinator.park(frameOwner, callerSignal ?? scope.admission.signal, continuation);
+        throw this.dual.coordinator.defer(continuation);
+      }
+      if (
+        !this.dual &&
+        options.purpose === "audit_source" &&
+        this.frameCoordinator.readinessV2 &&
+        continuation
+      )
+        await this.frameCoordinator.parkPending?.(
+          frameOwner,
+          callerSignal ?? scope.admission.signal,
+          continuation,
+        );
       this.deferPreparedSchedule(
         scope,
         { ...options, continuation },
         earlySchedule,
       );
+    }
     this.preparingFrameOwners.add(frameOwner);
     let timer = this.timers.setTimeout(
       () => scope.admission.abort(this.accountDeadline()),
@@ -805,6 +900,7 @@ export class VenueReads {
       this.timers.clearTimeout(timer);
       callerSignal?.removeEventListener("abort", cancelled);
       scope.reservation?.close(false);
+      scope.sourceResource?.close(false);
       if (scope.localInterest)
         this.budget.endObservationInterest(scope.localInterest);
       this.releaseFrame(scope);
@@ -828,14 +924,20 @@ export class VenueReads {
     ) => {
       if (closed || reading || reads < 1 || scope.admission.signal.aborted)
         throw costPlanUnavailable();
-      const ticket = history
+      const sourceTicket = scope.sourceResource
+        ? history ? scope.sourceResource.fills(history.source) : scope.sourceResource.source()
+        : undefined;
+      const ticket = sourceTicket ?? (history
         ? parent.beginHistorySupplement(history.source)
-        : parent.beginSupplement();
+        : parent.beginSupplement());
       reading = true;
       const sourceScope: AccountReadScope = {
         ...scope,
         id: ++this.accountSequence,
-        reservation: ticket,
+        reservation: sourceTicket ? undefined : ticket as AccountReadReservation,
+        sourceReservation: sourceTicket,
+        readStage: sourceTicket ? history ? "history" : "source" : undefined,
+        historySource: sourceTicket ? history?.source : undefined,
         preparingBundle: false,
         preparedParent: scope,
         preparedIdentityVerified: true,
@@ -1109,6 +1211,8 @@ export class VenueReads {
               child.planBound = true;
               child.frameOwner = frameOwner;
               child.frameLease = scope.frameLease;
+              child.dualLease = scope.dualLease;
+              child.readStage = "account";
               child.until = Math.min(child.until, scope.until);
               child.monotonicUntil = Math.min(
                 child.monotonicUntil,
@@ -1167,6 +1271,7 @@ export class VenueReads {
         parent.close(
           reads > 0 && !failed && !reading && supplementQueued === 0,
         );
+        scope.sourceResource?.close(reads > 0 && !failed && !reading && supplementQueued === 0);
         if (scope.localInterest)
           this.budget.endObservationInterest(scope.localInterest);
         this.releaseFrame(scope);
@@ -1179,6 +1284,10 @@ export class VenueReads {
     scope.admission.signal.addEventListener("abort", expired, { once: true });
     this.preparedWindows.add(window);
     return window;
+    } finally {
+      scope.promotion?.close();
+      if (scope.promotion) this.promotions.delete(scope.promotion);
+    }
   }
   freshSubmitReadPurpose(
     issuer: object,
@@ -1413,6 +1522,7 @@ export class VenueReads {
   }
   async drainAccounts(): Promise<void> {
     this.draining = true;
+    for (const promotion of this.promotions) promotion.close();
     await Promise.allSettled(
       [...this.preparedWindows].map((window) => window.close()),
     );
@@ -1423,6 +1533,7 @@ export class VenueReads {
       if (this.frameCoordinator && !scope.reservation)
         scope.admission.abort(costPlanUnavailable());
     await this.frameCoordinator?.close?.();
+    await this.dual?.coordinator.close();
     await Promise.allSettled([...this.accountObservations]);
     // A cancelled admission may resolve late and add its release finalizer.
     // Drain that release too, rather than snapshotting the set only once.
@@ -1441,7 +1552,7 @@ export class VenueReads {
     // remain charged in Core's shared rolling ledger, independent of this call.
     const releasing = this.trackReadActivity(scope, () =>
       Promise.resolve()
-        .then(() => this.frameCoordinator!.end(frameId))
+        .then(() => scope.dualLease ? this.dual!.coordinator.end(frameId) : this.frameCoordinator!.end(frameId))
         .then(
           () => {
             this.frames.released++;
@@ -1524,38 +1635,55 @@ export class VenueReads {
     // If actual scope exceeds the booking, Core must reject the continuation;
     // no partial account evidence or reduced history can become a success.
     const weight = reservation.weight;
-    const pending = coordinator
-      .begin(
-        scope.frameOwner ?? scope.owner!,
-        weight,
-        scope.queueUntil,
-        signal,
-        reservation.mode,
-        continuation,
+    const localReady =
+      !coordinator.readinessV2 ||
+      (scope.preparingBundle && scope.preparedReadPurpose !== "audit_source") ||
+      scope.freshSubmitPurpose ||
+      scope.waitForFrameAdmission
+        ? true
+        : this.budget.preparedObservationSchedule(scope.owner!).ready;
+    const pending = (
+      coordinator.readinessV2
+        ? coordinator.begin(
+            scope.frameOwner ?? scope.owner!,
+            weight,
+            scope.queueUntil,
+            signal,
+            reservation.mode,
+            continuation,
+            localReady,
+          )
+        : coordinator.begin(
+            scope.frameOwner ?? scope.owner!,
+            weight,
+            scope.queueUntil,
+            signal,
+            reservation.mode,
+            continuation,
+          )
+    ).then((lease) => {
+      if (
+        !lease ||
+        typeof lease.frame_id !== "string" ||
+        !/^[A-Za-z0-9_-]{16,128}$/.test(lease.frame_id)
       )
-      .then((lease) => {
-        if (
-          !lease ||
-          typeof lease.frame_id !== "string" ||
-          !/^[A-Za-z0-9_-]{16,128}$/.test(lease.frame_id)
-        )
-          throw costPlanUnavailable();
-        scope.frameLease = lease;
-        if (
-          !Number.isSafeInteger(lease.expires_at) ||
-          lease.expires_at > this.clock() + 20000 ||
-          this.clock() > scope.queueUntil
-        ) {
-          this.releaseFrame(scope);
-          throw costPlanUnavailable();
-        }
-        if (signal.aborted || lease.expires_at <= this.clock()) {
-          this.releaseFrame(scope);
-          throw signal.aborted ? signal.reason : this.accountDeadline();
-        }
-        scope.activateEvidenceDeadline!();
-        this.frames.admitted++;
-      });
+        throw costPlanUnavailable();
+      scope.frameLease = lease;
+      if (
+        !Number.isSafeInteger(lease.expires_at) ||
+        lease.expires_at > this.clock() + 20000 ||
+        this.clock() > scope.queueUntil
+      ) {
+        this.releaseFrame(scope);
+        throw costPlanUnavailable();
+      }
+      if (signal.aborted || lease.expires_at <= this.clock()) {
+        this.releaseFrame(scope);
+        throw signal.aborted ? signal.reason : this.accountDeadline();
+      }
+      scope.activateEvidenceDeadline!();
+      this.frames.admitted++;
+    });
     this.accountFinalizers.add(pending);
     void pending.then(
       () => this.accountFinalizers.delete(pending),
@@ -1724,6 +1852,168 @@ export class VenueReads {
     if (left <= 0) throw this.accountDeadline();
     return Math.min(maximum, left);
   }
+  private registerPromotion(scope: AccountReadScope, pin: object, callerSignal?: AbortSignal): void {
+    if (!this.preparedPromotionV1 || scope.promotion) return;
+    const dual = this.dual!;
+    const proof = dual.coordinator.pendingPromotion?.(pin);
+    if (!proof || proof.plan.owner !== scope.frameOwner || proof.plan.deadline_ms !== scope.queueUntil) return;
+    for (const entry of this.promotions) if (!entry.live()) this.promotions.delete(entry);
+    if (this.promotions.size >= 64) throw dual.coordinator.defer(pin);
+    const g = proof.plan.s_weight + Object.values(proof.plan.h_weights).reduce((a, b) => a + b, 0);
+    try { scope.promotion = registerPreparedPromotion(this.budget, {
+      firstDeadline: proof.plan.deadline_ms,
+      wallUntil: scope.until,
+      monoUntil: scope.monotonicUntil,
+      wallClock: this.clock,
+      monoClock: this.monotonicClock,
+      signal: AbortSignal.any([scope.admission.signal, ...(callerSignal ? [callerSignal] : []), ...(this.callerSignal ? [this.callerSignal] : [])]),
+      eligible: () => !this.draining && dual.coordinator.pendingPromotion?.(pin)?.frame_id === proof.frame_id &&
+        this.budget.preparedObservationSchedule(scope.owner!).ready && dual.sourceBudget.sourceCapacityReady(g),
+    }); } catch { throw dual.coordinator.defer(pin); }
+    this.promotions.add(scope.promotion);
+  }
+  private async reserveDualObservation(
+    scope: AccountReadScope,
+    bundle: PreparedReadWindowOptions & { continuation?: object },
+    durableHint: Awaited<ReturnType<ObservationPlanStore["read"]>> | undefined,
+    signal: AbortSignal,
+  ): Promise<AccountReadBundle> {
+    const dual = this.dual!;
+    const purpose = bundle.purpose ?? "audit_submit";
+    const historySources = bundle.historySources ?? [];
+    if (historySources.length > 8 || new Set(historySources).size !== historySources.length ||
+      historySources.some((s) => !/^[\x21-\x7e]{1,256}$/.test(s)) || (historySources.length > 0 && purpose !== "audit_source"))
+      throw costPlanUnavailable();
+    // Unlike the legacy two-A bundle, V3 must explicitly book every S byte on
+    // its real bank; no forecast A refund is source capacity.
+    const key = scope.frameOwner!, fallback = this.budget.preparedSupplementPlan(key, historySources);
+    const fallbackWeight = fallback.sourceWeight + Object.values(fallback.historyWeights).reduce((a, b) => a + b, 0);
+    const fallbackTrial = Math.min(900 - 120, 900 - fallbackWeight);
+    const native = scope.nativeSourcePlan && durableHint?.plan && fallbackTrial >= 120 &&
+      !this.budget.peekObservationFramePlan(scope.owner!, fallbackTrial).cold ? scope.nativeSourcePlan : undefined;
+    if (!native) { scope.nativeSourcePlan = undefined; scope.nativeSourceBinding = undefined; }
+    const supplements = native ? this.budget.preparedSupplementPlan(key, historySources, native) : fallback;
+    const gatewayWeight = supplements.sourceWeight + Object.values(supplements.historyWeights).reduce((a, b) => a + b, 0);
+    const trialCapacity = Math.min(900 - 120, 900 - gatewayWeight);
+    if (trialCapacity < Math.min(120, this.budget.limit)) throw costPlanUnavailable();
+    const hint = this.budget.peekObservationFramePlan(scope.owner!, trialCapacity);
+    const childLimit = hint.cold ? Math.min(hint.fullDemand, trialCapacity) : hint.fullDemand;
+    const childCount: 1 | 2 = purpose !== "audit_source" && !hint.cold ? 2 : 1;
+    const accountWeight = childLimit * childCount;
+    if (accountWeight + gatewayWeight > 900) throw costPlanUnavailable();
+    const fleet: ObservationFleetPlan = Object.freeze({ ...hint, childLimit, childCount,
+      reservedWeight: accountWeight + gatewayWeight, historySources: Object.freeze([...historySources]), supplements });
+    const old = bundle.continuation ? this.pendingPreparedBookings.get(bundle.continuation) : undefined;
+    if (old && (!old.dual || !this.pendingPlanFits(fleet, old.latest) || !this.pendingPlanFits(fleet, old.booked))) {
+      await dual.coordinator.park(scope.frameOwner!, signal, bundle.continuation);
+      throw dual.coordinator.defer(bundle.continuation!);
+    }
+    const plan: DualFramePlan = Object.freeze({ owner: scope.frameOwner!, deadline_ms: scope.queueUntil,
+      mode: hint.cold ? "cold_trial" : "learned", a_weight: accountWeight, s_weight: supplements.sourceWeight,
+      h_weights: supplements.historyWeights, purpose,
+      scope_hash: payloadHash(JSON.stringify([scope.owner, scope.frameOwner, purpose, historySources,
+        scope.nativeSourceBinding?.operationalBinding ?? null, supplements.nativeContractKey ?? null])),
+    });
+    let pin = bundle.continuation;
+    const remember = (continuation: object) => {
+      if (pin && continuation !== pin) throw costPlanUnavailable();
+      pin = continuation;
+      const current = this.pendingPreparedBookings.get(pin);
+      if (current) {
+        if (!current.dual || current.owner !== scope.owner || current.frameOwner !== scope.frameOwner ||
+          current.firstDeadline !== scope.queueUntil || current.purpose !== purpose || !this.pendingPlanFits(fleet, current.booked))
+          throw costPlanUnavailable();
+        current.latest = fleet;
+      } else this.pendingPreparedBookings.set(pin, { dual: true, owner: scope.owner!, frameOwner: scope.frameOwner!,
+        firstDeadline: scope.queueUntil, purpose, booked: fleet, latest: fleet });
+    };
+    try {
+      // No legacy soft-clock can prevent the first authenticated zero-hold
+      // episode. The sole exception is the earlier pure active-A BUSY gate,
+      // which avoids inspecting that A's dirty in-progress PG generation.
+      remember(await dual.coordinator.bootstrap(plan, signal, pin));
+      this.registerPromotion(scope, pin!);
+      scope.promotion?.markValidated();
+      const schedule = this.budget.preparedObservationSchedule(scope.owner!);
+      if (!schedule.ready || !dual.sourceBudget.sourceCapacityReady(gatewayWeight)) {
+        if (!dual.coordinator.isParked(pin!)) await dual.coordinator.park(scope.frameOwner!, signal, pin);
+        throw dual.coordinator.defer(pin!);
+      }
+      let turn: PreparedPromotionTurn | undefined;
+      if (scope.promotion) {
+        try { turn = await scope.promotion.acquire(); }
+        catch (error) {
+          if (signal.aborted) throw signal.reason;
+          throw dual.coordinator.defer(pin!);
+        }
+      }
+      try {
+      const lease = await dual.coordinator.reserve(plan, signal, pin, true);
+      scope.frameLease = lease;
+      scope.dualLease = lease;
+      // A revoked/cancelled owner cannot consume a late grant or release a
+      // successor's turn. Outer cleanup ENDs this exact original lease.
+      if (turn && !turn.live()) throw costPlanUnavailable();
+      this.accountReadTimeout();
+      if (signal.aborted || lease.expires_at <= this.clock()) throw this.accountDeadline();
+      scope.activateEvidenceDeadline!();
+      const original = consumeDualFrameLease(lease);
+      if (original.plan.owner !== scope.frameOwner || original.plan.deadline_ms !== scope.queueUntil ||
+        original.binding.account_bank_id !== dual.accountBankId || original.binding.gateway_bank_id !== dual.gatewayBankId)
+        throw costPlanUnavailable();
+      this.frames.admitted++;
+      scope.localInterest = this.budget.beginObservationInterest(scope.owner!);
+      const originalChild = original.plan.a_weight / childCount;
+      if (!Number.isSafeInteger(originalChild) || originalChild < childLimit) throw costPlanUnavailable();
+      // With the opt-in turn, this is exactly one synchronous joint book.
+      // Ordinary/fresh scopes remain independent: if they won the local race,
+      // END this grant rather than waiting with held Core credit. The legacy
+      // path (including unresolved protocol uncertainty) retains its contract.
+      for (;;) {
+        this.accountReadTimeout();
+        if (signal.aborted) throw signal.reason;
+        const local = this.budget.preparedObservationSchedule(scope.owner!);
+        const g = original.plan.s_weight + Object.values(original.plan.h_weights).reduce((a, b) => a + b, 0);
+        if (local.ready && dual.sourceBudget.sourceCapacityReady(g)) {
+          const latest = this.budget.peekObservationFramePlan(scope.owner!, originalChild);
+          if (latest.cold !== fleet.cold || (latest.fullDemand > originalChild && !latest.cold)) throw costPlanUnavailable();
+          let source: SourceReservation | undefined;
+          try {
+            // Both books are synchronous. No callback/await can consume a gap
+            // between the two physical ledgers or turn one half into credit.
+            source = new SourceReservation(dual.sourceBudget,
+              { sourceWeight: original.plan.s_weight, historyWeights: original.plan.h_weights },
+              Math.min(scope.until - this.clock(), scope.monotonicUntil - this.monotonicClock()),
+              (which, weight) => this.budget.recordSourceReservationNeed(supplements, which, weight));
+            const parent = this.budget.beginObservationBundle(scope.owner!, originalChild, childCount, scope.localInterest!, fleet.cold);
+            if (parent.weight !== original.plan.a_weight || parent.capacityTrial !== fleet.cold) {
+              parent.close(false);
+              throw costPlanUnavailable();
+            }
+            scope.sourceResource = source;
+            scope.reservation = parent;
+            scope.preparedHint = durableHint;
+            this.pendingPreparedBookings.delete(pin!);
+            return parent;
+          } catch (error) { source?.close(false); throw error; }
+        }
+        if (turn) throw costPlanUnavailable();
+        const remaining = this.accountReadTimeout();
+        const delay = Math.max(1, Math.min(1000, local.ready ? 1000 : local.retryAfterMs, remaining));
+        await new Promise<void>((resolve, reject) => {
+          const stop = () => { this.timers.clearTimeout(timer); signal.removeEventListener("abort", stop); reject(signal.reason); };
+          const timer = this.timers.setTimeout(() => { signal.removeEventListener("abort", stop); resolve(); }, delay);
+          signal.addEventListener("abort", stop, { once: true });
+          if (signal.aborted) stop();
+        });
+      }
+      } finally { turn?.release(); }
+    } catch (error) {
+      const continuation = dualFramePendingContinuation(error);
+      if (continuation) remember(continuation);
+      throw error;
+    }
+  }
   private async reserveObservation(
     scope: AccountReadScope,
     bundle?: PreparedReadWindowOptions & { continuation?: object },
@@ -1742,6 +2032,24 @@ export class VenueReads {
     // precheck never inserts a local interest before a real Core grant.
     const waiting = this.waitFreshSubmitSchedule(scope);
     if (waiting) await waiting;
+    if (
+      !bundle &&
+      !scope.preparingBundle &&
+      !scope.preparedParent &&
+      !scope.freshSubmitPurpose &&
+      !scope.waitForFrameAdmission &&
+      this.frameCoordinator?.readinessV2
+    ) {
+      const schedule = this.budget.preparedObservationSchedule(scope.owner!);
+      if (
+        !schedule.ready &&
+        (await this.frameCoordinator.parkPending?.(scope.owner!, signal))
+      )
+        throw new ObservationAdmissionDeferred(
+          schedule.reason,
+          schedule.retryAfterMs,
+        );
+    }
     let durableHint:
       Awaited<ReturnType<ObservationPlanStore["read"]>> | undefined;
     let restored = false;
@@ -1792,6 +2100,7 @@ export class VenueReads {
         throw costPlanUnavailable();
       }
     }
+    if (this.dual && bundle) return this.reserveDualObservation(scope, bundle, durableHint, signal);
     let fleetPlan: ObservationFleetPlan | undefined;
     if (this.frameCoordinator) {
       // A busy local source ledger must not prevent polling or expiring an
@@ -1936,11 +2245,19 @@ export class VenueReads {
       const booked = pending?.booked ?? fleetPlan;
       if (bundle) {
         this.accountReadTimeout();
-        this.deferPreparedSchedule(
-          scope,
-          bundle,
-          this.budget.preparedObservationSchedule(scope.owner!),
-        );
+        const schedule = this.budget.preparedObservationSchedule(scope.owner!);
+        if (
+          !schedule.ready &&
+          bundle.purpose === "audit_source" &&
+          this.frameCoordinator.readinessV2 &&
+          continuation
+        )
+          await this.frameCoordinator.parkPending?.(
+            scope.frameOwner!,
+            signal,
+            continuation,
+          );
+        this.deferPreparedSchedule(scope, bundle, schedule);
       }
       try {
         await this.reserveFrame(
@@ -2168,7 +2485,7 @@ export class VenueReads {
       if (scope?.preparedParent) {
         if (!scope.preparedIdentityVerified) throw costPlanUnavailable();
       }
-      if (scope?.owner && !scope.reservation) {
+      if (scope?.owner && !scope.reservation && !scope.sourceReservation) {
         if (scope.admissionError) throw scope.admissionError;
         try {
           scope.reservationPromise ??= this.reserveObservation(scope);
@@ -2191,10 +2508,10 @@ export class VenueReads {
       this.accountReadTimeout();
       if (this.callerSignal?.aborted) throw this.callerSignal.reason;
       this.checkCooldown(method, lane);
-      const key = JSON.stringify([url, payload]),
+      const key = (this.dual ? (this.readStage(scope) === "account" ? this.dual.accountBankId : this.dual.gatewayBankId) + ":" : "") + JSON.stringify([url, payload]),
         // A failed observation may cancel only its own queued work, never a
         // different caller that joined the same account request.
-        flightKey = `${lane}:${this.accountScope.getStore()?.id ?? "shared"}:${key}`;
+        flightKey = `${lane}:${this.accountScope.getStore()?.id ?? (this.dual && this.publicSource.getStore() ? "source-" + this.publicSource.getStore()!.id : "shared")}:${key}`;
       const cached = this.cache.get(key);
       if (
         ttlMs > 0 &&
@@ -2343,6 +2660,7 @@ export class VenueReads {
     const user = (payload as { user?: unknown })?.user;
     const owner = typeof user === "string" && user.length ? user : undefined;
     const scope = this.accountScope.getStore();
+    const budget = this.readBudget(scope);
     const unsent = scope ? this.unsentState(scope) : undefined;
     let attempt: { verifiedUnsent: boolean } | undefined;
     const requestSignal = this.callerSignal
@@ -2376,14 +2694,16 @@ export class VenueReads {
           () => sourceAdmission.abort(admissionError()),
           Math.max(0, admissionUntil! - this.clock()),
         );
-      ticket = await this.budget.acquire(
+      ticket = await (scope?.sourceReservation ? budget.acquireSource(
+        scope.sourceReservation, lane, cost.reserve, owner, admissionSignal, cost.unknownSurcharge,
+      ) : budget.acquire(
         lane,
         cost.reserve,
         owner,
         admissionSignal,
         cost.unknownSurcharge,
         scope?.reservation,
-      );
+      ));
       if (admissionTimer !== undefined)
         this.timers.clearTimeout(admissionTimer);
       // A late ticket may resolve in the same turn as the queue cutoff. No
@@ -2451,6 +2771,7 @@ export class VenueReads {
       );
       if (wireMs <= 0) throw this.accountDeadline();
       const wireDeadline = this.clock() + wireMs;
+      const originalWireMonotonicEnd = this.monotonicClock() + wireMs;
       wireTimer = this.timers.setTimeout(
         () =>
           wire.abort(
@@ -2464,6 +2785,23 @@ export class VenueReads {
         wireMs,
       );
       wireSignal = AbortSignal.any([requestSignal, wire.signal]);
+      if (this.retainRemoteDispatch || (this.dual && this.readStage(scope) !== "account")) {
+        if (!ticket.retainFor) throw costPlanUnavailable();
+        ticket.retainFor(Math.max(0, originalWireMonotonicEnd - this.monotonicClock()) + 60000);
+      }
+      let dualContext: NonNullable<Parameters<VenueReadFetcher>[2]>["dual"];
+      if (this.dual && scope?.dualLease) {
+        dualContext = { stage: this.readStage(scope), binding: dualFrameLeaseBinding(scope.dualLease),
+          ...(scope.historySource ? { history_source: scope.historySource } : {}) };
+      } else if (this.dual && this.readStage(scope) !== "account") {
+        if (scope) throw costPlanUnavailable();
+        const producer = this.publicSource.getStore();
+        if (!producer) throw costPlanUnavailable();
+        producer.binding ??= this.dual.currentBinding(wireSignal);
+        dualContext = { stage: "source", binding: await this.abortable(producer.binding, wireSignal) };
+      }
+      if (wireSignal.aborted) throw wireSignal.reason;
+      this.accountReadTimeout();
       ticket.sent();
       evidence.at = this.clock();
       if (
@@ -2500,6 +2838,7 @@ export class VenueReads {
               },
               {
                 deadline_ms: wireDeadline,
+                ...(dualContext ? { dual: dualContext } : {}),
                 ...(scope?.frameLease
                   ? {
                       frame_id: scope.frameLease.frame_id,
@@ -2527,8 +2866,8 @@ export class VenueReads {
           }
           if (error.code === "VENUE_RATE_LIMITED") {
             this.count(cost.method, lane, "coordinated_rate_limited");
-            this.budget.note429(error.details?.retry_after_ms ?? 0);
-            this.cache.clear();
+            budget.note429(error.details?.retry_after_ms ?? 0);
+            this.clearReadBankCache();
           }
           throw error;
         }
@@ -2559,8 +2898,8 @@ export class VenueReads {
               : retry && Number.isFinite(Date.parse(retry))
                 ? Date.parse(retry) - this.clock()
                 : 0;
-          this.budget.note429(Math.max(0, retryMs));
-          this.cache.clear();
+          budget.note429(Math.max(0, retryMs));
+          this.clearReadBankCache();
           try {
             this.noteRateLimitResponse(
               cost.method,
@@ -2602,7 +2941,7 @@ export class VenueReads {
         actual = responseCost(cost, data);
       } catch (error) {
         this.count(cost.method, lane, "invalid_response");
-        this.budget.quarantine();
+        budget.quarantine();
         throw error;
       }
       let capacityFailure: AgentError | undefined;

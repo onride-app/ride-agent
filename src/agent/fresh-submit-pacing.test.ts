@@ -151,7 +151,7 @@ async function fixedPaid(b: VenueReadBudget, time: Time, close = true) {
   }
   return f;
 }
-function component(t: TestContext) {
+function component(t: TestContext, readinessV2 = false) {
   const time = new Time(),
     owner = "a".repeat(64),
     frameOwner = "b".repeat(64);
@@ -179,7 +179,17 @@ function component(t: TestContext) {
       const body = JSON.parse(String(init?.body));
       if (String(url).endsWith("_end")) {
         ends.push(body);
-        return Response.json({ state: "closed", frame_id: body.frame_id });
+        return Response.json({
+          state: "closed",
+          frame_id: body.frame_id,
+          ...(body.protocol_version === 2
+            ? {
+                protocol_version: 2,
+                control_applied: true,
+                deadline_ms: body.deadline_ms,
+              }
+            : {}),
+        });
       }
       begins.push({ ...body, at: time.at });
       if (coreBarrier) await coreBarrier;
@@ -191,9 +201,23 @@ function component(t: TestContext) {
         reserved_weight: pendingCore ? 0 : body.weight,
         capacity: 900,
         guaranteed_complete: false,
+        ...(body.protocol_version === 2
+          ? {
+              protocol_version: 2,
+              fleet_epoch: "01234567-89ab-4cde-8fab-0123456789ab",
+              control_seq: body.control_seq,
+              ready: body.ready,
+              control_applied: true,
+              queued: pendingCore,
+              deadline_ms: body.deadline_ms,
+            }
+          : {}),
       });
     },
     time.clock,
+    readinessV2
+      ? { readinessV2: { fleetEpoch: "01234567-89ab-4cde-8fab-0123456789ab" } }
+      : {},
   );
   const issuer = {};
   const reads = new VenueReads(
@@ -692,3 +716,27 @@ for (const sent of [false, true])
     await assert.rejects(cap.read());
     assert.equal(calls, 1);
   });
+
+it("versioned coordination does not turn a fresh financial purpose into an ordinary soft-scheduling decision", async (t) => {
+  const f = component(t, true);
+  assert.ok(f.coordinator.parkPending);
+  const coordinator = f.coordinator as typeof f.coordinator & {
+    parkPending: NonNullable<typeof f.coordinator.parkPending>;
+  };
+  t.mock.method(coordinator, "parkPending", () => {
+    assert.fail("fresh financial/audit_submit retains its original path");
+  });
+  await fixedPaid(f.budget, f.time);
+  await f.time.run(fresh(f, t).read());
+  assert.equal(f.stats().publications, 1);
+  assert.ok(f.begins.length > 0);
+  assert.ok(
+    f.begins.every(
+      (body) => body.protocol_version === 2 && body.ready === true,
+    ),
+  );
+  await assert.rejects(
+    f.time.run(f.prepare(undefined, { purpose: "audit_submit" })),
+    (e: any) => e.details?.reason_code === "READ_LOCAL_PACING",
+  );
+});
