@@ -1874,6 +1874,11 @@ export class VenueReadBudget {
             charge.weight = weight;
             charge.settled = true;
             charge.at = this.clock();
+            // R64 explicit known-paid policy: a validated positive response
+            // proves dispatch preceded this completion. Keep its full actual
+            // fee for the original rolling60s from here. Uncertain/release
+            // paths retain the original last-possible-dispatch deadline+60s.
+            if (weight > 0) charge.retainUntil = undefined;
             if (sourcePool) {
               sourcePool.committed += weight - measured;
               if (!sourcePool.parent.closed) {

@@ -95,12 +95,12 @@ it("unknown/late source actuals after close keep full debt without an A sample o
   assert.equal(g.budget.snapshot().used, 0);
 });
 
-it("a known remote fee cannot expire before the original last-possible-dispatch plus60s", async () => {
+it("R64 known remote fees retain their full actual weight for completion plus60s", async () => {
   const g = bank(), ticket = await g.budget.acquire("source", 2, "one", signal());
   ticket.retainFor!(72000); ticket.sent(); ticket.settle(2); ticket.release();
-  g.advance(60001);
+  g.advance(59999);
   assert.equal(g.budget.snapshot().used, 2);
-  g.advance(11999);
+  g.advance(1);
   assert.equal(g.budget.snapshot().used, 0);
 });
 
