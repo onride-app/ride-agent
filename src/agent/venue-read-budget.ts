@@ -67,6 +67,8 @@ type Charge = {
   sent: boolean;
   settled: boolean;
   boundedSourceHold?: number;
+  /** V3 remote dispatch may remain possible until its ORIGINAL wire deadline. */
+  retainUntil?: number;
 };
 type Waiter = {
   lane: ReadLane;
@@ -79,6 +81,7 @@ type Waiter = {
   cancel(): void;
   budgetBlocked: boolean;
   observation?: AccountReadReservation;
+  sourceReservation?: SourceReadReservation;
 };
 export interface AccountReadReservation {
   readonly id: number;
@@ -157,7 +160,40 @@ export interface ReadTicket {
   settle(weight: number): void;
   uncertain(): void;
   release(): void;
+  /** Remaining original dispatch time plus60s, in this budget's own clock. */
+  retainFor?(remainingMs: number): void;
 }
+
+/** A source resource never publishes or masquerades as an account cost plan. */
+export interface SourceReadReservation {
+  readonly weight: number;
+  close(complete?: boolean): void;
+}
+export interface SourceCapacityReservation {
+  open(pool: string): SourceReadReservation;
+  close(complete?: boolean): void;
+}
+type SourcePool = {
+  parent: SourceCapacity;
+  key: string;
+  remaining: number;
+  committed: number;
+  limit: number;
+  pending: number;
+  closed: boolean;
+  uncertain: boolean;
+};
+type SourceCapacity = {
+  limits: ReadonlyMap<string, number>;
+  pools: Map<string, number>;
+  remaining: number;
+  pending: number;
+  closed: boolean;
+  invalid: boolean;
+  active?: SourcePool;
+  expiresAt: number;
+  need(pool: string, weight: number): void;
+};
 
 // Shared by ALL production VenueReads instances and both HL hosts. Different
 // hostnames do not imply independent IP quotas. Pending response surcharges
@@ -168,6 +204,8 @@ export class VenueReadBudget {
   private readonly timers: BudgetTimers;
   private readonly slots: number;
   private charges: Charge[] = [];
+  private sourceCapacities = new Set<SourceCapacity>();
+  private sourceReadReservations = new WeakMap<SourceReadReservation, SourcePool>();
   private queues: Record<ReadLane, Waiter[]> = { account: [], source: [] };
   private active: Record<ReadLane, number> = { account: 0, source: 0 };
   private turns: Partial<Record<ReadLane, Turn>> = {};
@@ -336,6 +374,15 @@ export class VenueReadBudget {
   }
   private prune() {
     const now = this.clock();
+    for (const resource of this.sourceCapacities) {
+      if (!resource.closed && resource.expiresAt <= now) {
+        resource.closed = true;
+        resource.invalid = true;
+        resource.remaining = 0;
+        resource.pools.clear();
+      }
+      if (resource.closed && !resource.pending) this.sourceCapacities.delete(resource);
+    }
     for (const [owner, attempt] of this.observationPlanAttempts)
       if (
         attempt.at < now - ACCOUNT_OBSERVATION_PLAN_TTL_MS &&
@@ -353,7 +400,7 @@ export class VenueReadBudget {
         this.observationQueue.delete(key);
     }
     this.charges = this.charges.filter(
-      (c) => !c.sent || !c.settled || c.at > now - 60000,
+      (c) => !c.sent || !c.settled || (c.retainUntil === undefined ? c.at > now - 60000 : Math.max(c.at + 60000, c.retainUntil) > now),
     );
     for (const lane of ["account", "source"] as const)
       for (const [key, value] of this.owners[lane])
@@ -367,6 +414,93 @@ export class VenueReadBudget {
   }
   private used() {
     return this.charges.reduce((n, c) => n + c.weight, 0);
+  }
+  private sourceReserved() {
+    return [...this.sourceCapacities].reduce((n, resource) => n + (!resource.closed && resource.expiresAt > this.clock() ? resource.remaining : 0), 0);
+  }
+  /** Pure local hard-gate probe. It neither prunes nor creates FIFO interest. */
+  sourceCapacityReady(weight: number): boolean {
+    const now = this.clock();
+    const used = this.charges.reduce((n, c) => n +
+      (!c.sent || !c.settled || Math.max(c.at + 60000, c.retainUntil ?? 0) > now ? c.weight : 0), 0);
+    return Number.isSafeInteger(weight) && weight >= 0 && weight <= this.limit &&
+      !this.exclusive && now >= this.blockedUntil && now >= this.providerUntil &&
+      used + this.protectedWeight() + weight <= this.limit;
+  }
+  /** Called synchronously only after the one authenticated dual-bank grant. */
+  beginSourceCapacity(
+    pools: Readonly<Record<string, number>>,
+    leaseRemainingMs: number,
+    need: (pool: string, weight: number) => void,
+  ): SourceCapacityReservation {
+    this.prune();
+    const entries = Object.entries(pools), weight = entries.reduce((n, [, w]) => n + w, 0);
+    if (!entries.length || entries.length > 9 || entries.some(([key, w]) => !key || key.length > 256 || !Number.isSafeInteger(w) || w <= 0) ||
+      !Number.isFinite(leaseRemainingMs) || leaseRemainingMs <= 0 || leaseRemainingMs > 20000 ||
+      this.sourceCapacities.size >= 64 || !this.sourceCapacityReady(weight)) throw costPlanUnavailable();
+    const parent: SourceCapacity = { limits: new Map(entries), pools: new Map(entries), remaining: weight, pending: 0, closed: false, invalid: false, expiresAt: this.clock() + leaseRemainingMs, need };
+    this.sourceCapacities.add(parent);
+    const retire = () => { if (parent.closed && !parent.pending) this.sourceCapacities.delete(parent); };
+    return Object.freeze({
+      open: (key: string): SourceReadReservation => {
+        const remaining = parent.pools.get(key);
+        if (parent.closed || parent.invalid || parent.active || parent.expiresAt <= this.clock() || remaining === undefined || remaining <= 0) throw costPlanUnavailable();
+        const limit = parent.limits.get(key)!;
+        const pool: SourcePool = { parent, key, remaining, committed: limit - remaining, limit, pending: 0, closed: false, uncertain: false };
+        const ticket = Object.freeze({
+          weight: remaining,
+          close: (complete = false) => {
+            if (pool.closed) return;
+            pool.closed = true;
+            if (!complete || pool.pending || pool.uncertain) parent.invalid = true;
+            if (!pool.pending) parent.active = undefined;
+            this.pump();
+            if (complete && parent.invalid) throw costPlanUnavailable();
+          },
+        });
+        parent.active = pool;
+        this.sourceReadReservations.set(ticket, pool);
+        return ticket;
+      },
+      close: (complete = false) => {
+        if (parent.closed) return;
+        parent.closed = true;
+        parent.invalid ||= !complete || !!parent.active || parent.pending > 0;
+        // Only unused local credit closes. Sent charges keep their actual fee
+        // and original remote-dispatch retention even after this parent ends.
+        parent.remaining = 0;
+        parent.pools.clear();
+        retire();
+        this.pump();
+        if (complete && parent.invalid) throw costPlanUnavailable();
+      },
+    });
+  }
+  acquireSource(
+    reservation: SourceReadReservation,
+    lane: ReadLane,
+    cost: number,
+    owner: string | undefined,
+    signal: AbortSignal,
+    unknownSurcharge = false,
+  ): Promise<ReadTicket> {
+    const pool = this.sourceReadReservations.get(reservation);
+    if (!pool || pool.closed || pool.parent.closed || pool.parent.invalid || pool.parent.active !== pool || pool.parent.expiresAt <= this.clock())
+      return Promise.reject(costPlanUnavailable());
+    if (!Number.isSafeInteger(cost) || cost <= 0 || (cost > pool.remaining && pool.pending === 0)) {
+      pool.parent.invalid = true;
+      pool.parent.need(pool.key, pool.committed + Math.max(0, cost));
+      return Promise.reject(this.sourceExhausted(pool, cost));
+    }
+    return this.acquire(lane, cost, owner, signal, unknownSurcharge, undefined, reservation);
+  }
+  private sourceExhausted(pool: SourcePool, requested?: number) {
+    return new AgentError("VENUE_READ_BUDGET_EXHAUSTED", "Complete source resource exceeds its original independent pool.", true, 503, {
+      reason_code: "READ_FRAME_CAPACITY", retry_after_ms: 60000,
+      read_stage: pool.key === "s" ? "source" : "history",
+      ...(Number.isSafeInteger(requested) && requested! >= 0 && requested! <= this.limit ? { requested_weight: requested } : {}),
+      remaining_weight: Math.max(0, Math.min(this.limit, pool.remaining)),
+    });
   }
   private sourceUsed() {
     return this.charges.reduce(
@@ -584,6 +718,23 @@ export class VenueReadBudget {
     });
     this.supplementSnapshots.add(plan);
     return plan;
+  }
+  /** Source-only operational growth; never an account observation/cost plan. */
+  recordSourceReservationNeed(plan: PreparedSupplementPlan, source: string | undefined, weight: number): void {
+    if (!this.supplementSnapshots.has(plan) || !Number.isSafeInteger(weight) || weight <= 0 ||
+      (source !== undefined && !Object.hasOwn(plan.historyWeights, source))) throw costPlanUnavailable();
+    let hint = this.supplementHints.get(plan.key);
+    if (!hint) {
+      if (this.supplementHints.size >= 512) {
+        const oldest = [...this.supplementHints].sort((a, b) => a[1].at - b[1].at)[0];
+        if (oldest) this.supplementHints.delete(oldest[0]);
+      }
+      hint = { at: this.clock(), source: 0, history: new Map() };
+      this.supplementHints.set(plan.key, hint);
+    }
+    hint.at = this.clock();
+    if (source === undefined) hint.source = Math.max(hint.source, weight);
+    else hint.history.set(source, Math.max(hint.history.get(source) ?? 0, weight));
   }
   private supplementPlanCurrent(
     plan: PreparedSupplementPlan,
@@ -1216,14 +1367,16 @@ export class VenueReadBudget {
     this.observation = undefined;
     this.pump();
   }
-  private protectedWeight(observation?: AccountReadReservation) {
+  private protectedWeight(observation?: AccountReadReservation, source?: SourceReadReservation) {
+    const pool = source ? this.sourceReadReservations.get(source) : undefined;
+    const sourceWeight = Math.max(0, this.sourceReserved() - (pool?.remaining ?? 0));
     if (this.observation) {
       const meter = this.observationMeter(observation);
-      return meter
+      return sourceWeight + (meter
         ? Math.max(0, this.observation.remaining - meter.remaining)
-        : this.observation.remaining;
+        : this.observation.remaining);
     }
-    return this.observationQueue.values().next().value?.demand ?? 0;
+    return sourceWeight + (this.observationQueue.values().next().value?.demand ?? 0);
   }
   private canBorrowPacingWeight(waiter: Waiter) {
     const share = Math.floor(this.limit * 0.2);
@@ -1232,6 +1385,8 @@ export class VenueReadBudget {
       waiter.lane === "source" &&
       !waiter.unknownSurcharge &&
       !waiter.observation &&
+      !waiter.sourceReservation &&
+      this.sourceReserved() === 0 &&
       !this.observation &&
       head !== undefined &&
       // Cold/full-window frames must retain an entirely free budget window.
@@ -1289,7 +1444,7 @@ export class VenueReadBudget {
       .sort((a, b) => a.at - b.at)) {
       if (remaining + cost <= this.limit) break;
       remaining -= charge.weight;
-      next = charge.at + 60000;
+      next = Math.max(charge.at + 60000, charge.retainUntil ?? 0);
     }
     if (remaining + cost > this.limit) next = at + 60000;
     // An unsettled reservation can still refund unused response weight (or
@@ -1353,6 +1508,7 @@ export class VenueReadBudget {
     signal: AbortSignal,
     unknownSurcharge = false,
     observation?: AccountReadReservation,
+    sourceReservation?: SourceReadReservation,
   ): Promise<ReadTicket> {
     const reject = (error: Error): Promise<ReadTicket> => {
       const meter = this.observationMeter(observation);
@@ -1424,6 +1580,7 @@ export class VenueReadBudget {
         reject,
         budgetBlocked: false,
         observation,
+        ...(sourceReservation ? { sourceReservation } : {}),
         cancel: () => {},
       };
       waiter.cancel = () => {
@@ -1542,6 +1699,22 @@ export class VenueReadBudget {
           deferredGrace = candidateGrace;
           break;
         }
+        const sourcePool = next.sourceReservation ? this.sourceReadReservations.get(next.sourceReservation) : undefined;
+        if (next.sourceReservation && (!sourcePool || sourcePool.closed || sourcePool.parent.closed || sourcePool.parent.invalid || sourcePool.parent.expiresAt <= this.clock())) {
+          this.queues[next.lane].splice(this.queues[next.lane].indexOf(next), 1);
+          next.signal.removeEventListener("abort", next.cancel);
+          next.reject(costPlanUnavailable());
+          continue;
+        }
+        if (sourcePool && next.cost > sourcePool.remaining) {
+          if (sourcePool.pending > 0) break;
+          sourcePool.parent.invalid = true;
+          sourcePool.parent.need(sourcePool.key, sourcePool.committed + next.cost);
+          this.queues[next.lane].splice(this.queues[next.lane].indexOf(next), 1);
+          next.signal.removeEventListener("abort", next.cancel);
+          next.reject(this.sourceExhausted(sourcePool, next.cost));
+          continue;
+        }
         const trialFrame = this.observationMeter(next.observation);
         if (
           trialFrame?.capacityTrialLimit !== undefined &&
@@ -1568,7 +1741,7 @@ export class VenueReadBudget {
         )
           break;
         const used = this.used(),
-          protectedWeight = this.protectedWeight(next.observation),
+          protectedWeight = this.protectedWeight(next.observation, next.sourceReservation),
           borrow =
             used + next.cost + protectedWeight > this.limit &&
             this.canBorrowPacingWeight(next),
@@ -1597,6 +1770,7 @@ export class VenueReadBudget {
                 meter?.capacityTrialLimit !== undefined
                   ? meter.remaining
                   : Infinity,
+                sourcePool?.remaining ?? Infinity,
               )
             : next.cost,
           sent: false,
@@ -1613,7 +1787,16 @@ export class VenueReadBudget {
         if (borrow) this.sourcePacingLoans++;
         this.charges.push(charge);
         const held = frame ? Math.min(frame.remaining, charge.weight) : 0;
+        const sourceHeld = sourcePool ? Math.min(sourcePool.remaining, charge.weight) : 0;
         const measured = next.unknownSurcharge ? next.cost : charge.weight;
+        if (sourcePool) {
+          sourcePool.remaining -= sourceHeld;
+          sourcePool.parent.remaining -= sourceHeld;
+          sourcePool.parent.pools.set(sourcePool.key, sourcePool.remaining);
+          sourcePool.committed += measured;
+          sourcePool.pending++;
+          sourcePool.parent.pending++;
+        }
         if (frame) {
           frame.remaining -= held;
           frame.committed += measured;
@@ -1645,10 +1828,15 @@ export class VenueReadBudget {
           charge.settled = true;
           if (frame) frame.hadUncertain = true;
           if (meter) meter.hadUncertain = true;
+          if (sourcePool) {
+            sourcePool.uncertain = true;
+            sourcePool.parent.invalid = true;
+            if (next.unknownSurcharge) sourcePool.committed += charge.weight - measured;
+          }
           charge.at = this.clock();
           this.owners[next.lane].get(next.owner)!.pending -= reservation;
           if (next.unknownSurcharge)
-            this.blockedUntil = Math.max(this.blockedUntil, charge.at + 60000);
+            this.blockedUntil = Math.max(this.blockedUntil, charge.at + 60000, charge.retainUntil ?? 0);
           if (frame && next.unknownSurcharge) {
             frame.committed += charge.weight - measured;
             frame.peak = Math.max(frame.peak, frame.committed);
@@ -1660,6 +1848,12 @@ export class VenueReadBudget {
         };
         next.resolve({
           reservation,
+          retainFor: (remainingMs) => {
+            if (!Number.isFinite(remainingMs) || remainingMs < 0 || remainingMs > 72000)
+              throw new RangeError("Invalid original remote-dispatch retention");
+            const until = this.clock() + remainingMs;
+            charge.retainUntil = Math.max(charge.retainUntil ?? 0, until);
+          },
           sent: () => {
             if (released || charge.sent) return;
             charge.sent = true;
@@ -1680,6 +1874,17 @@ export class VenueReadBudget {
             charge.weight = weight;
             charge.settled = true;
             charge.at = this.clock();
+            if (sourcePool) {
+              sourcePool.committed += weight - measured;
+              if (!sourcePool.parent.closed) {
+                const refundHeld = Math.max(0, sourceHeld - weight);
+                sourcePool.remaining += refundHeld;
+                sourcePool.parent.remaining += refundHeld;
+                sourcePool.parent.pools.set(sourcePool.key, sourcePool.remaining);
+              }
+              if (weight === 0 || sourcePool.committed > sourcePool.limit) sourcePool.parent.invalid = true;
+              if (sourcePool.committed > sourcePool.limit) sourcePool.parent.need(sourcePool.key, sourcePool.committed);
+            }
             if (frame) {
               frame.committed += weight - measured;
               frame.remaining += Math.max(0, held - weight);
@@ -1708,6 +1913,7 @@ export class VenueReadBudget {
             this.pump();
             // The full actual fee is already recorded above, including debt.
             // It cannot become a successful or partial account observation.
+            if (sourcePool && sourcePool.committed > sourcePool.limit) throw this.sourceExhausted(sourcePool);
             if (frame?.trialExceeded || meter?.trialExceeded) {
               const exhausted = meter?.trialExceeded ? meter : frame;
               if (exhausted) this.recordSupplementNeed(exhausted, 0);
@@ -1734,6 +1940,12 @@ export class VenueReadBudget {
                 meter.committed -= measured;
                 meter.remaining += held;
               }
+              if (sourcePool && !sourcePool.parent.closed) {
+                sourcePool.committed -= measured;
+                sourcePool.remaining += sourceHeld;
+                sourcePool.parent.remaining += sourceHeld;
+                sourcePool.parent.pools.set(sourcePool.key, sourcePool.remaining);
+              }
             }
             this.active[next.lane]--;
             if (this.exclusive === charge) this.exclusive = undefined;
@@ -1751,6 +1963,13 @@ export class VenueReadBudget {
               }
               this.finishObservation();
             }
+            if (sourcePool) {
+              sourcePool.pending--;
+              sourcePool.parent.pending--;
+              if (sourcePool.closed && !sourcePool.pending && sourcePool.parent.active === sourcePool)
+                sourcePool.parent.active = undefined;
+              if (sourcePool.parent.closed && !sourcePool.parent.pending) this.sourceCapacities.delete(sourcePool.parent);
+            }
             this.pump();
           },
         });
@@ -1759,7 +1978,7 @@ export class VenueReadBudget {
         const now = this.clock();
         const expiry = this.charges
           .filter((c) => c.sent && c.settled)
-          .reduce((n, c) => Math.min(n, c.at + 60000), now + 60000);
+          .reduce((n, c) => Math.min(n, Math.max(c.at + 60000, c.retainUntil ?? 0)), now + 60000);
         const turnExpiry = Object.entries(this.turns).reduce((n, [lane, t]) => {
           const expires = t.started + (lane === "account" ? 20000 : 12000);
           return Math.min(n, expires > now ? expires : n);

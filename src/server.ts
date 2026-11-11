@@ -32,6 +32,10 @@ import { AgentError, mutationTools } from "./agent/contracts.js";
 import { VERSION } from "./version.js";
 import { recordMcpProtocolError, requestDiagnostics } from "./request_diagnostics.js";
 import { exchangePrivyForRide } from "./auth_exchange.js";
+import { gatewayInfoConfigFromEnv, createGatewayBindingReader } from "./gateway-info-config.js";
+import { createGatewayInfoRelay } from "./gateway-info-relay.js";
+import { createGatewayInfoClient } from "./gateway-info-client.js";
+import { sharedPhysicalVenueBudgets } from "./agent/physical-venue-budgets.js";
 
 async function main(): Promise<void> {
   const required = (key: string) => {
@@ -93,6 +97,17 @@ async function main(): Promise<void> {
     }),
     readOnly = process.env.RIDE_PUBLIC_SUBMISSION_MODE === "true";
   app.use(requestDiagnostics("gateway"));
+  const gatewayReads = gatewayInfoConfigFromEnv(process.env);
+  const gatewayRelay = gatewayReads ? createGatewayInfoRelay({ template: gatewayReads.relay,
+    readClientToken: gatewayReads.readClientToken, forwardKey: gatewayReads.forwardKey }) : undefined;
+  if (gatewayRelay) app.use(gatewayRelay.router);
+  const balanceOptions = gatewayReads && gatewayRelay ? {
+    hyperliquidFetcher: createGatewayInfoClient({ coreOrigin: gatewayReads.authority.core_origin,
+      readClientToken: gatewayReads.readClientToken, pendingCallers: gatewayRelay.pendingCallers,
+      currentBinding: createGatewayBindingReader(gatewayReads) }),
+    hyperliquidBudget: sharedPhysicalVenueBudgets(gatewayReads.authority).gateway,
+    hyperliquidRetention: true as const,
+  } : undefined;
   app.use(
     mcpAuthRouter({
       provider,
@@ -109,9 +124,9 @@ async function main(): Promise<void> {
     args: unknown,
     token: string,
   ) =>
-    invokeAccountRead(name, args, token, graphql, () =>
-      invokeAgent(backend, token, "get_portfolio", args),
-    );
+    invokeAccountRead(name, args, token, graphql,
+      () => invokeAgent(backend, token, "get_portfolio", args),
+      undefined, balanceOptions);
   mountAgentProxy(app, auth, backend, readOnly, accountRead);
   if (!readOnly) {
     mountHumanConfirmation(app, {

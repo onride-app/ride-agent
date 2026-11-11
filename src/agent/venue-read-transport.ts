@@ -1,4 +1,5 @@
 import { AgentError } from "./contracts.js";
+import type { DualBinding } from "./dual-egress-contract.js";
 
 // Proof about this read's admission only, never financial non-acceptance.
 export const UNSENT_READ_BUDGET_REASON = "READ_LOCAL_BUDGET_UNSENT";
@@ -14,7 +15,13 @@ export function isUnsentReadBudgetDenial(error: unknown): error is AgentError {
 export type VenueReadFetcher = (
   url: string,
   init: RequestInit,
-  context?: { deadline_ms: number; frame_id?: string; frame_owner?: string },
+  context?: {
+    deadline_ms: number;
+    frame_id?: string;
+    frame_owner?: string;
+    /** Private runtime stage. Logical source lanes inside A remain A. */
+    dual?: { stage: "account" | "source" | "history"; binding?: DualBinding; history_source?: string };
+  },
 ) => Promise<Response>;
 
 // Only the authenticated Core adapter creates these receipts. Ordinary HTTP

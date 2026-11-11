@@ -40,6 +40,8 @@
 | `RIDE_AGENT_PREDICTION_ENABLED` | bridge/Core显式prediction开关；无paper模式 | 配置/公开标识；URL含凭据时按秘密 | [.env.example:21](../.env.example#L21)、[src/agent/core_bridge.ts:250](../src/agent/core_bridge.ts#L250) |
 | `RIDE_AGENT_PRIVATE_HTTP_HOST` | backend允许的精确Railway internal bridge HTTP host | 配置/公开标识；URL含凭据时按秘密 | [src/agent/backend.ts:337](../src/agent/backend.ts#L337) |
 | `RIDE_AGENT_READ_ONLY` | backend/Core只读与暂停trading runner，各层独立配置 | 配置/公开标识；URL含凭据时按秘密 | [.env.example:12](../.env.example#L12)、[src/agent/backend.ts:346](../src/agent/backend.ts#L346) |
+| `RIDE_AGENT_INFO_FRAME_V2_ENABLED` | 默认关闭；仅在所有共享队列的 Core Lua 读取者均升级并经运维确认后，启用版本化 ready/park 协调。不是交易或 fresh-read 权限 | 配置 | [src/agent/core-frame-coordinator.ts](../src/agent/core-frame-coordinator.ts) |
+| `RIDE_AGENT_INFO_FRAME_V2_FLEET_EPOCH` | 启用 v2 时必填 canonical UUID；BEGIN 必须精确回显，绑定响应服务配置，不能代替全 fleet 兼容证明。END 清理不要求当前 epoch | 配置，非凭据 | [src/agent/core-frame-coordinator.ts](../src/agent/core-frame-coordinator.ts) |
 | `RIDE_AGENT_RWA_ENABLED` | bridge RWA功能开关；受支持边界独立校验 | 配置/公开标识；URL含凭据时按秘密 | [.env.example:30](../.env.example#L30)、[src/agent/core_bridge.ts:261](../src/agent/core_bridge.ts#L261) |
 | `RIDE_AGENT_TEST_DATABASE_URL` | 真实durability/timeout tests的一次性PostgreSQL连接串 | 秘密/可能含凭据；实际值走受控渠道 | [src/agent/durability.test.ts:19](../src/agent/durability.test.ts#L19)、[src/agent/order-precheck.test.ts:481](../src/agent/order-precheck.test.ts#L481)、[src/agent/repository-timeouts.test.ts:16](../src/agent/repository-timeouts.test.ts#L16) |
 | `RIDE_AGENT_TRADER_ID_SALT` | bridge稳定public trader-ID盐，>=32字符，轮换影响旧ID | 秘密/可能含凭据；实际值走受控渠道 | [.env.example:19](../.env.example#L19)、[src/agent/core_bridge.ts:1938](../src/agent/core_bridge.ts#L1938) |
@@ -67,3 +69,18 @@
 | `STRATEGY_CONTROL_PLANE_SERVICE_TOKEN` | Core API/gRPC/worker控制平面凭据，区别于Node S2S token | 是 |
 
 CI使用GitHub OIDC trusted publishing；平台注入的OIDC/GitHub runner变量不需要手工复制。没有新增长期npm publish key要求。
+
+## 默认关闭的双物理出口读取
+
+这些键只授权只读配额/输运；不增加用户、签名、交易或组合权限。完整边界见[双出口读取](dual-egress-readiness.md)。旧上表数量是此前盘点快照。
+
+| 键 | 服务与用途 | 秘密 |
+|---|---|---|
+| `RIDE_AGENT_INFO_FRAME_V3_ENABLED` | Core/App 显式开启新 prepared-parent 协议；默认 false，普通 A/fresh-submit 保持原 R61 协调 | 否 |
+| `RIDE_AGENT_INFO_FRAME_V3_AUTHORITY_JSON` | Core/App/Gateway 同一份14字段原始 UTF8 稳定物理/配置 authority；不包含 boot nonce/deployment ID；空值或缺证明拒绝 opt-in | 不含凭据；真实值由受控运维配置 |
+| `RIDE_AGENT_SOURCE_FORWARD_ENABLED` | Gateway 狭窄 official-info forward；默认 false | 否 |
+| `RIDE_AGENT_SOURCE_READ_CLIENT_TOKEN` | Gateway 只读 quota/status/redeem 专用 token，至少32字符；不与 CoreServiceToken/forward key 共用 | 是 |
+| `RIDE_AGENT_SOURCE_FORWARD_KEY_HEX64` | Core/Gateway 狭窄单用 capability HMAC key，64小写十六进制/32 bytes；不是交易签名 key | 是 |
+| `RIDE_AGENT_SOURCE_GATEWAY_DEPLOYMENT_ID` | 仅 Core 固定已观察到的 Gateway deployment UUID；不同 deployment 不自动收养 | 否 |
+
+Gateway 的实际 `RAILWAY_SERVICE_ID`/`RAILWAY_DEPLOYMENT_ID` 来自运行环境，boot nonce 由进程随机生成。相同 deployment 重启只可更新新父窗口的 runtime binding，不能换账本、重做 cold seed、迁移旧 claim 或延长旧期限。IP/service/deployment 变化仍需明确证明和 drain。

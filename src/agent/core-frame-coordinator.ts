@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AgentError } from "./contracts.js";
+import { dualFramePendingContinuation } from "./core-dual-frame-coordinator.js";
 import { costPlanUnavailable } from "./account-observation-plans.js";
 import type {
   AccountReadFrameCoordinator,
@@ -14,7 +15,30 @@ type Frame = {
   readonly deadline: number;
   expires?: number;
   polling: boolean;
+  pendingReceipt?: true;
+  readiness?: {
+    mayHaveApplied: boolean;
+    intent: { seq: number; ready: boolean; acknowledged: boolean };
+  };
 };
+
+export type FrameReadinessOptions = { readinessV2?: { fleetEpoch: string } };
+// Shared wire bound: Redis cjson does not preserve MAX_SAFE_INTEGER decimal text.
+export const FRAME_CONTROL_SEQ_MAX = 1_000_000_000;
+const canonicalEpoch = (value: string) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+    value,
+  ) && value !== "00000000-0000-0000-0000-000000000000";
+/** Operator gate only. An echoed epoch does not prove every shared Lua reader upgraded. */
+export function frameReadinessOptions(
+  env: NodeJS.ProcessEnv,
+): FrameReadinessOptions {
+  if (env.RIDE_AGENT_INFO_FRAME_V2_ENABLED !== "true") return {};
+  const fleetEpoch = env.RIDE_AGENT_INFO_FRAME_V2_FLEET_EPOCH ?? "";
+  if (!canonicalEpoch(fleetEpoch))
+    throw new Error("Frame v2 requires a canonical fleet epoch");
+  return { readinessV2: { fleetEpoch } };
+}
 
 const pendingContinuations = new WeakMap<AgentError, object>();
 const framePins = new WeakMap<Frame, object>();
@@ -37,7 +61,7 @@ export function framePendingContinuation(error: unknown): object | undefined {
     ["READ_FRAME_PENDING", "READ_FRAME_POLLING"].includes(
       error.details?.reason_code ?? "",
     )
-    ? pendingContinuations.get(error)
+    ? pendingContinuations.get(error) ?? dualFramePendingContinuation(error)
     : undefined;
 }
 function deferred(retry = 1000, frame?: Frame, reason = "READ_FRAME_PENDING") {
@@ -80,12 +104,24 @@ export function coreFrameCoordinator(
   token: string,
   request: typeof fetch = (...args) => fetch(...args),
   clock = Date.now,
+  options: FrameReadinessOptions = {},
 ): AccountReadFrameCoordinator {
+  const epoch = options.readinessV2?.fleetEpoch;
+  if (epoch !== undefined && !canonicalEpoch(epoch))
+    throw new Error("Frame v2 requires a canonical fleet epoch");
   const beginUrl = new URL(
     "/internal/agent-core/perps_info_frame_begin",
     coreUrl,
   );
   const endUrl = new URL("/internal/agent-core/perps_info_frame_end", coreUrl);
+  const v2BeginUrl = new URL(
+    "/internal/agent-core/perps_info_frame_v2_begin",
+    coreUrl,
+  );
+  const v2EndUrl = new URL(
+    "/internal/agent-core/perps_info_frame_v2_end",
+    coreUrl,
+  );
   if (
     beginUrl.protocol !== "https:" &&
     !(
@@ -97,6 +133,9 @@ export function coreFrameCoordinator(
   const frames = new Map<string, Frame>();
   const releasing = new Set<Promise<void>>();
   const releases = new WeakMap<Frame, Promise<void>>();
+  // A failed v2 END must not turn map absence into permission for a new UUID.
+  // New episodes stop at this bound; existing exact cleanup remains available.
+  const retiring = new Map<string, Frame>();
   const stop = new AbortController();
   let closing = false;
 
@@ -122,13 +161,19 @@ export function coreFrameCoordinator(
     // booking after the account attempt's signal has already been aborted.
     const signal = AbortSignal.timeout(2000);
     const response = await bounded(
-      request(endUrl, {
+      request(frame.readiness ? v2EndUrl : endUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ frame_id: frame.id, owner: frame.owner }),
+        body: JSON.stringify({
+          frame_id: frame.id,
+          owner: frame.owner,
+          ...(frame.readiness
+            ? { protocol_version: 2, deadline_ms: frame.deadline }
+            : {}),
+        }),
         signal,
         redirect: "error",
       }),
@@ -138,19 +183,30 @@ export function coreFrameCoordinator(
     if (
       response.status !== 200 ||
       body?.state !== "closed" ||
-      body?.frame_id !== frame.id
+      body?.frame_id !== frame.id ||
+      (frame.readiness &&
+        (body.protocol_version !== 2 ||
+          body.control_applied !== true ||
+          body.deadline_ms !== frame.deadline))
     )
       throw costPlanUnavailable();
   }
   function trackRelease(frame: Frame) {
     const previous = releases.get(frame);
     if (previous) return previous;
+    if (frame.readiness) retiring.set(frame.owner, frame);
     const work = release(frame);
     releases.set(frame, work);
     releasing.add(work);
     void work.then(
-      () => releasing.delete(work),
-      () => releasing.delete(work),
+      () => {
+        releasing.delete(work);
+        if (retiring.get(frame.owner) === frame) retiring.delete(frame.owner);
+      },
+      () => {
+        releasing.delete(work);
+        if (frame.readiness) releases.delete(frame); // Retry the same idempotent END, never a new identity.
+      },
     );
     return work;
   }
@@ -159,9 +215,245 @@ export function coreFrameCoordinator(
       if ((frame.expires ?? frame.deadline) <= clock())
         void trackRelease(frame).catch(() => {});
   }
+  async function finishRetiring(owner: string) {
+    const frame = retiring.get(owner);
+    if (frame) await trackRelease(frame);
+  }
+  function expired(frame: Frame) {
+    if ((frame.expires ?? frame.deadline) > clock()) return;
+    void trackRelease(frame).catch(() => {});
+    throw new AgentError(
+      "VENUE_READ_DEADLINE",
+      "Queued account observation reached its original deadline before venue reads began.",
+      true,
+      503,
+    );
+  }
+  function terminal(body: any, frame: Frame) {
+    return (
+      body?.protocol_version === 2 &&
+      body.frame_id === frame.id &&
+      body.deadline_ms === frame.deadline &&
+      body.state === "cancelled" &&
+      body.queued === false
+    );
+  }
+  async function beginResponse(
+    frame: Frame,
+    ready: boolean,
+    signal: AbortSignal,
+    unchanged: () => void,
+  ): Promise<{ response: Response; body: any }> {
+    const exchange = async () => {
+      if (closing || signal.aborted) throw costPlanUnavailable();
+      const control = frame.readiness;
+      const priorPossible = control?.mayHaveApplied ?? false;
+      if (control) {
+        control.mayHaveApplied = true;
+        control.intent.acknowledged = false;
+      }
+      const response = await bounded(
+        request(control ? v2BeginUrl : beginUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            frame_id: frame.id,
+            owner: frame.owner,
+            weight: frame.weight,
+            mode: frame.mode,
+            deadline_ms: frame.deadline,
+            ...(control
+              ? {
+                  protocol_version: 2,
+                  control_seq: control.intent.seq,
+                  ready: control.intent.ready,
+                }
+              : {}),
+          }),
+          signal,
+          redirect: "error",
+        }),
+        signal,
+      );
+      try {
+        unchanged();
+      } catch (error) {
+        void response.body?.cancel().catch(() => {});
+        throw error;
+      }
+      const body = (await bounded(response.json(), signal)) as any;
+      unchanged();
+      if (!control) return { response, body };
+      const explicitlyUnsupported =
+        (response.status === 503 &&
+          body?.error?.code === "frame_v2_disabled" &&
+          body.error.upstream_request_sent === false) ||
+        (response.status === 409 &&
+          body?.error?.code === "CORE_REJECTED" &&
+          body.error.message === "Unknown private Agent operation");
+      if (!priorPossible && explicitlyUnsupported) {
+        frame.readiness = undefined; // This entire episode now stays legacy.
+        return exchange();
+      }
+      if (response.status === 200 && terminal(body, frame)) {
+        await trackRelease(frame); // Positive exact fence cleanup, not an absence assumption.
+        throw new AgentError(
+          "VENUE_READ_DEADLINE",
+          "Original read episode is permanently closed.",
+          true,
+          503,
+        );
+      }
+      if (
+        response.status !== 200 ||
+        body?.protocol_version !== 2 ||
+        body.fleet_epoch !== epoch ||
+        body.frame_id !== frame.id ||
+        body.deadline_ms !== frame.deadline ||
+        !Number.isInteger(body.control_seq) ||
+        body.control_seq < 1 ||
+        body.control_seq > FRAME_CONTROL_SEQ_MAX ||
+        body.control_seq !== control.intent.seq ||
+        body.ready !== control.intent.ready ||
+        body.control_applied !== true ||
+        body.capacity !== 900 ||
+        body.guaranteed_complete !== false ||
+        !["pending", "granted"].includes(body.state) ||
+        !Number.isSafeInteger(body.reserved_weight) ||
+        body.reserved_weight < 0 ||
+        body.reserved_weight > frame.weight ||
+        !Number.isSafeInteger(body.expires_at) ||
+        body.expires_at <= clock() ||
+        !Number.isSafeInteger(body.retry_after_ms) ||
+        (body.state === "pending"
+          ? body.retry_after_ms < 1 || body.retry_after_ms > 1000
+          : body.retry_after_ms !== 0) ||
+        (body.state === "pending" &&
+          (body.queued !== true ||
+            body.expires_at !== frame.deadline ||
+            (!control.intent.ready && body.reserved_weight !== 0))) ||
+        (body.state === "granted" &&
+          (!control.intent.ready ||
+            body.queued !== false ||
+            body.reserved_weight !== frame.weight ||
+            body.expires_at > clock() + 20000))
+      ) {
+        // A refused park can report an already existing lease. Preserve its
+        // real expiry, but this negative ACK never grants a new caller a lease.
+        if (
+          response.status === 200 &&
+          body?.protocol_version === 2 &&
+          body.fleet_epoch === epoch &&
+          body.frame_id === frame.id &&
+          body.deadline_ms === frame.deadline &&
+          body.state === "granted" &&
+          body.control_applied === false &&
+          Number.isSafeInteger(body.expires_at) &&
+          body.expires_at > clock() &&
+          body.expires_at <= clock() + 20000
+        )
+          frame.expires = body.expires_at;
+        throw costPlanUnavailable();
+      }
+      control.intent.acknowledged = true;
+      frame.pendingReceipt = body.state === "pending" ? true : undefined;
+      return { response, body };
+    };
+    const control = frame.readiness;
+    if (control) {
+      // Resolve an unknown old intent before changing readiness. Equal seq is
+      // an idempotent intent and still performs a real capacity poll in Core.
+      if (!control.intent.acknowledged && control.intent.ready !== ready) {
+        const previous = await exchange();
+        if (!frame.readiness || previous.body.state !== "pending")
+          return previous;
+      }
+      if (frame.readiness && frame.readiness.intent.ready !== ready) {
+        if (frame.readiness.intent.seq >= FRAME_CONTROL_SEQ_MAX)
+          throw costPlanUnavailable();
+        frame.readiness.intent = {
+          seq: frame.readiness.intent.seq + 1,
+          ready,
+          acknowledged: false,
+        };
+      }
+    }
+    return exchange();
+  }
   return {
     capacity: 900,
-    async begin(owner, weight, deadlineMs, signal, mode, continuation) {
+    ...(epoch ? { readinessV2: true as const } : {}),
+    async parkPending(owner, signal, continuation) {
+      if (!epoch) return false;
+      if (closing || signal.aborted) throw costPlanUnavailable();
+      await finishRetiring(owner);
+      if (closing || signal.aborted) throw costPlanUnavailable();
+      const frame = frames.get(owner);
+      if (!frame) {
+        prune();
+        return false;
+      }
+      expired(frame);
+      prune();
+      if (!frame.readiness || frame.polling || frame.expires !== undefined)
+        return false;
+      if (continuation !== undefined) {
+        const pin = pinnedFrames.get(continuation);
+        if (
+          !pin ||
+          pin.frame !== frame ||
+          pin.id !== frame.id ||
+          pin.deadline !== frame.deadline
+        )
+          throw identityChanged();
+      }
+      const control = frame.readiness;
+      if (
+        !frame.pendingReceipt &&
+        (control.intent.ready || control.intent.acknowledged)
+      )
+        return false;
+      if (!control.intent.ready && control.intent.acknowledged) return true;
+      frame.polling = true;
+      const boundedSignal = AbortSignal.any([
+        signal,
+        stop.signal,
+        AbortSignal.timeout(2000),
+      ]);
+      try {
+        const { body } = await beginResponse(
+          frame,
+          false,
+          boundedSignal,
+          () => {
+            if (frames.get(owner) !== frame) throw identityChanged();
+          },
+        );
+        return (
+          !!frame.readiness && body.state === "pending" && body.ready === false
+        );
+      } catch (error) {
+        if (error instanceof AgentError && error.code === "VENUE_READ_DEADLINE")
+          throw error;
+        throw deferred(1000, frame); // Operational continuity only; no park ACK or read permission.
+      } finally {
+        frame.polling = false;
+      }
+    },
+    async begin(
+      owner,
+      weight,
+      deadlineMs,
+      signal,
+      mode,
+      continuation,
+      localReady,
+    ) {
+      if (closing || signal.aborted) throw costPlanUnavailable();
+      if (epoch) await finishRetiring(owner);
       if (closing || signal.aborted) throw costPlanUnavailable();
       const now = clock();
       if (
@@ -209,7 +501,7 @@ export function coreFrameCoordinator(
         throw identityChanged();
       }
       if (!frame) {
-        if (frames.size >= 64)
+        if (frames.size >= 64 || (epoch && retiring.size >= 64))
           throw deferred(1000, undefined, "READ_FRAME_QUEUE_FULL");
         frame = {
           id: randomUUID(),
@@ -219,6 +511,18 @@ export function coreFrameCoordinator(
           // Subsequent polls retain this FIRST deadline; retries never renew it.
           deadline: deadlineMs,
           polling: false,
+          ...(epoch
+            ? {
+                readiness: {
+                  mayHaveApplied: false,
+                  intent: {
+                    seq: 1,
+                    ready: localReady !== false,
+                    acknowledged: false,
+                  },
+                },
+              }
+            : {}),
         };
         frames.set(owner, frame);
       }
@@ -242,39 +546,19 @@ export function coreFrameCoordinator(
       };
       unchanged();
       current.polling = true;
+      current.pendingReceipt = undefined;
       const boundedSignal = AbortSignal.any([
         signal,
         stop.signal,
         AbortSignal.timeout(2000),
       ]);
       try {
-        const response = await bounded(
-          request(beginUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              frame_id: current.id,
-              owner,
-              weight: current.weight,
-              mode: current.mode,
-              deadline_ms: current.deadline,
-            }),
-            signal: boundedSignal,
-            redirect: "error",
-          }),
+        const { response, body } = await beginResponse(
+          current,
+          localReady !== false,
           boundedSignal,
+          unchanged,
         );
-        try {
-          unchanged();
-        } catch (error) {
-          void response.body?.cancel().catch(() => {});
-          throw error;
-        }
-        const body = (await bounded(response.json(), boundedSignal)) as any;
-        unchanged();
         if (!response.ok) {
           const retry = body?.error?.retry_after_ms;
           if (
@@ -362,13 +646,21 @@ export function coreFrameCoordinator(
           )
         )
           throw error;
+        if (
+          current.readiness?.mayHaveApplied &&
+          current.expires === undefined &&
+          frames.get(owner) === current
+        )
+          throw deferred(1000, current);
         throw costPlanUnavailable();
       } finally {
         current.polling = false;
       }
     },
     async end(frameId) {
-      const frame = [...frames.values()].find((entry) => entry.id === frameId);
+      const frame = [...frames.values(), ...retiring.values()].find(
+        (entry) => entry.id === frameId,
+      );
       if (frame) await trackRelease(frame);
     },
     async cancelPending(continuation) {
@@ -388,6 +680,7 @@ export function coreFrameCoordinator(
       closing = true;
       stop.abort(costPlanUnavailable());
       await Promise.allSettled([...frames.values()].map(trackRelease));
+      await Promise.allSettled([...retiring.values()].map(trackRelease));
       while (releasing.size) await Promise.allSettled([...releasing]);
     },
   };

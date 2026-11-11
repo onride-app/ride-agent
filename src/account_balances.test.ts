@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 import { AgentError } from "./agent/contracts.js";
 import type { VenueReads } from "./agent/venue-reads.js";
+import { VenueReadBudget } from "./agent/venue-read-budget.js";
 import {
   readAccountBalances,
   type AccountBalanceReadDiagnostic,
@@ -204,6 +205,36 @@ function fixture(
   }) as typeof fetch;
   return { request, calls: () => publicCalls };
 }
+it("routes only Hyperliquid balances through the injected physical-bank client with a fresh caller deadline per balance read", async () => {
+  const f = fixture({ sameWallet: true });
+  const signals: AbortSignal[] = [];
+  let originalCalls = 0;
+  const original = (async (url: any, init: RequestInit) => {
+    assert.notEqual(new URL(String(url)).hostname, "api.hyperliquid.xyz");
+    originalCalls++;
+    return f.request(url, init);
+  }) as typeof fetch;
+  const options = {
+    hyperliquidRetention: true as const,
+    hyperliquidBudget: new VenueReadBudget(),
+    hyperliquidFetcher: async (url: string, init: RequestInit, context?: { deadline_ms: number }) => {
+      assert.equal(new URL(url).hostname, "api.hyperliquid.xyz");
+      assert.equal(new Headers(init.headers).get("authorization"), null);
+      assert.ok(context && context.deadline_ms <= Date.now() + 10000 && context.deadline_ms > Date.now());
+      assert.ok(init.signal && !init.signal.aborted);
+      signals.push(init.signal);
+      return f.request(url, init);
+    },
+  };
+  const first = await readAccountBalances("https://core.test/graphql", "fixture", original, undefined, options);
+  const firstCount = signals.length;
+  assert.ok(firstCount > 0);
+  const second = await readAccountBalances("https://core.test/graphql", "fixture", original, undefined, options);
+  assert.ok(signals.length > firstCount && originalCalls > 0);
+  assert.notEqual(signals[0], signals[firstCount]);
+  assert.equal(first.markets.perps.account_value_usd, "43.000000");
+  assert.equal(second.markets.perps.account_value_usd, "43.000000");
+});
 it("reads the App's 43 USD Perps separately from 7 USDC Prediction cash and never adds copy budgets or duplicate wallets", async () => {
   const f = fixture({ sameWallet: true }),
     out = await readAccountBalances(

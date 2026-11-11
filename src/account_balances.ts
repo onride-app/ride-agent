@@ -4,6 +4,8 @@ import { VenueReads } from "./agent/venue-reads.js";
 import { readPredictionPositionsV2 } from "./agent/polymarket-data.js";
 import { coreAuthenticationError } from "./core_auth.js";
 import { randomUUID } from "node:crypto";
+import type { VenueReadFetcher } from "./agent/venue-read-transport.js";
+import type { VenueReadBudget } from "./agent/venue-read-budget.js";
 
 type PerpsReadMode =
   "standard" | "dex_abstraction" | "unified" | "portfolio_margin";
@@ -120,15 +122,21 @@ export async function readAccountBalances(
   venueReads?: VenueReads,
   options: {
     reportReadFailure?: (diagnostic: AccountBalanceReadDiagnostic) => void;
+    hyperliquidFetcher?: VenueReadFetcher;
+    hyperliquidBudget?: VenueReadBudget;
+    hyperliquidRetention?: true;
   } = {},
 ) {
   // Pagination and wallet reads share one deadline, below the widget tool timeout.
   const deadline = AbortSignal.timeout(22000);
   const publicVenueReads =
     venueReads ??
-    new VenueReads(request, Date.now, 2, {
+    new VenueReads(options.hyperliquidFetcher ?? request, Date.now, 2, {
       deadlineMs: 10000,
       signal: deadline,
+      ...(options.hyperliquidFetcher ? { transport: "core_shared_info" as const } : {}),
+      ...(options.hyperliquidBudget ? { budget: options.hyperliquidBudget } : {}),
+      ...(options.hyperliquidRetention ? { retainRemoteDispatch: true } : {}),
     });
   let authenticationFailure: AgentError | undefined;
   const query = async (document: string, embedded = false) => {
