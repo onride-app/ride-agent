@@ -210,6 +210,8 @@ export interface AccountReadFrameCoordinator {
     localReady?: boolean,
   ): Promise<AccountReadFrameLease>;
   end(frameId: string): Promise<void>;
+  /** Exact issued v1 lease only: retain its identity until positive END ACK. */
+  retainGrantedLease?(lease: AccountReadFrameLease): boolean;
   close?(): Promise<void>;
   cancelPending?(continuation: object): Promise<void>;
   /** True only after a strict versioned Core park ACK for this existing episode. */
@@ -2311,6 +2313,14 @@ export class VenueReads {
           scope.localInterest,
         );
     }
+    // This opt-in affects only an already verified ordinary v1 grant. It adds
+    // no pre-Core readiness gate and never changes pending FIFO polling.
+    const ordinaryGrantHandoff =
+      this.preparedPromotionV1 && !!this.dual &&
+      !bundle && !scope.preparingBundle && !scope.preparedParent &&
+      !scope.freshSubmitPurpose && !scope.waitForFrameAdmission &&
+      !!scope.frameLease &&
+      this.frameCoordinator?.retainGrantedLease?.(scope.frameLease) === true;
     let deferred: unknown;
     for (;;) {
       if (signal.aborted) throw signal.reason;
@@ -2405,6 +2415,16 @@ export class VenueReads {
           this.frameCoordinator &&
           !scope.reservation &&
           isObservationAdmissionDeferred(error);
+        if (ordinaryGrantHandoff && fleetBegin) {
+          // One synchronous local booking attempt after the grant. Another
+          // observation may have won during Core await: do not idle with its
+          // unused credit. Unknown END keeps the original coordinator frame.
+          if (scope.localInterest)
+            this.budget.endObservationInterest(scope.localInterest);
+          scope.localInterest = undefined;
+          this.releaseFrame(scope);
+          throw error;
+        }
         const waitUntil = fleetBegin ? scope.until : until;
         if (this.frameCoordinator && !fleetBegin) {
           this.releaseFrame(scope);
