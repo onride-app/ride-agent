@@ -16,6 +16,8 @@ type Frame = {
   expires?: number;
   polling: boolean;
   pendingReceipt?: true;
+  retainGranted?: true;
+  retirementUnsafe?: true;
   readiness?: {
     mayHaveApplied: boolean;
     intent: { seq: number; ready: boolean; acknowledged: boolean };
@@ -133,7 +135,8 @@ export function coreFrameCoordinator(
   const frames = new Map<string, Frame>();
   const releasing = new Set<Promise<void>>();
   const releases = new WeakMap<Frame, Promise<void>>();
-  // A failed v2 END must not turn map absence into permission for a new UUID.
+  const grantedLeases = new WeakMap<AccountReadFrameLease, Frame>();
+  // A failed v2 or opted-in verified v1 END must not authorize a new UUID.
   // New episodes stop at this bound; existing exact cleanup remains available.
   const retiring = new Map<string, Frame>();
   const stop = new AbortController();
@@ -194,7 +197,7 @@ export function coreFrameCoordinator(
   function trackRelease(frame: Frame) {
     const previous = releases.get(frame);
     if (previous) return previous;
-    if (frame.readiness) retiring.set(frame.owner, frame);
+    if (frame.readiness || frame.retainGranted) retiring.set(frame.owner, frame);
     const work = release(frame);
     releases.set(frame, work);
     releasing.add(work);
@@ -205,7 +208,7 @@ export function coreFrameCoordinator(
       },
       () => {
         releasing.delete(work);
-        if (frame.readiness) releases.delete(frame); // Retry the same idempotent END, never a new identity.
+        if (frame.readiness || frame.retainGranted) releases.delete(frame); // Retry the same idempotent END, never a new identity.
       },
     );
     return work;
@@ -453,7 +456,7 @@ export function coreFrameCoordinator(
       localReady,
     ) {
       if (closing || signal.aborted) throw costPlanUnavailable();
-      if (epoch) await finishRetiring(owner);
+      if (epoch || retiring.has(owner)) await finishRetiring(owner);
       if (closing || signal.aborted) throw costPlanUnavailable();
       const now = clock();
       if (
@@ -501,7 +504,7 @@ export function coreFrameCoordinator(
         throw identityChanged();
       }
       if (!frame) {
-        if (frames.size >= 64 || (epoch && retiring.size >= 64))
+        if (frames.size >= 64 || retiring.size >= 64)
           throw deferred(1000, undefined, "READ_FRAME_QUEUE_FULL");
         frame = {
           id: randomUUID(),
@@ -547,6 +550,7 @@ export function coreFrameCoordinator(
       unchanged();
       current.polling = true;
       current.pendingReceipt = undefined;
+      let verifiedReceipt = false;
       const boundedSignal = AbortSignal.any([
         signal,
         stop.signal,
@@ -616,6 +620,7 @@ export function coreFrameCoordinator(
             body.retry_after_ms > 1000
           )
             throw costPlanUnavailable();
+          verifiedReceipt = response.status === 200;
           throw deferred(Math.max(250, body.retry_after_ms), current);
         }
         if (
@@ -626,16 +631,25 @@ export function coreFrameCoordinator(
           clock() > current.deadline
         )
           throw costPlanUnavailable();
+        verifiedReceipt = response.status === 200;
         current.expires = body.expires_at;
         if (boundedSignal.aborted || closing) {
           await trackRelease(current);
           throw costPlanUnavailable();
         }
-        return {
+        const lease = {
           frame_id: current.id,
           expires_at: body.expires_at as number,
         } satisfies AccountReadFrameLease;
+        // Opt-in retirement is available only for this exact, positively
+        // verified v1 grant. A clone, unknown BEGIN or pending pin is not a lease.
+        if (response.status === 200 && !current.readiness)
+          grantedLeases.set(lease, current);
+        return lease;
       } catch (error) {
+        // A transport/JSON/abort race may still have an old BEGIN in flight.
+        // Later grants cannot turn that uncertainty into opt-in retirement.
+        if (!verifiedReceipt) current.retirementUnsafe = true;
         // A verified pending receipt is operational progress and owns its FIFO
         // place. Unverified transport errors retain the SAME stable id too;
         // they cannot authorize a new reservation or upstream read.
@@ -656,6 +670,22 @@ export function coreFrameCoordinator(
       } finally {
         current.polling = false;
       }
+    },
+    retainGrantedLease(lease) {
+      const frame = grantedLeases.get(lease);
+      if (
+        !frame || frame.readiness || frame.polling || frame.retirementUnsafe ||
+        frames.get(frame.owner) !== frame ||
+        frame.id !== lease.frame_id || frame.expires !== lease.expires_at ||
+        frame.expires <= clock()
+      ) return false;
+      if (frame.retainGranted) return true;
+      // Reserve cleanup capacity before opting in, including live marked grants.
+      // Legacy/default-off frame-table admission keeps its original bound.
+      if (retiring.size + [...frames.values()].filter(entry => entry.retainGranted).length >= 64)
+        return false;
+      frame.retainGranted = true;
+      return true;
     },
     async end(frameId) {
       const frame = [...frames.values(), ...retiring.values()].find(
